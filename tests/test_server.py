@@ -1,22 +1,57 @@
 import pytest
 from unittest.mock import patch, MagicMock
-from mysql_mcp_server.server import app, list_tools, list_prompts, get_prompt, list_resources, read_resource, call_tool, validate_identifier, parse_table_arg, get_db_config
+from mysql_mcp_server import __version__
+from mysql_mcp_server.server import (
+    app,
+    list_tools,
+    list_prompts,
+    get_prompt,
+    list_resources,
+    read_resource,
+    call_tool,
+    validate_identifier,
+    parse_table_arg,
+    get_db_config,
+    _validate_sse_exposure,
+)
 from pydantic import AnyUrl
 
 
 def test_server_initialization():
     """Test that the server initializes correctly."""
     assert app.name == "mysql_mcp_server"
+    assert __version__ == "0.7.0"
+
+
+def test_sse_public_bind_requires_authentication():
+    with pytest.raises(ValueError, match="Refusing unauthenticated public"):
+        _validate_sse_exposure("0.0.0.0", None, False)
+
+    _validate_sse_exposure("127.0.0.1", None, False)
+    _validate_sse_exposure("0.0.0.0", "x" * 32, False)
+    _validate_sse_exposure("0.0.0.0", None, True)
+
+
+def test_sse_bearer_token_has_minimum_length():
+    with pytest.raises(ValueError, match="at least 32"):
+        _validate_sse_exposure("127.0.0.1", "too-short", False)
 
 
 @pytest.mark.asyncio
 async def test_list_tools():
     """Test that list_tools returns expected tools."""
     tools = await list_tools()
-    assert len(tools) == 3
+    assert len(tools) == 8
+    assert any(t.name == "list_connections" for t in tools)
+    assert any(t.name == "validate_connections" for t in tools)
+    assert any(t.name == "check_connection" for t in tools)
+    assert any(t.name == "list_databases" for t in tools)
+    assert any(t.name == "list_tables" for t in tools)
     assert any(t.name == "execute_sql" for t in tools)
     assert any(t.name == "get_schema_info" for t in tools)
     assert any(t.name == "get_table_sample" for t in tools)
+    assert all(t.annotations.readOnlyHint for t in tools)
+    assert all(not t.annotations.destructiveHint for t in tools)
 
 
 @pytest.mark.asyncio
@@ -109,7 +144,8 @@ async def test_list_prompts():
 async def test_get_prompt_explore_database():
     result = await get_prompt("explore_database", None)
     assert len(result.messages) == 1
-    assert "list_resources" in result.messages[0].content.text
+    assert "list_connections" in result.messages[0].content.text
+    assert "list_tables" in result.messages[0].content.text
     assert "get_schema_info" in result.messages[0].content.text
     assert "get_table_sample" in result.messages[0].content.text
 
@@ -125,7 +161,11 @@ async def test_get_prompt_analyze_table():
 
 @pytest.mark.asyncio
 async def test_get_prompt_unknown():
-    response = await call_tool.__wrapped__("unknown_prompt", {}) if hasattr(call_tool, "__wrapped__") else None
+    response = (
+        await call_tool.__wrapped__("unknown_prompt", {})
+        if hasattr(call_tool, "__wrapped__")
+        else None
+    )
     with pytest.raises(ValueError, match="Unknown prompt"):
         await get_prompt("no_such_prompt", {})
 
@@ -153,8 +193,19 @@ async def test_execute_sql_multi_statement():
     """Multi-statement queries return a helpful error instead of MySQL's cryptic message."""
     response = await call_tool("execute_sql", {"query": "SELECT 1; SELECT 2"})
     assert len(response) == 1
-    assert "single statements" in response[0].text
-    assert "database.table" in response[0].text
+    assert "one SQL statement" in response[0].text
+
+
+@pytest.mark.asyncio
+@patch("mysql_mcp_server.server.connect")
+async def test_execute_sql_write_is_blocked_before_connect(mock_connect):
+    response = await call_tool(
+        "execute_sql",
+        {"query": "UPDATE users SET admin = 1 WHERE id = 1"},
+    )
+
+    assert "read-only SQL" in response[0].text
+    mock_connect.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -165,8 +216,9 @@ async def test_get_schema_info_cross_database(monkeypatch):
 
     captured = {}
 
-    async def fake_run_query(query):
+    async def fake_run_query(query, **kwargs):
         captured["query"] = query
+        captured["kwargs"] = kwargs
         return []
 
     with patch("mysql_mcp_server.server.run_query", side_effect=fake_run_query):
@@ -184,8 +236,9 @@ async def test_get_table_sample_cross_database(monkeypatch):
 
     captured = {}
 
-    async def fake_run_query(query):
+    async def fake_run_query(query, **kwargs):
         captured["query"] = query
+        captured["kwargs"] = kwargs
         return []
 
     with patch("mysql_mcp_server.server.run_query", side_effect=fake_run_query):
@@ -196,11 +249,13 @@ async def test_get_table_sample_cross_database(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(
-    not all([
-        pytest.importorskip("mysql.connector"),
-        pytest.importorskip("mysql_mcp_server")
-    ]),
-    reason="MySQL connection not available"
+    not all(
+        [
+            pytest.importorskip("mysql.connector"),
+            pytest.importorskip("mysql_mcp_server"),
+        ]
+    ),
+    reason="MySQL connection not available",
 )
 async def test_list_resources():
     """Test listing resources (requires database connection)."""

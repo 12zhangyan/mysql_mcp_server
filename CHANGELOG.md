@@ -5,6 +5,87 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-07-30
+
+### Added
+- **Enterprise JSONL Audit:** Versioned UTC events now include event/request IDs,
+  MCP operation and client metadata, optional actor/purpose/ticket attribution,
+  database scope, policy decision, execution outcome and resource metrics.
+- **Durable Audit Controls:** Added size rotation, configurable retention,
+  optional fsync, HMAC-SHA256 signing, required context and fail-closed mode.
+- **Denial Auditing:** SQL guard, database policy and missing-context rejections
+  are audited before any database connection is opened.
+- **Untrusted Credential Mode:** Read-only enforcement no longer treats account
+  grants as a correctness boundary. Unknown stored functions/UDFs, MariaDB
+  sequence advancement and additional lock/side-effect functions are blocked.
+- **Privilege Assessment:** `check_connection` identifies non-read grants and
+  reports whether the account/server provide database-level defense in depth.
+- **SSE Authentication:** Added optional bearer authentication for both SSE
+  endpoints and explicit authenticated-proxy trust mode.
+- **npm Distribution:** Added `mysql-mcp-server-readonly`, a cross-platform
+  launcher that embeds the matching Python wheel, plus version-synchronized
+  GitHub Actions publication with OIDC provenance or token fallback.
+- Added an enterprise deployment, SIEM and operational security guide.
+
+### Changed
+- SSE now binds to `127.0.0.1` by default. Public binds fail safely unless
+  bearer authentication or authenticated-proxy trust is explicitly configured.
+- General error logs record error types instead of database-supplied details.
+- Connection diagnostics redact authenticated usernames, raw grants, absolute
+  profile paths, database error text and debug tracebacks by default.
+- Resource reads now respect the profile row cap.
+
+### Fixed
+- `check_connection` now uses a MySQL-compatible alias for `CURRENT_USER()`;
+  the previous alias failed on a real MySQL 8.0 server.
+- Malformed and rejected SQL always receives a safe, non-reversible audit
+  fingerprint.
+
+## [0.6.0] - 2026-07-29
+
+### Added
+- **Timeout and Cancellation:** Full-call deadlines, Connector socket timeouts,
+  MySQL/MariaDB statement timeouts, and active socket shutdown on MCP cancellation.
+- **Connection Diagnostics:** Added `validate_connections` and `check_connection`.
+- **Profile Policies:** Added `allowed_databases`, system-schema policy,
+  per-profile result/timeout/row/cell limits, pooling, and audit settings.
+- **Structured Results:** Added JSON metadata output, standards-compliant CSV,
+  stable value serialization, cell truncation, and offset pagination.
+- **Private Audit Events:** Query fingerprints omit literals and record only
+  connection, timing, status, row counts, and truncation.
+
+### Changed
+- SSH tunnels are dynamically allocated, health-checked, reused, restarted after
+  failure, and closed on process shutdown.
+- Named connection pools are isolated by effective endpoint, database, and
+  credential fingerprint.
+- Profile files hot-reload and isolate invalid profiles instead of disabling all
+  valid environments.
+- Resource reads now use the same database allowlist, read-only transaction,
+  timeout, pooling, and rollback controls as tools.
+
+### Security
+- Added MySQL AST validation for cross-database access and system-schema blocking.
+- Added high-risk function blocking for file reads, advisory locks, sleeps,
+  benchmarks, and common command-execution UDFs.
+
+## [0.5.0] - 2026-07-29
+
+### Added
+- **Named Connections:** Load dev/test/staging/prod profiles from one TOML file and choose `connection` plus `database` independently on every tool call.
+- **Discovery Tools:** Added `list_connections`, `list_databases`, and `list_tables`.
+- **Result Limits:** Added `MYSQL_MAX_ROWS` with a hard maximum of 1000 rows.
+
+### Security
+- **Strict Read-Only SQL:** `execute_sql` now rejects DML, DDL, transaction control, locks, `SELECT INTO`, variable assignment, executable comments, and multiple statements before connecting.
+- **Database Enforcement:** All queries use a MySQL read-only transaction with autocommit disabled and unconditional rollback.
+- **Read-Only Metadata:** Every MCP tool is marked read-only and non-destructive.
+- **Read-Only Tests:** Removed database-writing integration fixtures and added SQL bypass coverage.
+
+### Changed
+- Passwords in named profiles can be referenced through environment variables with `password_env`.
+- Legacy `MYSQL_*` configuration remains available when no profiles file is configured.
+
 ## [0.4.1] - 2026-06-08
 
 ### Fixed

@@ -4,39 +4,41 @@ import os
 import mysql.connector
 from mysql.connector import Error
 
+
+@pytest.fixture(autouse=True)
+def legacy_test_configuration(monkeypatch):
+    """Give unit tests a harmless legacy profile unless they override it."""
+    monkeypatch.delenv("MYSQL_PROFILES_FILE", raising=False)
+    monkeypatch.delenv("MYSQL_CONNECTIONS_FILE", raising=False)
+    monkeypatch.setenv("MYSQL_USER", os.getenv("MYSQL_USER", "readonly_test"))
+    monkeypatch.setenv("MYSQL_PASSWORD", os.getenv("MYSQL_PASSWORD", "readonly_test"))
+
+
 @pytest.fixture(scope="session")
 def mysql_connection():
-    """Create a test database connection."""
+    """Open an optional read-only integration-test connection."""
     try:
         connection = mysql.connector.connect(
             host=os.getenv("MYSQL_HOST", "127.0.0.1"),
             user=os.getenv("MYSQL_USER", "root"),
             password=os.getenv("MYSQL_PASSWORD", "testpassword"),
-            database=os.getenv("MYSQL_DATABASE", "test_db")
+            database=os.getenv("MYSQL_DATABASE", "test_db"),
         )
-        
+
         if connection.is_connected():
-            # Create a test table
             cursor = connection.cursor()
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS test_table (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
-                    name VARCHAR(255),
-                    value INT
-                )
-            """)
-            connection.commit()
-            
-            yield connection
-            
-            # Cleanup
-            cursor.execute("DROP TABLE IF EXISTS test_table")
-            connection.commit()
-            cursor.close()
-            connection.close()
-            
+            cursor.execute("SET SESSION TRANSACTION READ ONLY")
+            cursor.execute("START TRANSACTION READ ONLY")
+            try:
+                yield connection
+            finally:
+                connection.rollback()
+                cursor.close()
+                connection.close()
+
     except Error as e:
-        pytest.fail(f"Failed to connect to MySQL: {e}")
+        pytest.skip(f"Read-only MySQL integration connection unavailable: {e}")
+
 
 @pytest.fixture(scope="session")
 def mysql_cursor(mysql_connection):

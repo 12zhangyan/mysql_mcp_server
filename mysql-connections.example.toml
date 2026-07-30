@@ -1,0 +1,70 @@
+# Choose the profile used when a tool omits the `connection` argument.
+default = "dev"
+
+[connections.dev]
+description = "Local development"
+host = "127.0.0.1"
+port = 3306
+user = "readonly_user"
+password_env = "MYSQL_DEV_PASSWORD"
+database = "app_dev"
+allowed_databases = ["app_dev", "analytics_dev"]
+query_timeout_ms = 30000
+max_rows = 500
+max_cell_length = 20000
+result_format = "json"
+pool_size = 3
+audit_enabled = true
+audit_log_file = "C:/var/log/mysql-mcp/dev-audit.jsonl"
+audit_log_max_bytes = 10000000
+audit_log_backup_count = 10
+# Optional signing key is loaded from the environment, never this file.
+# audit_hmac_key_env = "MYSQL_MCP_AUDIT_SIGNING_KEY"
+# audit_required_context = ["actor", "purpose", "ticket_id"]
+# audit_fail_closed = true
+# audit_fsync = true
+
+[connections.test]
+description = "Shared test environment"
+host = "test-db.example.internal"
+port = 3306
+user = "readonly_user"
+password_env = "MYSQL_TEST_PASSWORD"
+database = "app_test"
+allowed_databases = ["app_test"]
+ssl_mode = "VERIFY_CA"
+ssl_ca = "C:/path/to/ca.pem"
+
+[connections.prod]
+description = "Production read replica through SSH"
+host = "mysql.internal"
+port = 3306
+user = "readonly_user"
+password_env = "MYSQL_PROD_PASSWORD"
+database = "app"
+allowed_databases = ["app", "reporting"]
+# Unrecognized stored functions/UDFs are blocked. Add only reviewed,
+# deterministic functions that cannot write or cause external side effects.
+allowed_functions = []
+query_timeout_ms = 15000
+max_rows = 200
+result_format = "json"
+pool_size = 5
+audit_enabled = true
+audit_log_file = "C:/var/log/mysql-mcp/prod-audit.jsonl"
+audit_hmac_key_env = "MYSQL_MCP_AUDIT_SIGNING_KEY"
+audit_required_context = ["actor", "purpose", "ticket_id"]
+audit_fail_closed = true
+audit_fsync = true
+
+[connections.prod.ssh]
+enabled = true
+host = "bastion.example.com"
+port = 22
+user = "developer"
+key_path = "C:/Users/you/.ssh/id_ed25519"
+remote_host = "mysql.internal"
+remote_port = 3306
+# 0 selects a free local port. The process is reused and automatically restarted.
+local_port = 0
+startup_timeout = 5
