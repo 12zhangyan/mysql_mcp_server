@@ -29,4 +29,7 @@ npm/vendor/*.whl
 # Distribution directories
 *.dist-info/
 
+# Local, untrusted web-research cache.
+.firecrawl/
+
 pypi_publishing_notes.md
