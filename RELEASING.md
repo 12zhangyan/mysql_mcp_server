@@ -31,7 +31,7 @@ package can be reviewed in npm before its public release:
 
 ```bash
 npm login
-npx --yes npm@12 stage publish
+npx --yes npm@11.19.0 stage publish
 ```
 
 Then open npmjs.com, go to **Staged Packages**, inspect the staged artifact, and
