@@ -25,7 +25,7 @@ exist. A `v0.7.1` tag can also trigger the same workflow.
 
 ## Initial npm Publication
 
-The package name is `@yanzhang123/mysql-mcp-server-readonly`. The first publication must be
+The package name is `@yanzhang123/readonly-db-mcp`. The first publication must be
 performed by an authenticated npm owner. Use staged publishing so that the
 package can be reviewed in npm before its public release:
 

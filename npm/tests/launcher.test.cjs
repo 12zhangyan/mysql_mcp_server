@@ -14,7 +14,7 @@ const {
 } = require("../lib/launcher.cjs");
 
 test("manifest exposes the expected public CLI", () => {
-  assert.equal(manifest.name, "@yanzhang123/mysql-mcp-server-readonly");
+  assert.equal(manifest.name, "@yanzhang123/readonly-db-mcp");
   assert.equal(
     manifest.bin["mysql-mcp-server-readonly"],
     "npm/bin/mysql-mcp-server-readonly.cjs",
