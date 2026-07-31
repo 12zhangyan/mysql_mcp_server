@@ -26,16 +26,16 @@ exist. A `v0.7.1` tag can also trigger the same workflow.
 ## Initial npm Publication
 
 The package name is `mysql-mcp-server-readonly`. The first publication must be
-performed by an authenticated npm owner:
+performed by an authenticated npm owner. Use staged publishing so that the
+package can be reviewed in npm before its public release:
 
 ```bash
 npm login
-python -m build
-npm test
-npm publish --access public
+npx --yes npm@12 stage publish
 ```
 
-No npm token belongs in this repository.
+Then open npmjs.com, go to **Staged Packages**, inspect the staged artifact, and
+approve it with 2FA. No npm token belongs in this repository.
 
 ## Automatic npm Authentication
 
