@@ -1,5 +1,5 @@
 {
-  "name": "mysql-mcp-server-readonly",
+  "name": "@yanzhang123/mysql-mcp-server-readonly",
   "version": "0.7.0",
   "description": "Enterprise-auditable, strictly read-only MySQL MCP server with multi-environment profiles.",
   "license": "MIT",

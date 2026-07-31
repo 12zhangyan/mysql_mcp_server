@@ -22,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reports whether the account/server provide database-level defense in depth.
 - **SSE Authentication:** Added optional bearer authentication for both SSE
   endpoints and explicit authenticated-proxy trust mode.
-- **npm Distribution:** Added `mysql-mcp-server-readonly`, a cross-platform
+- **npm Distribution:** Added `@yanzhang123/mysql-mcp-server-readonly`, a cross-platform
   launcher that embeds the matching Python wheel, plus version-synchronized
   GitHub Actions publication with OIDC provenance or token fallback.
 - Added an enterprise deployment, SIEM and operational security guide.

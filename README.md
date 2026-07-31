@@ -29,7 +29,7 @@ The npm package contains the matching Python wheel and exposes a cross-platform
 launcher:
 
 ```bash
-npx -y mysql-mcp-server-readonly
+npx -y @yanzhang123/mysql-mcp-server-readonly
 ```
 
 Python 3.11 or newer is required. On first use, the launcher creates a
@@ -38,7 +38,7 @@ plus its Python dependencies. Override Python with `MYSQL_MCP_PYTHON` or the
 cache location with `MYSQL_MCP_NPM_CACHE_DIR`.
 
 For MCP clients, use `npx` as the command and
-`["-y", "mysql-mcp-server-readonly"]` as its arguments.
+`["-y", "@yanzhang123/mysql-mcp-server-readonly"]` as its arguments.
 
 ### Manual Installation
 ```bash
