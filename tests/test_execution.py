@@ -84,6 +84,30 @@ def test_required_tls_rejects_plaintext_connection():
     connection.close.assert_called_once_with()
 
 
+def test_required_tls_accepts_connector_c_extension_cipher():
+    connection = MagicMock()
+    connection.is_secure = False
+    connection._cmysql.get_ssl_cipher.return_value = "TLS_AES_256_GCM_SHA384"
+    profile = MagicMock(ssl_mode="REQUIRED", name="prod")
+
+    _verify_connection_transport(profile, connection)
+
+    connection._cmysql.get_ssl_cipher.assert_called_once_with()
+    connection.close.assert_not_called()
+
+
+def test_required_tls_rejects_empty_c_extension_cipher():
+    connection = MagicMock()
+    connection.is_secure = False
+    connection._cmysql.get_ssl_cipher.return_value = None
+    profile = MagicMock(ssl_mode="REQUIRED", name="prod")
+
+    with pytest.raises(RuntimeError, match="requires TLS"):
+        _verify_connection_transport(profile, connection)
+
+    connection.close.assert_called_once_with()
+
+
 @pytest.mark.asyncio
 async def test_denied_write_is_audited_before_opening_a_connection(caplog):
     with (

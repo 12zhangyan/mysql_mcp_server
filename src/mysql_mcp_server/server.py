@@ -180,16 +180,33 @@ def _verify_connection_transport(profile: ConnectionProfile, connection_object) 
     """Fail closed when a profile requiring TLS negotiated a plaintext session."""
     if profile.ssl_mode == "DISABLED":
         return
-    secure = getattr(connection_object, "is_secure", False)
-    if callable(secure):
-        secure = secure()
-    if not bool(secure):
-        try:
-            connection_object.close()
-        finally:
-            raise RuntimeError(
-                f"Connection '{profile.name}' requires TLS but the session is not secure"
-            )
+    inspection_error: Exception | None = None
+    try:
+        secure = getattr(connection_object, "is_secure", False)
+        if callable(secure):
+            secure = secure()
+        if secure is True:
+            return
+
+        # Connector/Python's C extension negotiates TLS but does not currently
+        # set the Python-layer `_ssl_active` flag used by `is_secure`. Its native
+        # handle exposes the negotiated cipher, which is authoritative for that
+        # backend.
+        native_connection = getattr(connection_object, "_cmysql", None)
+        get_ssl_cipher = getattr(native_connection, "get_ssl_cipher", None)
+        if callable(get_ssl_cipher):
+            cipher = get_ssl_cipher()
+            if isinstance(cipher, (str, bytes)) and bool(cipher):
+                return
+    except Exception as exc:
+        inspection_error = exc
+
+    try:
+        connection_object.close()
+    finally:
+        raise RuntimeError(
+            f"Connection '{profile.name}' requires TLS but the session is not secure"
+        ) from inspection_error
 
 
 # Create the MCP Server instance.

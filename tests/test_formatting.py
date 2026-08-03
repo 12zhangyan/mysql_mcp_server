@@ -22,6 +22,7 @@ async def test_call_tool_describe_formatting(mock_get_config, mock_connect):
     ]
 
     mock_conn = MagicMock()
+    mock_conn.is_secure = True
     mock_conn.__enter__.return_value = mock_conn
     mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
     mock_connect.return_value = mock_conn
@@ -58,6 +59,7 @@ async def test_call_tool_empty_results(mock_get_config, mock_connect):
     mock_cursor.fetchmany.return_value = []
 
     mock_conn = MagicMock()
+    mock_conn.is_secure = True
     mock_conn.__enter__.return_value = mock_conn
     mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
     mock_connect.return_value = mock_conn
@@ -80,6 +82,7 @@ async def test_call_tool_show_tables(mock_get_config, mock_connect):
     mock_cursor.fetchmany.return_value = [("users",), ("orders",)]
 
     mock_conn = MagicMock()
+    mock_conn.is_secure = True
     mock_conn.__enter__.return_value = mock_conn
     mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
     mock_connect.return_value = mock_conn
@@ -108,6 +111,7 @@ async def test_list_resources_identifier_safe(
     mock_cursor.fetchmany.return_value = [("users",), ("products",)]
 
     mock_conn = MagicMock()
+    mock_conn.is_secure = True
     mock_conn.__enter__.return_value = mock_conn
     mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
     mock_connect.return_value = mock_conn
@@ -135,6 +139,7 @@ async def test_list_resources_multi_db_safe(mock_get_config, mock_connect, monke
     mock_cursor.fetchmany.return_value = [("db1",), ("db2",)]
 
     mock_conn = MagicMock()
+    mock_conn.is_secure = True
     mock_conn.__enter__.return_value = mock_conn
     mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
     mock_connect.return_value = mock_conn
