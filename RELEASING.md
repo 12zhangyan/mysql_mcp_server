@@ -3,7 +3,7 @@
 Python and npm use one synchronized version. Run:
 
 ```bash
-npm run release:version -- 0.7.2
+npm run release:version -- X.Y.Z
 ```
 
 This updates `package.json`, `package-lock.json`, `pyproject.toml`,
@@ -21,7 +21,7 @@ npm run test:install
 ```bash
 git add package.json package-lock.json pyproject.toml uv.lock \
   src/mysql_mcp_server/__init__.py CHANGELOG.md
-git commit -m "release: v0.7.2"
+git commit -m "release: vX.Y.Z"
 git push origin <release-branch>
 ```
 
@@ -29,7 +29,7 @@ A push to `main` that changes `package.json` runs
 `.github/workflows/publish-npm.yml`. The workflow verifies synchronized
 versions, builds the Python wheel, embeds it in the npm tarball, tests both
 launchers, and publishes only when that exact npm version does not already
-exist. A `v0.7.2` tag can also trigger the same workflow.
+exist. A matching `vX.Y.Z` tag can also trigger the same workflow.
 
 ## Initial npm Publication
 
