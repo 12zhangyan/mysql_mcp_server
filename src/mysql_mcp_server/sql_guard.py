@@ -232,26 +232,32 @@ def validate_read_only_query(sql: str) -> str:
             f"Only read-only SQL is allowed; '{tokens[0]}' statements are blocked"
         )
 
+    if re.search(r"\bFOR\s+UPDATE\b", sanitized_trimmed, re.IGNORECASE):
+        raise ReadOnlyViolation(
+            "Locking read 'FOR UPDATE' is not allowed by the read-only policy"
+        )
+    if re.search(r"\bLOCK\s+IN\s+SHARE\s+MODE\b", sanitized_trimmed, re.IGNORECASE):
+        raise ReadOnlyViolation(
+            "Locking read 'LOCK IN SHARE MODE' is not allowed by the read-only policy"
+        )
+    if re.search(r"\bFOR\s+SHARE\b", sanitized_trimmed, re.IGNORECASE):
+        raise ReadOnlyViolation(
+            "Locking read 'FOR SHARE' is not allowed by the read-only policy"
+        )
+    if re.search(r"\bNEXT\s+VALUE\s+FOR\b", sanitized_trimmed, re.IGNORECASE):
+        raise ReadOnlyViolation("Sequence advancement is not allowed")
+    if "INTO" in tokens:
+        raise ReadOnlyViolation("SELECT ... INTO is not allowed")
+
     blocked = next((token for token in tokens if token in BLOCKED_KEYWORDS), None)
     if blocked:
         raise ReadOnlyViolation(
             f"Only read-only SQL is allowed; keyword '{blocked}' is blocked"
         )
-    if "INTO" in tokens:
-        raise ReadOnlyViolation("SELECT ... INTO is not allowed")
 
     for function_name in BLOCKED_FUNCTIONS:
         if re.search(rf"\b{function_name}\s*\(", sanitized_trimmed, re.IGNORECASE):
             raise ReadOnlyViolation(f"Function '{function_name}' is not allowed")
-
-    if re.search(r"\bFOR\s+UPDATE\b", sanitized_trimmed, re.IGNORECASE):
-        raise ReadOnlyViolation("Locking reads are not allowed")
-    if re.search(r"\bLOCK\s+IN\s+SHARE\s+MODE\b", sanitized_trimmed, re.IGNORECASE):
-        raise ReadOnlyViolation("Locking reads are not allowed")
-    if re.search(r"\bFOR\s+SHARE\b", sanitized_trimmed, re.IGNORECASE):
-        raise ReadOnlyViolation("Locking reads are not allowed")
-    if re.search(r"\bNEXT\s+VALUE\s+FOR\b", sanitized_trimmed, re.IGNORECASE):
-        raise ReadOnlyViolation("Sequence advancement is not allowed")
 
     return normalized_query
 

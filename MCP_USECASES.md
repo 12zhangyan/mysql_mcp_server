@@ -6,7 +6,11 @@ This server is intentionally read-only. Every data tool accepts an optional
 ## 1. Choose an environment
 
 Start with `list_connections({})`. It returns profile names, the default profile,
-each default database, and descriptions without exposing credentials.
+each default database, descriptions, and a `database_routes` index without
+exposing credentials. When an environment has several database-specific
+profiles, use that index instead of guessing the connection name. A mismatched
+`connection`/`database` pair is rejected with declared profile candidates; the
+server never switches environments automatically.
 
 If anything is unavailable, call `validate_connections({})`; this reloads the
 TOML file and reports profile-local configuration errors. Use
@@ -40,11 +44,15 @@ Reading it lists the accessible non-system databases.
   `get_table_sample({"connection": "test", "database": "orders_test", "table_name": "orders", "limit": 10})`
 
 `table_name` can also be qualified as `database.table`.
+Sampling is bounded in MySQL with `LIMIT`/`OFFSET` before rows are fetched.
 
 ## 4. Run read-only analysis
 
 `execute_sql` accepts one `SELECT`, `WITH`, `SHOW`, `DESCRIBE`, `DESC`, `EXPLAIN`,
 or `TABLE` statement.
+Older clients may call `query` with the same arguments; it is a stateless
+compatibility alias for `execute_sql`. Stateful `use_connection` and
+`use_database` tools are intentionally not provided.
 
 - Count:
   `execute_sql({"connection": "prod", "query": "SELECT COUNT(*) FROM orders"})`
@@ -62,6 +70,9 @@ Writes, DDL, `USE`, locks, transaction control, `SELECT INTO`, session-variable
 assignment, executable comments, and multiple statements are rejected.
 Queries that reference a schema outside the profile's `allowed_databases` are
 also rejected, including through MCP resource URIs.
+Direct user queries against `information_schema` remain blocked by default.
+Use `list_tables` and `get_schema_info` for their narrowly scoped internal
+metadata paths.
 
 ## 5. Attribute an enterprise query
 

@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.4] - 2026-08-03
+
+### Fixed
+- Bound `get_table_sample` queries with server-side `LIMIT`/`OFFSET` and fully
+  consume the small result so truncated samples do not churn pooled sockets.
+- Retry one transient Connector/Python client failure with `errno=-1` and
+  expose only a redacted lifecycle phase and exception type if it persists.
+- Report locking reads such as `SELECT ... FOR UPDATE` with a specific
+  read-only policy rejection instead of a generic blocked-keyword error.
+
+### Added
+- Add a stateless `query` compatibility alias for clients migrating from older
+  MySQL MCP servers.
+- Add database-to-profile routing hints and mismatched-target suggestions
+  without implicitly switching connections or environments.
+
 ## [0.7.3] - 2026-08-03
 
 ### Fixed

@@ -170,6 +170,25 @@ def test_side_effecting_select_constructs_are_blocked(query):
         validate_read_only_query(query)
 
 
+@pytest.mark.parametrize(
+    ("query", "construct"),
+    [
+        ("SELECT * FROM users FOR UPDATE", "FOR UPDATE"),
+        ("SELECT * FROM users FOR SHARE", "FOR SHARE"),
+        (
+            "SELECT * FROM users LOCK IN SHARE MODE",
+            "LOCK IN SHARE MODE",
+        ),
+    ],
+)
+def test_locking_reads_have_policy_specific_errors(query, construct):
+    with pytest.raises(
+        ReadOnlyViolation,
+        match=rf"Locking read '{construct}' is not allowed",
+    ):
+        validate_read_only_query(query)
+
+
 def test_unrecognized_udf_or_stored_function_is_fail_closed():
     with pytest.raises(ReadOnlyViolation, match="CUSTOM_FUNC"):
         validate_function_safety("SELECT custom_func(id) FROM users")

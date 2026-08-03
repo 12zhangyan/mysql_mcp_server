@@ -24,6 +24,7 @@ clients do not need a repository checkout or a separate package installation.
 ## Features
 - **Named connection profiles** for dev/test/staging/prod and multiple servers
 - Select a `connection` and `database` independently on every tool call
+- Database-to-profile routing hints without implicit cross-environment switching
 - **Strictly read-only SQL** with fail-closed validation, a MySQL read-only transaction, and unconditional rollback
 - Discover connections, databases, tables, schemas, and sample rows
 - Return-size protection (`MYSQL_MAX_ROWS`, hard maximum 1000)
@@ -31,6 +32,7 @@ clients do not need a repository checkout or a separate package installation.
 - **SSE/HTTP transport support** (`MCP_TRANSPORT=sse`)
 - Per-profile SSL/TLS and SSH tunneling
 - Passwords can stay in environment variables instead of the profiles file
+- Compatibility `query` alias for clients migrating from older MySQL MCP servers
 
 ## Installation
 
@@ -280,6 +282,9 @@ All tools are declared with `readOnlyHint=true` and `destructiveHint=false`.
 
 ### `list_connections`
 Lists named profiles, default database, policy limits and readiness. It never returns hosts, usernames, passwords, or SSH key paths.
+It also returns a `database_routes` index so clients can select the correct
+profile when one environment is split across several database-specific
+connections.
 
 ### `validate_connections`
 Forces a configuration reload and reports valid/invalid profiles plus missing
@@ -312,6 +317,16 @@ Executes exactly one read-only statement.
 - **Pagination:** JSON output includes `truncated` and `next_offset`; pass that value back as `offset`.
 - **Formats:** `json` preserves structured rows and metadata; `csv` uses RFC-style quoting and explicit `NULL`.
 - **Attribution:** `audit_context` supports `actor`, `purpose`, and `ticket_id`. A profile can require any of these fields before a connection is opened.
+- **Transient connector recovery:** client-side Connector/Python failures with
+  `errno=-1` are retried once. Persistent failures report only a safe exception
+  type and lifecycle phase; connector messages are not exposed.
+
+### `query`
+Compatibility alias for `execute_sql` with the same schema and all the same
+read-only, database allowlist, masking, timeout, pagination, and audit controls.
+Stateful legacy tools such as `use_connection` and `use_database` are
+intentionally not restored because process-global selection is unsafe with
+concurrent MCP clients.
 
 ### `get_schema_info`
 Provides detailed metadata about database structures.
@@ -326,6 +341,9 @@ Fetches a representative sample of data.
 - **Use Case:** Quickly understand data formats and content without fetching large result sets.
 - **Cross-database:** Pass `database.table` to sample a table outside `MYSQL_DATABASE`; bare names use the configured database.
 - **Identifier rules:** Names must contain only alphanumeric characters, underscores, and `$` (dots are allowed as a separator between database and table names).
+- **Bounded execution:** Sampling applies `LIMIT limit+1 OFFSET offset` in
+  MySQL and fully consumes that small result. It does not open an unbounded
+  table scan merely to return a few rows.
 
 ## Available Prompts
 
@@ -423,6 +441,10 @@ pytest
 - **Database enforcement:** Every exposed query runs with `autocommit=false` in a read-only transaction. Normal completion rolls back; cancellation or truncation closes the socket and forces server-side rollback.
 - **Write-capable credentials:** Read-only behavior does not depend on account grants. Unrecognized stored functions/UDFs, side-effecting functions, sequence advancement and locking reads are rejected because they can hide effects inside `SELECT`.
 - **Database allowlist:** `allowed_databases` is enforced with a MySQL AST parser for tools and resource URIs; system schemas are blocked by default.
+- **Controlled metadata:** User SQL cannot query `information_schema` by
+  default. Dedicated `list_tables` and `get_schema_info` operations use narrowly
+  scoped internal metadata queries, so catalog access does not become a general
+  system-schema bypass.
 - **Resource limits:** Calls have full-operation, socket and server statement timeouts; at most 1000 rows are returned and oversized cells are truncated.
 - **Cancellation:** Cancelling the MCP request closes the active connector socket. The worker does not continue silently after the response is abandoned.
 - **Enterprise audit:** Versioned UTC JSONL events include an event ID, MCP request ID, operation, caller-supplied attribution, policy decision, target database, literal-free query fingerprint, duration, result size and outcome. SQL text and result data are never logged. Optional rotation, fsync, HMAC signatures, required context and fail-closed behavior are supported.

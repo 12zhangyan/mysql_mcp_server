@@ -137,10 +137,53 @@ database = "app"
     assert payload["default"] == "prod"
     assert payload["source"] == "profiles_file"
     assert payload["profiles"][0]["description"] == "Production replica"
+    assert payload["database_routes"] == {"app": ["prod"]}
+    assert "never switches environments implicitly" in payload["selection_guidance"]
     assert str(profiles_file) not in text
     assert "super-secret-password" not in text
     assert "sensitive_user" not in text
     assert "secret.internal" not in text
+
+
+@pytest.mark.asyncio
+async def test_wrong_connection_database_pair_suggests_declared_profile(
+    tmp_path: Path, monkeypatch
+):
+    profiles_file = tmp_path / "connections.toml"
+    profiles_file.write_text(
+        """
+default = "test"
+
+[connections.test]
+host = "test-db"
+user = "reader"
+password = "secret"
+database = "core"
+allowed_databases = ["core"]
+
+[connections.test-gts]
+host = "test-db"
+user = "reader"
+password = "secret"
+database = "gts"
+allowed_databases = ["gts"]
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MYSQL_PROFILES_FILE", str(profiles_file))
+
+    with patch("mysql_mcp_server.server._open_connection") as connector:
+        response = await call_tool(
+            "execute_sql",
+            {
+                "query": "SELECT id FROM orders",
+                "connection": "test",
+                "database": "gts",
+            },
+        )
+
+    assert "Connections declaring database 'gts': test-gts" in response[0].text
+    connector.assert_not_called()
 
 
 def test_invalid_profile_does_not_disable_valid_profiles(tmp_path: Path, monkeypatch):

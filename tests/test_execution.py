@@ -6,7 +6,7 @@ import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
-from mysql.connector import Error
+from mysql.connector import Error, InterfaceError
 
 from mysql_mcp_server.results import QueryResult
 from mysql_mcp_server.server import (
@@ -181,6 +181,117 @@ async def test_mysql_error_details_are_redacted_from_tool_response():
     assert "sqlstate=28000" in response[0].text
     assert "sensitive_user" not in response[0].text
     assert "secret.internal" not in response[0].text
+
+
+@pytest.mark.asyncio
+async def test_errno_minus_one_is_retried_once_without_exposing_details(caplog):
+    failed_connection, failed_cursor = fake_connection([], ["id"])
+    successful_connection, successful_cursor = fake_connection(
+        [(7,)],
+        ["id"],
+    )
+
+    def fail_first_attempt(sql):
+        if sql == "DESCRIBE users":
+            raise InterfaceError(
+                msg="Unread result from sensitive.internal",
+                errno=-1,
+            )
+
+    failed_cursor.execute.side_effect = fail_first_attempt
+    with (
+        patch(
+            "mysql_mcp_server.server._open_connection",
+            side_effect=[
+                (failed_connection, {"database": "app"}),
+                (successful_connection, {"database": "app"}),
+            ],
+        ) as connector,
+        caplog.at_level(logging.WARNING, logger="mysql_mcp_server"),
+    ):
+        response = await call_tool(
+            "execute_sql",
+            {
+                "query": "DESCRIBE users",
+                "database": "app",
+                "result_format": "json",
+            },
+        )
+
+    assert connector.call_count == 2
+    payload = json.loads(response[0].text)
+    assert payload["rows"] == [[7]]
+    assert payload["retry_count"] == 1
+    assert "sensitive.internal" not in response[0].text
+    assert "phase=execute" in caplog.text
+    assert "Unread result" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_persistent_errno_minus_one_reports_safe_phase_and_type():
+    connections = []
+
+    def failing_connection():
+        connection, cursor = fake_connection([], ["table"])
+
+        def execute(sql):
+            if sql == "SHOW TABLES LIKE 'orders'":
+                raise InterfaceError(
+                    msg="Connection details must remain private",
+                    errno=-1,
+                )
+
+        cursor.execute.side_effect = execute
+        connections.append(connection)
+        return connection, {"database": "app"}
+
+    with patch(
+        "mysql_mcp_server.server._open_connection",
+        side_effect=[failing_connection(), failing_connection()],
+    ):
+        response = await call_tool(
+            "execute_sql",
+            {
+                "query": "SHOW TABLES LIKE 'orders'",
+                "database": "app",
+            },
+        )
+
+    text = response[0].text
+    assert "error_type=InterfaceError" in text
+    assert "phase=execute" in text
+    assert "errno=-1" in text
+    assert "Connection details" not in text
+
+
+@pytest.mark.asyncio
+async def test_bounded_table_sample_consumes_result_without_socket_shutdown():
+    connection, cursor = fake_connection([], ["id"])
+    cursor.fetchall.return_value = [(1,), (2,), (3,)]
+    with patch(
+        "mysql_mcp_server.server._open_connection",
+        return_value=(connection, {"database": "app"}),
+    ):
+        response = await call_tool(
+            "get_table_sample",
+            {
+                "table_name": "orders",
+                "database": "app",
+                "limit": 2,
+                "offset": 4,
+                "result_format": "json",
+            },
+        )
+
+    payload = json.loads(response[0].text)
+    assert payload["rows"] == [[1], [2]]
+    assert payload["offset"] == 4
+    assert payload["next_offset"] == 6
+    assert payload["truncated"] is True
+    assert payload["retry_count"] == 0
+    cursor.fetchall.assert_called_once_with()
+    connection.shutdown.assert_not_called()
+    connection.rollback.assert_called_once_with()
 
 
 @pytest.mark.asyncio

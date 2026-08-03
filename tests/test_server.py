@@ -20,7 +20,7 @@ from pydantic import AnyUrl
 def test_server_initialization():
     """Test that the server initializes correctly."""
     assert app.name == "mysql_mcp_server"
-    assert __version__ == "0.7.3"
+    assert __version__ == "0.7.4"
 
 
 def test_sse_public_bind_requires_authentication():
@@ -41,13 +41,14 @@ def test_sse_bearer_token_has_minimum_length():
 async def test_list_tools():
     """Test that list_tools returns expected tools."""
     tools = await list_tools()
-    assert len(tools) == 8
+    assert len(tools) == 9
     assert any(t.name == "list_connections" for t in tools)
     assert any(t.name == "validate_connections" for t in tools)
     assert any(t.name == "check_connection" for t in tools)
     assert any(t.name == "list_databases" for t in tools)
     assert any(t.name == "list_tables" for t in tools)
     assert any(t.name == "execute_sql" for t in tools)
+    assert any(t.name == "query" for t in tools)
     assert any(t.name == "get_schema_info" for t in tools)
     assert any(t.name == "get_table_sample" for t in tools)
     assert all(t.annotations.readOnlyHint for t in tools)
@@ -230,7 +231,7 @@ async def test_get_schema_info_cross_database(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_get_table_sample_cross_database(monkeypatch):
-    """get_table_sample with database.table uses backtick-quoted db.table reference."""
+    """Samples are bounded in SQL and retain the caller's pagination offset."""
     monkeypatch.setenv("MYSQL_USER", "u")
     monkeypatch.setenv("MYSQL_PASSWORD", "p")
 
@@ -242,9 +243,45 @@ async def test_get_table_sample_cross_database(monkeypatch):
         return []
 
     with patch("mysql_mcp_server.server.run_query", side_effect=fake_run_query):
-        await call_tool("get_table_sample", {"table_name": "otherdb.mytable"})
+        await call_tool(
+            "get_table_sample",
+            {"table_name": "otherdb.mytable", "limit": 5, "offset": 10},
+        )
 
     assert "`otherdb`.`mytable`" in captured["query"]
+    assert "LIMIT 6 OFFSET 10" in captured["query"]
+    assert captured["kwargs"]["database"] == "otherdb"
+    assert captured["kwargs"]["result_offset"] == 10
+    assert captured["kwargs"]["bounded_result"] is True
+
+
+@pytest.mark.asyncio
+async def test_query_compatibility_alias_uses_read_only_runner(monkeypatch):
+    monkeypatch.setenv("MYSQL_USER", "u")
+    monkeypatch.setenv("MYSQL_PASSWORD", "p")
+
+    with patch(
+        "mysql_mcp_server.server.run_query",
+        return_value=[],
+    ) as runner:
+        await call_tool(
+            "query",
+            {
+                "query": "SELECT id FROM users",
+                "connection": "legacy",
+                "database": "app",
+            },
+        )
+
+    runner.assert_awaited_once_with(
+        "SELECT id FROM users",
+        connection="legacy",
+        database="app",
+        max_rows=None,
+        offset=0,
+        result_format=None,
+        timeout_ms=None,
+    )
 
 
 @pytest.mark.asyncio

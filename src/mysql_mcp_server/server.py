@@ -125,6 +125,33 @@ def get_db_config(
     )
 
 
+def _ensure_database_allowed_with_hint(
+    profile: ConnectionProfile, database: str | None
+) -> str | None:
+    """Enforce scope and suggest declared profiles without switching environments."""
+    try:
+        return ensure_database_allowed(profile, database)
+    except ValueError as exc:
+        if not database:
+            raise
+        registry = load_connection_registry()
+        candidates = sorted(
+            candidate.name
+            for candidate in registry.profiles.values()
+            if candidate.name != profile.name
+            and (
+                candidate.database == database
+                or database in candidate.allowed_databases
+            )
+        )
+        if not candidates:
+            raise
+        raise ValueError(
+            f"{exc}. Connections declaring database '{database}': "
+            + ", ".join(candidates)
+        ) from exc
+
+
 def _start_read_only_transaction(cursor) -> None:
     """Ask MySQL to enforce read-only mode before executing any exposed query."""
     cursor.execute("SET SESSION TRANSACTION READ ONLY")
@@ -646,6 +673,31 @@ async def list_tools() -> list[Tool]:
             ),
         ),
         Tool(
+            name="query",
+            description=(
+                "Compatibility alias for execute_sql. Executes one strictly "
+                "read-only SQL statement with the same explicit connection, "
+                "database, limits, masking, and audit controls."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "One read-only SQL statement.",
+                    },
+                    **target_properties,
+                    **result_properties,
+                },
+                "required": ["query"],
+            },
+            annotations=ToolAnnotations(
+                title="Query (Read-Only Compatibility Alias)",
+                readOnlyHint=True,
+                destructiveHint=False,
+            ),
+        ),
+        Tool(
             name="get_schema_info",
             description=(
                 "Get column metadata for one table or all tables in the selected "
@@ -774,6 +826,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                         },
                     }
                 )
+            database_routes: dict[str, list[str]] = {}
+            for profile in registry.profiles.values():
+                declared_databases = profile.allowed_databases or (
+                    (profile.database,) if profile.database else ()
+                )
+                for declared_database in declared_databases:
+                    database_routes.setdefault(declared_database, []).append(
+                        profile.name
+                    )
             payload = {
                 "valid": not registry.errors
                 and all(item["ready"] for item in profiles),
@@ -784,6 +845,18 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     else "profiles_file"
                 ),
                 "profiles": profiles,
+                "database_routes": {
+                    database_name: sorted(connection_names)
+                    for database_name, connection_names in sorted(
+                        database_routes.items()
+                    )
+                },
+                "selection_guidance": (
+                    "Pass connection and database explicitly. If one environment "
+                    "uses several profiles, choose a connection listed for the "
+                    "target database; the server never switches environments "
+                    "implicitly."
+                ),
                 "errors": registry.errors,
             }
             return [
@@ -824,7 +897,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 timeout_ms=arguments.get("timeout_ms"),
             )
 
-        if name == "execute_sql":
+        if name in {"execute_sql", "query"}:
             query_argument = arguments.get("query")
             if not isinstance(query_argument, str):
                 raise ValueError("Query is required")
@@ -846,7 +919,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 table_database, table = parse_table_arg(table_name)
                 selected_database = table_database or database
                 profile = load_connection_registry().get(connection)
-                ensure_database_allowed(profile, selected_database)
+                _ensure_database_allowed_with_hint(profile, selected_database)
                 if (
                     selected_database in SYSTEM_DATABASES
                     and not profile.allow_system_databases
@@ -889,16 +962,25 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             limit = int(arguments.get("limit", 5))
             if not 1 <= limit <= 100:
                 raise ValueError("limit must be between 1 and 100")
+            page_offset = int(arguments.get("offset", 0))
+            if not 0 <= page_offset <= 1_000_000:
+                raise ValueError("offset must be between 0 and 1000000")
+            selected_database = table_database or database
+            profile = load_connection_registry().get(connection)
+            _ensure_database_allowed_with_hint(profile, selected_database)
             table_ref = (
                 f"`{table_database}`.`{table}`" if table_database else f"`{table}`"
             )
-            query = f"SELECT * FROM {table_ref}"
+            query = (
+                f"SELECT * FROM {table_ref} " f"LIMIT {limit + 1} OFFSET {page_offset}"
+            )
             return await run_query(
                 query,
                 connection=connection,
-                database=database,
+                database=selected_database,
                 max_rows=limit,
-                offset=arguments.get("offset", 0),
+                result_offset=page_offset,
+                bounded_result=True,
                 result_format=arguments.get("result_format"),
                 timeout_ms=arguments.get("timeout_ms"),
             )
@@ -1046,6 +1128,7 @@ def _write_audit_event(
     policy: str = "allowed",
     row_count: int = 0,
     truncated: bool = False,
+    retry_count: int = 0,
     error_type: str | None = None,
 ) -> None:
     if not profile.audit_enabled:
@@ -1063,6 +1146,7 @@ def _write_audit_event(
         "duration_ms": duration_ms,
         "row_count": row_count,
         "truncated": truncated,
+        "retry_count": retry_count,
     }
     if error_type:
         fields["error_type"] = error_type
@@ -1094,8 +1178,10 @@ async def execute_query(
     database: str | None = None,
     max_rows: int | None = None,
     offset: int = 0,
+    result_offset: int | None = None,
     timeout_ms: int | None = None,
     internal: bool = False,
+    bounded_result: bool = False,
 ) -> QueryResult:
     """Execute one validated query with policy, timeout, cancellation and paging."""
     profile = load_connection_registry().get(connection)
@@ -1107,7 +1193,7 @@ async def execute_query(
             raise ValueError(readiness)
         validate_required_audit_context(profile, current_audit_context())
         query = validate_read_only_query(query)
-        selected_database = ensure_database_allowed(profile, database)
+        selected_database = _ensure_database_allowed_with_hint(profile, database)
         if selected_database in SYSTEM_DATABASES and not profile.allow_system_databases:
             raise ValueError(
                 f"System database '{selected_database}' is blocked for connection "
@@ -1130,6 +1216,9 @@ async def execute_query(
         page_offset = int(offset)
         if not 0 <= page_offset <= 1_000_000:
             raise ValueError("offset must be between 0 and 1000000")
+        reported_offset = page_offset if result_offset is None else int(result_offset)
+        if not 0 <= reported_offset <= 1_000_000:
+            raise ValueError("result offset must be between 0 and 1000000")
         effective_timeout = (
             profile.query_timeout_ms if timeout_ms is None else int(timeout_ms)
         )
@@ -1163,87 +1252,116 @@ async def execute_query(
     control = QueryControl()
 
     def _sync_execute() -> QueryResult:
-        connection_object = None
-        discard_connection = False
-        try:
-            connection_object, config = _open_connection(
-                profile,
-                database=selected_database,
-                query_timeout_ms=effective_timeout,
-            )
-            control.bind(connection_object)
-            with connection_object.cursor() as cursor:
-                _apply_server_query_timeout(cursor, effective_timeout)
-                _start_read_only_transaction(cursor)
-                cursor.execute(query)
-                if cursor.description is None:
-                    raise RuntimeError("Read-only query did not return a result set")
-
-                remaining = page_offset
-                while remaining:
-                    skipped = cursor.fetchmany(size=min(remaining, 1000))
-                    if not skipped:
-                        break
-                    remaining -= len(skipped)
-
-                columns = [str(description[0]) for description in cursor.description]
-                raw_rows = list(cursor.fetchmany(size=row_limit + 1))
-                truncated = len(raw_rows) > row_limit
-                discard_connection = truncated
-                raw_rows = raw_rows[:row_limit]
-                serialized_rows = [
-                    [serialize_value(value, profile.max_cell_length) for value in row]
-                    for row in raw_rows
-                ]
-                rows, masked_columns = mask_result_rows(
-                    query,
-                    columns,
-                    serialized_rows,
-                    profile.mask_columns,
+        for attempt in range(2):
+            connection_object = None
+            discard_connection = False
+            phase = "connect"
+            try:
+                connection_object, config = _open_connection(
+                    profile,
+                    database=selected_database,
+                    query_timeout_ms=effective_timeout,
                 )
-                return QueryResult(
-                    connection=profile.name,
-                    database=config.get("database"),
-                    columns=columns,
-                    rows=rows,
-                    offset=page_offset,
-                    truncated=truncated,
-                    duration_ms=round((time.monotonic() - started) * 1000),
-                    query_id=query_fingerprint(query),
-                    masked_columns=masked_columns,
-                )
-        except Error as exc:
-            errno = getattr(exc, "errno", None)
-            sqlstate = getattr(exc, "sqlstate", None)
-            reference = ",".join(
-                value
-                for value in [
-                    f"errno={errno}" if errno is not None else "",
-                    f"sqlstate={sqlstate}" if sqlstate else "",
-                ]
-                if value
-            )
-            suffix = f" ({reference})" if reference else ""
-            raise RuntimeError(f"MySQL read-only query failed{suffix}") from exc
-        finally:
-            if connection_object is not None:
-                if discard_connection:
-                    try:
-                        connection_object.shutdown()
-                    except Exception:
-                        logger.debug(
-                            "Socket shutdown failed for truncated result cleanup"
+                control.bind(connection_object)
+                with connection_object.cursor() as cursor:
+                    phase = "session_setup"
+                    _apply_server_query_timeout(cursor, effective_timeout)
+                    _start_read_only_transaction(cursor)
+                    phase = "execute"
+                    cursor.execute(query)
+                    if cursor.description is None:
+                        raise RuntimeError(
+                            "Read-only query did not return a result set"
                         )
-                else:
+
+                    phase = "fetch"
+                    remaining = page_offset
+                    while remaining:
+                        skipped = cursor.fetchmany(size=min(remaining, 1000))
+                        if not skipped:
+                            break
+                        remaining -= len(skipped)
+
+                    columns = [
+                        str(description[0]) for description in cursor.description
+                    ]
+                    if bounded_result:
+                        raw_rows = list(cursor.fetchall())
+                    else:
+                        raw_rows = list(cursor.fetchmany(size=row_limit + 1))
+                    truncated = len(raw_rows) > row_limit
+                    discard_connection = truncated and not bounded_result
+                    raw_rows = raw_rows[:row_limit]
+                    serialized_rows = [
+                        [
+                            serialize_value(value, profile.max_cell_length)
+                            for value in row
+                        ]
+                        for row in raw_rows
+                    ]
+                    rows, masked_columns = mask_result_rows(
+                        query,
+                        columns,
+                        serialized_rows,
+                        profile.mask_columns,
+                    )
+                    return QueryResult(
+                        connection=profile.name,
+                        database=config.get("database"),
+                        columns=columns,
+                        rows=rows,
+                        offset=reported_offset,
+                        truncated=truncated,
+                        duration_ms=round((time.monotonic() - started) * 1000),
+                        query_id=query_fingerprint(query),
+                        masked_columns=masked_columns,
+                        retry_count=attempt,
+                    )
+            except Error as exc:
+                errno = getattr(exc, "errno", None)
+                if errno == -1 and attempt == 0:
+                    logger.warning(
+                        "Retrying transient Connector/Python read failure "
+                        "(connection=%s, phase=%s, error_type=%s)",
+                        profile.name,
+                        phase,
+                        type(exc).__name__,
+                    )
+                    continue
+                sqlstate = getattr(exc, "sqlstate", None)
+                reference = ",".join(
+                    value
+                    for value in [
+                        f"error_type={type(exc).__name__}",
+                        f"phase={phase}",
+                        f"errno={errno}" if errno is not None else "",
+                        f"sqlstate={sqlstate}" if sqlstate else "",
+                    ]
+                    if value
+                )
+                raise RuntimeError(
+                    f"MySQL read-only query failed ({reference})"
+                ) from exc
+            finally:
+                if connection_object is not None:
+                    if discard_connection:
+                        try:
+                            connection_object.shutdown()
+                        except Exception:
+                            logger.debug(
+                                "Socket shutdown failed for truncated result cleanup"
+                            )
+                    else:
+                        try:
+                            connection_object.rollback()
+                        except Exception:
+                            logger.debug("Rollback failed during connection cleanup")
                     try:
-                        connection_object.rollback()
+                        connection_object.close()
                     except Exception:
-                        logger.debug("Rollback failed during connection cleanup")
-                try:
-                    connection_object.close()
-                except Exception:
-                    logger.debug("Connection close failed during cleanup")
-            control.unbind()
+                        logger.debug("Connection close failed during cleanup")
+                control.unbind()
+        raise RuntimeError("Connector retry loop exited unexpectedly")
 
     try:
         with anyio.fail_after(effective_timeout / 1000):
@@ -1301,6 +1419,7 @@ async def execute_query(
         internal=internal,
         row_count=len(result.rows),
         truncated=result.truncated,
+        retry_count=result.retry_count,
     )
     return result
 
@@ -1312,9 +1431,11 @@ async def run_query(
     database: str | None = None,
     max_rows: int | None = None,
     offset: int = 0,
+    result_offset: int | None = None,
     result_format: str | None = None,
     timeout_ms: int | None = None,
     internal: bool = False,
+    bounded_result: bool = False,
 ) -> list[TextContent]:
     profile = load_connection_registry().get(connection)
     selected_format = (result_format or profile.result_format).lower()
@@ -1326,8 +1447,10 @@ async def run_query(
         database=database,
         max_rows=max_rows,
         offset=offset,
+        result_offset=result_offset,
         timeout_ms=timeout_ms,
         internal=internal,
+        bounded_result=bounded_result,
     )
     return [TextContent(type="text", text=result.render(selected_format))]
 

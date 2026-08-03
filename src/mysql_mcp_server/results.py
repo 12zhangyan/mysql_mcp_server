@@ -104,6 +104,7 @@ class QueryResult:
     duration_ms: int
     query_id: str
     masked_columns: list[str] = field(default_factory=list)
+    retry_count: int = 0
 
     @property
     def next_offset(self) -> int | None:
@@ -122,6 +123,7 @@ class QueryResult:
             "duration_ms": self.duration_ms,
             "query_id": self.query_id,
             "masked_columns": self.masked_columns,
+            "retry_count": self.retry_count,
         }
 
     def render(self, result_format: str) -> str:
