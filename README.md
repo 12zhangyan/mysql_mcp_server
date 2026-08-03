@@ -1,14 +1,25 @@
 [![Tests](https://github.com/12zhangyan/mysql_mcp_server/actions/workflows/test.yml/badge.svg)](https://github.com/12zhangyan/mysql_mcp_server/actions)
-[![PyPI - Downloads](https://img.shields.io/pypi/dm/mysql-mcp-server)](https://pypi.org/project/mysql-mcp-server/)
-[![AgentAudit Safe](https://img.shields.io/badge/AgentAudit-safe-brightgreen)](https://www.agentaudit.dev/packages/mysql-mcp-server)
+[![npm version](https://img.shields.io/npm/v/%40yanzhang123%2Freadonly-db-mcp)](https://www.npmjs.com/package/@yanzhang123/readonly-db-mcp)
+[![npm provenance](https://img.shields.io/badge/npm-provenance-blue)](https://www.npmjs.com/package/@yanzhang123/readonly-db-mcp)
+
 # MySQL MCP Server
-A Model Context Protocol (MCP) implementation that enables secure interaction with MySQL databases. This server component facilitates communication between AI applications (hosts/clients) and MySQL databases, making database exploration and analysis safer and more structured through a controlled interface.
+
+An enterprise-auditable, strictly read-only Model Context Protocol (MCP) server
+for exploring multiple MySQL environments and databases from one process.
+
+The supported npm distribution for this fork is
+[`@yanzhang123/readonly-db-mcp`](https://www.npmjs.com/package/@yanzhang123/readonly-db-mcp).
+It includes the matching Python wheel and a cross-platform launcher, so MCP
+clients do not need a repository checkout or a separate package installation.
 
 > **Note**: MySQL MCP Server supports both standard input/output (STDIO) and Streamable HTTP (SSE) transport modes. The SSE mode is recommended for remote/self-hosted deployments.
 
-## Deployment options
-- **Hosted** — [Fronteir AI](https://fronteir.ai/mcp/designcomputer-mysql-mcp-server) runs the server for you; no local setup required.
-- **Local** — [Smithery](https://smithery.ai/server/designcomputer/mysql-mcp-server) installs and runs the server on your own machine.
+> [!IMPORTANT]
+> Read-only enforcement does not trust the MySQL account grants. Even if the
+> supplied account has `INSERT`, `UPDATE`, `DELETE`, or DDL privileges, the MCP
+> SQL gate only accepts reviewed read statement families, runs them in a
+> read-only transaction, and always rolls back. A database-level `SELECT`-only
+> account is still strongly recommended as independent defense in depth.
 
 ## Features
 - **Named connection profiles** for dev/test/staging/prod and multiple servers
@@ -25,38 +36,68 @@ A Model Context Protocol (MCP) implementation that enables secure interaction wi
 
 ### npm / npx
 
-The npm package contains the matching Python wheel and exposes a cross-platform
-launcher:
+Requirements: Node.js 18+, npm 9+, and Python 3.11+ available on `PATH`.
+
+Run the current release without installing it globally:
 
 ```bash
 npx -y @yanzhang123/readonly-db-mcp
 ```
 
-Python 3.11 or newer is required. On first use, the launcher creates a
-versioned virtual environment in the user cache and installs the bundled wheel
-plus exact Python dependencies from a version-controlled SHA-256 lock file.
-Downloads use the configured pip index and the completed environment is cached
-by wheel-and-lock fingerprint. Override Python with `MYSQL_MCP_PYTHON` or the
-cache location with `MYSQL_MCP_NPM_CACHE_DIR`.
+For controlled production rollouts, pin the reviewed version:
+
+```bash
+npx -y @yanzhang123/readonly-db-mcp@0.7.3
+```
+
+On first use, the launcher creates a versioned virtual environment in the user
+cache and installs the bundled wheel plus exact Python dependencies from a
+version-controlled SHA-256 lock file. Downloads use the configured pip index
+and the completed environment is cached by wheel-and-lock fingerprint. Override
+Python with `MYSQL_MCP_PYTHON` or the cache location with
+`MYSQL_MCP_NPM_CACHE_DIR`.
 
 For MCP clients, use `npx` as the command and
 `["-y", "@yanzhang123/readonly-db-mcp"]` as its arguments.
 
-### Manual Installation
+### Minimal MCP client configuration
+
+Create `mysql-connections.toml` from
+[`mysql-connections.example.toml`](mysql-connections.example.toml), keep
+passwords in environment variables, and use an absolute path:
+
+```json
+{
+  "mcpServers": {
+    "mysql-readonly": {
+      "command": "npx",
+      "args": ["-y", "@yanzhang123/readonly-db-mcp@0.7.3"],
+      "env": {
+        "MYSQL_PROFILES_FILE": "C:/absolute/path/mysql-connections.toml",
+        "MYSQL_DEV_PASSWORD": "set-in-the-client-secret-store"
+      }
+    }
+  }
+}
+```
+
+On Windows clients that do not resolve npm command shims correctly, set
+`"command": "npx.cmd"`. Do not commit the populated profile, passwords, audit
+HMAC keys, connection strings, or client configuration containing secrets.
+
+After startup, call `validate_connections`, then `check_connection`, before
+running discovery queries. `check_connection` reports an irreversible account
+fingerprint and privilege classification without returning the username or raw
+grant statements.
+
+### Manual Python installation
+
 ```bash
 pip install mysql-mcp-server
 ```
 
-### Installing via Smithery
-To install MySQL MCP Server for Claude Desktop automatically via [Smithery](https://smithery.ai/server/designcomputer/mysql-mcp-server):
-```bash
-npx -y @smithery/cli install designcomputer/mysql-mcp-server --client claude
-```
-
-### Installing via Claude Code CLI
-```bash
-claude mcp add --transport stdio designcomputer-mysql_mcp_server uvx mysql_mcp_server
-```
+The Python package remains available for source-oriented deployments, but the
+scoped npm package is the documented distribution path for this fork.
 
 ## Configuration
 
@@ -309,14 +350,9 @@ Add this to your `claude_desktop_config.json`:
 ```json
 {
   "mcpServers": {
-    "mysql": {
-      "command": "uv",
-      "args": [
-        "--directory",
-        "path/to/mysql_mcp_server",
-        "run",
-        "mysql_mcp_server"
-      ],
+    "mysql-readonly": {
+      "command": "npx",
+      "args": ["-y", "@yanzhang123/readonly-db-mcp@0.7.3"],
       "env": {
         "MYSQL_PROFILES_FILE": "C:/absolute/path/mysql-connections.toml",
         "MYSQL_DEV_PASSWORD": "your_dev_password",
@@ -334,14 +370,10 @@ Add this to your `mcp.json`:
 ```json
 {
   "mcpServers": {
-    "mysql": {
+    "mysql-readonly": {
       "type": "stdio",
-      "command": "uvx",
-      "args": [
-        "--from",
-        "mysql-mcp-server",
-        "mysql_mcp_server"
-      ],
+      "command": "npx",
+      "args": ["-y", "@yanzhang123/readonly-db-mcp@0.7.3"],
       "env": {
         "MYSQL_PROFILES_FILE": "C:/absolute/path/mysql-connections.toml",
         "MYSQL_DEV_PASSWORD": "your_dev_password",
@@ -351,7 +383,8 @@ Add this to your `mcp.json`:
   }
 }
 ```
-Note: Will need to install uv for this to work
+
+Use `npx.cmd` instead of `npx` if required by your Windows MCP host.
 
 ### Debugging with MCP Inspector
 While MySQL MCP Server isn't intended to be run standalone or directly from the command line with Python, you can use the MCP Inspector to debug it.
@@ -373,11 +406,13 @@ git clone https://github.com/12zhangyan/mysql_mcp_server.git
 cd mysql_mcp_server
 # Create virtual environment
 python -m venv venv
-source venv/bin/activate  # or `venv\Scripts\activate` on Windows
+# Linux/macOS: source venv/bin/activate
+# Windows PowerShell: .\venv\Scripts\Activate.ps1
 # Install development dependencies
 pip install -r requirements-dev.txt
 # Copy the example config and edit with your credentials
-cp .env.example .env
+# Linux/macOS: cp .env.example .env
+# Windows PowerShell: Copy-Item .env.example .env
 # Edit .env with your MySQL connection details
 # Run tests
 pytest
@@ -425,11 +460,11 @@ Maintainers should follow [RELEASING.md](RELEASING.md) for synchronized Python/n
 
 ## Security Best Practices
 This MCP implementation requires database access to function. For security:
-1. **Create a dedicated MySQL user** with `SELECT` only
+1. **Prefer a dedicated MySQL user** with `SELECT` only as defense in depth; MCP enforcement remains read-only even when broader credentials are supplied
 2. **Never use root credentials** or administrative accounts
-3. **Restrict database access** to only necessary operations
-4. **Enable logging** for audit purposes
-5. **Regular security reviews** of database access
+3. **Restrict `allowed_databases`** to the schemas each profile needs
+4. **Require audit attribution** and protect the optional HMAC key in a secret manager
+5. **Review masking patterns, audit events, dependency updates, and account grants regularly**
 
 See [MySQL Security Configuration Guide](https://github.com/12zhangyan/mysql_mcp_server/blob/main/SECURITY.md) for detailed instructions on:
 - Creating a restricted MySQL user
