@@ -102,10 +102,14 @@ def test_connection_pool_is_reused_and_password_rotation_changes_key():
         def __init__(self, **kwargs):
             self.kwargs = kwargs
             self.connection = object()
+            self.closed = False
             pools.append(self)
 
         def get_connection(self):
             return self.connection
+
+        def close(self):
+            self.closed = True
 
     manager = ConnectionPoolManager(pool_factory=FakePool)
     profile = ConnectionProfile(
@@ -130,6 +134,8 @@ def test_connection_pool_is_reused_and_password_rotation_changes_key():
     assert first is second
     assert rotated is not first
     assert len(pools) == 2
+    assert pools[0].closed is True
+    assert len(manager._pools) == 1
     assert "one" not in repr(pools[0].kwargs["pool_name"])
 
 

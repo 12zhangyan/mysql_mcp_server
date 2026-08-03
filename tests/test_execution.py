@@ -12,6 +12,7 @@ from mysql_mcp_server.results import QueryResult
 from mysql_mcp_server.server import (
     _apply_server_query_timeout,
     _assess_grants,
+    _verify_connection_transport,
     call_tool,
     check_connection,
     execute_query,
@@ -67,8 +68,20 @@ async def test_json_pagination_executes_read_only_controls_and_audits(caplog):
     connection.rollback.assert_not_called()
     assert "SELECT id, name" not in caplog.text
     assert '"status":"success"' in caplog.text
+    assert '"status":"started"' in caplog.text
     assert '"schema_version":1' in caplog.text
     assert '"read_only_enforced":true' in caplog.text
+
+
+def test_required_tls_rejects_plaintext_connection():
+    connection = MagicMock()
+    connection.is_secure = False
+    profile = MagicMock(ssl_mode="REQUIRED", name="prod")
+
+    with pytest.raises(RuntimeError, match="requires TLS"):
+        _verify_connection_transport(profile, connection)
+
+    connection.close.assert_called_once_with()
 
 
 @pytest.mark.asyncio

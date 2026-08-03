@@ -3,7 +3,12 @@ import json
 from datetime import datetime
 from decimal import Decimal
 
-from mysql_mcp_server.results import QueryResult, serialize_value
+from mysql_mcp_server.results import (
+    MASKED_VALUE,
+    QueryResult,
+    mask_result_rows,
+    serialize_value,
+)
 
 
 def test_json_result_preserves_types_and_paging_metadata():
@@ -53,3 +58,27 @@ def test_csv_uses_real_escaping_and_explicit_null():
 
 def test_large_cell_is_truncated_deterministically():
     assert serialize_value("abcdefgh", 4) == "abcd…[truncated]"
+
+
+def test_sensitive_results_are_masked_across_aliases_and_ctes():
+    rows, masked = mask_result_rows(
+        "WITH source AS (SELECT password AS value FROM users) SELECT value AS safe FROM source",
+        ["safe", "status"],
+        [["secret", "active"]],
+        ("password",),
+    )
+
+    assert rows == [[MASKED_VALUE, MASKED_VALUE]]
+    assert masked == ["safe", "status"]
+
+
+def test_output_column_patterns_mask_only_matching_columns():
+    rows, masked = mask_result_rows(
+        "SELECT 1",
+        ["id", "email_address"],
+        [[1, "user@example.test"]],
+        ("*email*",),
+    )
+
+    assert rows == [[1, MASKED_VALUE]]
+    assert masked == ["email_address"]

@@ -198,6 +198,33 @@ class ConnectionPoolManager:
         self._pool_factory = pool_factory
         self._lock = threading.RLock()
         self._pools: dict[str, Any] = {}
+        self._profile_keys: dict[str, str] = {}
+
+    @staticmethod
+    def _dispose_pool(pool: Any) -> None:
+        close = getattr(pool, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+            return
+
+        # Connector/Python does not expose a public pool shutdown API. Drain
+        # and close its idle raw connections so profile reloads and credential
+        # rotations do not retain server sessions indefinitely.
+        queue = getattr(pool, "_cnx_queue", None)
+        if queue is None:
+            return
+        while True:
+            try:
+                connection = queue.get_nowait()
+            except Exception:
+                break
+            try:
+                connection.close()
+            except Exception:
+                pass
 
     @staticmethod
     def _key(
@@ -229,6 +256,11 @@ class ConnectionPoolManager:
 
         key = self._key(profile, endpoint, config)
         with self._lock:
+            previous_key = self._profile_keys.get(profile.name)
+            if previous_key is not None and previous_key != key:
+                previous_pool = self._pools.pop(previous_key, None)
+                if previous_pool is not None:
+                    self._dispose_pool(previous_pool)
             pool = self._pools.get(key)
             if pool is None:
                 pool = self._pool_factory(
@@ -238,12 +270,16 @@ class ConnectionPoolManager:
                     **config,
                 )
                 self._pools[key] = pool
+            self._profile_keys[profile.name] = key
         return pool.get_connection()
 
     def clear(self) -> None:
-        """Drop cached pool references; checked-out connections remain self-owned."""
+        """Close idle pool connections and drop cached references."""
         with self._lock:
+            for pool in self._pools.values():
+                self._dispose_pool(pool)
             self._pools.clear()
+            self._profile_keys.clear()
 
 
 class QueryControl:

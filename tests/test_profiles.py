@@ -66,6 +66,29 @@ database = "app_dev"
 
     assert config["autocommit"] is False
     assert config["database"] == "audit"
+    assert config["ssl_disabled"] is False
+    assert profile.ssl_mode == "REQUIRED"
+    assert "password" in profile.mask_columns
+
+
+def test_verified_tls_requires_ca_file(tmp_path: Path, monkeypatch):
+    profiles_file = tmp_path / "connections.toml"
+    profiles_file.write_text(
+        """
+[connections.prod]
+host = "prod-db"
+user = "reader"
+password_env = "PROD_DB_PASSWORD"
+ssl_mode = "VERIFY_IDENTITY"
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MYSQL_PROFILES_FILE", str(profiles_file))
+    monkeypatch.setenv("PROD_DB_PASSWORD", "secret")
+
+    registry = load_connection_registry()
+
+    assert "requires ssl_ca" in registry.errors["prod"]
 
 
 def test_missing_profile_password_fails_explicitly(tmp_path: Path, monkeypatch):

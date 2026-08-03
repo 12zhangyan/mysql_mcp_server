@@ -42,7 +42,7 @@ from .config import (
     ensure_database_allowed,
     load_connection_registry,
 )
-from .results import QueryResult, serialize_value
+from .results import QueryResult, mask_result_rows, serialize_value
 from .runtime import (
     QueryControl,
     close_runtime_resources,
@@ -172,7 +172,24 @@ def _open_connection(
         config,
         connect_factory=connect,
     )
+    _verify_connection_transport(profile, connection)
     return connection, config
+
+
+def _verify_connection_transport(profile: ConnectionProfile, connection_object) -> None:
+    """Fail closed when a profile requiring TLS negotiated a plaintext session."""
+    if profile.ssl_mode == "DISABLED":
+        return
+    secure = getattr(connection_object, "is_secure", False)
+    if callable(secure):
+        secure = secure()
+    if not bool(secure):
+        try:
+            connection_object.close()
+        finally:
+            raise RuntimeError(
+                f"Connection '{profile.name}' requires TLS but the session is not secure"
+            )
 
 
 # Create the MCP Server instance.
@@ -224,6 +241,14 @@ def _sync_resource_query(
         )
         validate_function_safety(query, allowed_functions=profile.allowed_functions)
         audit_sink.preflight(profile)
+        _write_audit_event(
+            profile,
+            query=query,
+            status="started",
+            duration_ms=round((time.monotonic() - started) * 1000),
+            database=selected_database,
+            internal=True,
+        )
         policy_allowed = True
         connection_object, _ = _open_connection(
             profile,
@@ -396,18 +421,26 @@ async def read_resource(uri: AnyUrl) -> str:
                 f"SELECT * FROM `{table}` LIMIT 100",
                 max_rows=100,
             )
+            serialized_rows = [
+                [serialize_value(value, profile.max_cell_length) for value in row]
+                for row in rows
+            ]
+            masked_rows, masked_columns = mask_result_rows(
+                f"SELECT * FROM `{table}` LIMIT 100",
+                columns,
+                serialized_rows,
+                profile.mask_columns,
+            )
             result = QueryResult(
                 connection=profile.name,
                 database=profile.database,
                 columns=columns,
-                rows=[
-                    [serialize_value(value, profile.max_cell_length) for value in row]
-                    for row in rows
-                ],
+                rows=masked_rows,
                 offset=0,
                 truncated=False,
                 duration_ms=0,
                 query_id=query_fingerprint(f"SELECT * FROM `{table}` LIMIT 100"),
+                masked_columns=masked_columns,
             )
             return result.render(profile.result_format)
 
@@ -1089,6 +1122,14 @@ async def execute_query(
                 f"{profile.query_timeout_ms}"
             )
         audit_sink.preflight(profile)
+        _write_audit_event(
+            profile,
+            query=query,
+            status="started",
+            duration_ms=round((time.monotonic() - started) * 1000),
+            database=selected_database,
+            internal=internal,
+        )
     except Exception as exc:
         _write_audit_event(
             profile,
@@ -1133,10 +1174,16 @@ async def execute_query(
                 truncated = len(raw_rows) > row_limit
                 discard_connection = truncated
                 raw_rows = raw_rows[:row_limit]
-                rows = [
+                serialized_rows = [
                     [serialize_value(value, profile.max_cell_length) for value in row]
                     for row in raw_rows
                 ]
+                rows, masked_columns = mask_result_rows(
+                    query,
+                    columns,
+                    serialized_rows,
+                    profile.mask_columns,
+                )
                 return QueryResult(
                     connection=profile.name,
                     database=config.get("database"),
@@ -1146,6 +1193,7 @@ async def execute_query(
                     truncated=truncated,
                     duration_ms=round((time.monotonic() - started) * 1000),
                     query_id=query_fingerprint(query),
+                    masked_columns=masked_columns,
                 )
         except Error as exc:
             errno = getattr(exc, "errno", None)

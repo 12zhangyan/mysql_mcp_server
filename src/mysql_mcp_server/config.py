@@ -14,7 +14,19 @@ from typing import Any
 PROFILE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_$]+$")
 RESULT_FORMATS = {"csv", "json"}
-SSL_MODES = {"", "DISABLED", "REQUIRED", "VERIFY_CA", "VERIFY_IDENTITY"}
+SSL_MODES = {"DISABLED", "REQUIRED", "VERIFY_CA", "VERIFY_IDENTITY"}
+DEFAULT_MASK_COLUMNS = (
+    "password",
+    "passwd",
+    "*secret*",
+    "*token*",
+    "*api_key*",
+    "*private_key*",
+    "*ssn*",
+    "*id_card*",
+    "*phone*",
+    "*email*",
+)
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -101,6 +113,7 @@ class ConnectionProfile:
     query_timeout_ms: int = 30_000
     max_rows: int = 500
     max_cell_length: int = 20_000
+    mask_columns: tuple[str, ...] = DEFAULT_MASK_COLUMNS
     result_format: str = "csv"
     pool_size: int = 5
     audit_enabled: bool = True
@@ -114,7 +127,7 @@ class ConnectionProfile:
     auth_plugin: str | None = None
     use_pure: bool = False
     raise_on_warnings: bool = False
-    ssl_mode: str = ""
+    ssl_mode: str = "REQUIRED"
     ssl_ca: str | None = None
     ssh: SshConfig = SshConfig()
 
@@ -235,6 +248,12 @@ def _profile_from_toml(name: str, values: dict[str, Any]) -> ConnectionProfile:
         _validate_identifier(str(item), label="allowed function").upper()
         for item in raw_allowed_functions
     )
+    raw_mask_columns = values.get("mask_columns", DEFAULT_MASK_COLUMNS)
+    if not isinstance(raw_mask_columns, (list, tuple)):
+        raise ValueError(f"Connection '{name}'.mask_columns must be an array")
+    mask_columns = tuple(
+        str(item).strip().lower() for item in raw_mask_columns if str(item).strip()
+    )
     if database and allowed_databases and database not in allowed_databases:
         raise ValueError(
             f"Connection '{name}' default database '{database}' is not in "
@@ -244,12 +263,16 @@ def _profile_from_toml(name: str, values: dict[str, Any]) -> ConnectionProfile:
     result_format = str(values.get("result_format", "csv")).lower()
     if result_format not in RESULT_FORMATS:
         raise ValueError(f"Connection '{name}'.result_format must be csv or json")
-    ssl_mode = str(values.get("ssl_mode", "")).upper()
+    ssl_mode = str(values.get("ssl_mode", "REQUIRED")).upper()
     if ssl_mode not in SSL_MODES:
         raise ValueError(
             f"Connection '{name}'.ssl_mode must be DISABLED, REQUIRED, "
             "VERIFY_CA or VERIFY_IDENTITY"
         )
+
+    ssl_ca = str(values["ssl_ca"]) if values.get("ssl_ca") else None
+    if ssl_mode in {"VERIFY_CA", "VERIFY_IDENTITY"} and not ssl_ca:
+        raise ValueError(f"Connection '{name}'.ssl_mode={ssl_mode} requires ssl_ca")
 
     raw_required_context = values.get("audit_required_context") or []
     if not isinstance(raw_required_context, list):
@@ -341,6 +364,7 @@ def _profile_from_toml(name: str, values: dict[str, Any]) -> ConnectionProfile:
             minimum=100,
             maximum=1_000_000,
         ),
+        mask_columns=mask_columns,
         result_format=result_format,
         pool_size=_bounded_int(
             values.get("pool_size"),
@@ -373,7 +397,7 @@ def _profile_from_toml(name: str, values: dict[str, Any]) -> ConnectionProfile:
         use_pure=_as_bool(values.get("use_pure")),
         raise_on_warnings=_as_bool(values.get("raise_on_warnings")),
         ssl_mode=ssl_mode,
-        ssl_ca=str(values["ssl_ca"]) if values.get("ssl_ca") else None,
+        ssl_ca=ssl_ca,
         ssh=SshConfig(
             enabled=_as_bool(ssh_values.get("enabled")),
             host=str(ssh_values["host"]) if ssh_values.get("host") else None,
@@ -438,6 +462,14 @@ def _legacy_profile() -> ConnectionProfile:
         for item in os.getenv("MYSQL_ALLOWED_FUNCTIONS", "").split(",")
         if item.strip()
     )
+    raw_mask_columns = os.getenv("MYSQL_MASK_COLUMNS")
+    mask_columns = (
+        DEFAULT_MASK_COLUMNS
+        if raw_mask_columns is None
+        else tuple(
+            item.strip().lower() for item in raw_mask_columns.split(",") if item.strip()
+        )
+    )
     if database and allowed and database not in allowed:
         raise ValueError(
             f"MYSQL_DATABASE '{database}' is not in MYSQL_ALLOWED_DATABASES"
@@ -445,11 +477,15 @@ def _legacy_profile() -> ConnectionProfile:
     result_format = os.getenv("MYSQL_RESULT_FORMAT", "csv").lower()
     if result_format not in RESULT_FORMATS:
         raise ValueError("MYSQL_RESULT_FORMAT must be csv or json")
-    ssl_mode = os.getenv("MYSQL_SSL_MODE", "").upper()
+    ssl_mode = os.getenv("MYSQL_SSL_MODE", "REQUIRED").upper()
     if ssl_mode not in SSL_MODES:
         raise ValueError(
             "MYSQL_SSL_MODE must be DISABLED, REQUIRED, VERIFY_CA or VERIFY_IDENTITY"
         )
+    ssl_ca = os.getenv("MYSQL_SSL_CA") or None
+    if ssl_mode in {"VERIFY_CA", "VERIFY_IDENTITY"} and not ssl_ca:
+        raise ValueError(f"MYSQL_SSL_MODE={ssl_mode} requires MYSQL_SSL_CA")
+
     required_context = tuple(
         item.strip()
         for item in os.getenv("MYSQL_AUDIT_REQUIRED_CONTEXT", "").split(",")
@@ -527,6 +563,7 @@ def _legacy_profile() -> ConnectionProfile:
             minimum=100,
             maximum=1_000_000,
         ),
+        mask_columns=mask_columns,
         result_format=result_format,
         pool_size=_bounded_int(
             os.getenv("MYSQL_POOL_SIZE"),
@@ -559,7 +596,7 @@ def _legacy_profile() -> ConnectionProfile:
         use_pure=_env_bool("MYSQL_USE_PURE"),
         raise_on_warnings=_env_bool("MYSQL_RAISE_ON_WARNINGS"),
         ssl_mode=ssl_mode,
-        ssl_ca=os.getenv("MYSQL_SSL_CA") or None,
+        ssl_ca=ssl_ca,
         ssh=SshConfig(
             enabled=_env_bool("MYSQL_SSH_ENABLE"),
             host=os.getenv("MYSQL_SSH_HOST") or None,
@@ -731,7 +768,7 @@ def build_connector_config(
     if profile.ssl_mode == "DISABLED":
         config["ssl_disabled"] = True
     elif profile.ssl_mode == "REQUIRED":
-        config["ssl_verify_cert"] = True
+        config["ssl_disabled"] = False
     elif profile.ssl_mode in {"VERIFY_CA", "VERIFY_IDENTITY"}:
         config["ssl_verify_cert"] = True
         if profile.ssl_mode == "VERIFY_IDENTITY":

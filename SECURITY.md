@@ -118,18 +118,21 @@ If your MySQL server is not on the same network as the MCP server, **do not expo
 For production environments, always encrypt the connection between the MCP server and MySQL.
 
 Use the `MYSQL_SSL_MODE` environment variable to control encryption:
+- `DISABLED`: Allows plaintext only when explicitly selected; do not use in production.
 - `REQUIRED`: Ensures the connection is encrypted.
 - `VERIFY_CA`: Encrypts and verifies the server's certificate against a CA.
 - `VERIFY_IDENTITY`: Encrypts and verifies that the server's hostname matches the certificate.
 
-Specify the CA certificate path using `MYSQL_SSL_CA` if using verification modes.
+`REQUIRED` is the default, and the MCP verifies after connection that the
+connector reports an encrypted session. Specify the CA certificate path using
+`MYSQL_SSL_CA` when using either verification mode.
 
 ### SQL Injection Protection
 
 The MCP server includes built-in protection against SQL injection for administrative operations:
 - All database and table identifiers provided via resources or tool arguments are strictly validated against a regex whitelist (`^[a-zA-Z0-9_$]+$`).
 - Identifiers are automatically quoted with backticks in internal queries.
-- `execute_sql` uses a lexer-style guard that ignores ordinary strings and comments but rejects executable comments, multiple statements, DML, DDL, locks, transactions, `SELECT INTO`, and session assignment.
+- `execute_sql` uses a lexer-style guard that ignores ordinary strings and comments but rejects MySQL `/*!...*/` and MariaDB `/*M!...*/` executable comments, multiple statements, DML, DDL, locks, transactions, `SELECT INTO`, and session assignment.
 - Stored functions and UDFs are fail-closed unless sqlglot recognizes them as a
   built-in or their reviewed name is explicitly listed in `allowed_functions`.
   Sequence advancement, lock functions and other known side-effecting functions
@@ -137,11 +140,16 @@ The MCP server includes built-in protection against SQL injection for administra
 - All exposed SQL then runs inside a MySQL read-only transaction. Normal completion rolls back; cancellation or result truncation closes the socket, forcing rollback and stopping unread-row production.
 - Every MCP tool is advertised as read-only and non-destructive.
 - Named profiles can define `allowed_databases`; SQL table/function qualifiers and resource URIs are checked against it with a MySQL AST parser.
+- User-supplied `SHOW` statements must be safely scoped to an allowed database; server-wide account, process, engine, binary-log, status, and variable inspection is blocked.
 - System schemas are blocked for user SQL unless `allow_system_databases=true` is explicitly configured.
 - Full-call, connector socket, and MySQL/MariaDB statement timeouts limit resource exhaustion. MCP cancellation actively closes the connector socket.
 - Audit logs never contain SQL text, result data, credentials, hosts, usernames,
   or SSH key paths. They contain a literal-free fingerprint plus the policy and
   execution metadata needed for investigation.
+- Result cells whose output or source columns match `mask_columns` are replaced
+  with `[REDACTED]`. Source-column detection traverses aliases, expressions and
+  CTEs; review the patterns for your schema because name-based masking cannot
+  replace database views or column-level permissions.
 
 These controls enforce the MCP read-only contract even when the supplied MySQL
 account has write privileges. A `SELECT`-only account is still recommended as
@@ -168,6 +176,12 @@ name of a secret-manager supplied environment variable to sign every event with
 HMAC-SHA256. `audit_fail_closed=true` requires a durable audit file and makes
 audit sink/signing failures fail the MCP call. `audit_fsync=true` trades
 throughput for stronger local durability.
+
+Fail-closed query execution uses two-phase audit recording: an fsynced
+`status=started` event must be durable before a database connection is opened,
+then a terminal success, denial, error, timeout, or cancellation event is
+written. Monitoring should alert on started events without a matching terminal
+event, which can indicate process termination or an unavailable audit sink.
 
 The audit context and MCP client metadata are caller assertions. For
 cryptographically strong human attribution, terminate the remote transport at

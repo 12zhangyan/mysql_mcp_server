@@ -1,6 +1,7 @@
 "use strict";
 
 const fs = require("node:fs");
+const crypto = require("node:crypto");
 const os = require("node:os");
 const path = require("node:path");
 const { spawn, spawnSync } = require("node:child_process");
@@ -90,6 +91,33 @@ function bundledWheel(root = packageRoot) {
   return path.join(vendor, wheels[0]);
 }
 
+function dependencyLock(root = packageRoot) {
+  const lock = path.join(root, "npm", "requirements.lock");
+  if (!fs.existsSync(lock)) {
+    throw new Error("The npm package is missing its hashed Python dependency lock.");
+  }
+  return lock;
+}
+
+function runtimeFingerprint(wheel, lock) {
+  const digest = crypto.createHash("sha256");
+  digest.update(fs.readFileSync(wheel));
+  digest.update(fs.readFileSync(lock));
+  return digest.digest("hex");
+}
+
+function runtimeIsReady(marker, runtimePython, fingerprint) {
+  if (!fs.existsSync(marker) || !fs.existsSync(runtimePython)) {
+    return false;
+  }
+  try {
+    const state = JSON.parse(fs.readFileSync(marker, "utf8"));
+    return state.runtimeFingerprint === fingerprint;
+  } catch {
+    return false;
+  }
+}
+
 function virtualenvPython(virtualenv, platform = process.platform) {
   return platform === "win32"
     ? path.join(virtualenv, "Scripts", "python.exe")
@@ -145,13 +173,15 @@ function acquireInstallLock(lockPath, markerPath) {
 
 function ensureRuntime() {
   const wheel = bundledWheel();
+  const lockfile = dependencyLock();
+  const fingerprint = runtimeFingerprint(wheel, lockfile);
   const runtimeRoot = path.join(cacheBase(), manifest.version);
   const virtualenv = path.join(runtimeRoot, "venv");
   const marker = path.join(runtimeRoot, "ready.json");
   const lock = path.join(runtimeRoot, "install.lock");
   const runtimePython = virtualenvPython(virtualenv);
 
-  if (fs.existsSync(marker) && fs.existsSync(runtimePython)) {
+  if (runtimeIsReady(marker, runtimePython, fingerprint)) {
     return runtimePython;
   }
 
@@ -161,7 +191,7 @@ function ensureRuntime() {
     return runtimePython;
   }
   try {
-    if (fs.existsSync(marker) && fs.existsSync(runtimePython)) {
+    if (runtimeIsReady(marker, runtimePython, fingerprint)) {
       return runtimePython;
     }
     const python = detectPython();
@@ -180,16 +210,34 @@ function ensureRuntime() {
         "install",
         "--disable-pip-version-check",
         "--no-input",
+        "--require-hashes",
+        "--only-binary=:all:",
+        "--upgrade",
+        "-r",
+        lockfile,
+      ],
+      "Locked Python dependency installation",
+    );
+    runChecked(
+      runtimePython,
+      [
+        "-m",
+        "pip",
+        "install",
+        "--disable-pip-version-check",
+        "--no-input",
+        "--no-deps",
         "--upgrade",
         wheel,
       ],
-      "Python dependency installation",
+      "Bundled Python package installation",
     );
     fs.writeFileSync(
       marker,
       `${JSON.stringify({
         packageVersion: manifest.version,
         wheel: path.basename(wheel),
+        runtimeFingerprint: fingerprint,
       })}\n`,
       "utf8",
     );
@@ -237,6 +285,7 @@ async function main(argv = process.argv.slice(2)) {
 module.exports = {
   bundledWheel,
   cacheBase,
+  dependencyLock,
   detectPython,
   ensureRuntime,
   main,

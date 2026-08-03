@@ -20,6 +20,8 @@ containment layer rather than a correctness prerequisite.
    built-in bearer token.
 8. Forward JSONL audit events to an append-only SIEM and alert on denials,
    timeouts, repeated errors and privilege-assessment warnings.
+9. Review `mask_columns` against the organization's data classification catalog
+   and expose database views that omit sensitive fields where possible.
 
 ## Database Account
 
@@ -57,6 +59,7 @@ allowed_databases = ["application_database"]
 # Unrecognized stored functions/UDFs are blocked. This list should normally
 # remain empty. Add only reviewed deterministic functions with no side effects.
 allowed_functions = []
+mask_columns = ["password", "passwd", "*secret*", "*token*", "*api_key*", "*private_key*", "ssn", "id_card", "phone", "email"]
 
 ssl_mode = "VERIFY_IDENTITY"
 ssl_ca = "/etc/mysql-mcp/company-ca.pem"
@@ -128,6 +131,15 @@ Each line is canonical JSON containing:
 The query ID is a non-reversible fingerprint with literals removed. SQL text,
 result rows, credentials, hosts, usernames and private-key paths are excluded.
 Denied SQL receives an audit event even though it never reaches MySQL.
+In fail-closed mode, the server first persists and fsyncs a `started` event
+before opening the database connection, then writes a terminal outcome. Alert
+on unmatched started events and preserve them during incident review.
+
+Result masking is a final egress control, not an authorization boundary. Output
+names matching `mask_columns` are redacted, and any sensitive source column
+found through an alias, expression, subquery, or CTE causes conservative
+redaction. Validate patterns with representative queries and prefer restricted
+views or column grants for fields that must never be exposed.
 
 When HMAC signing is enabled, verify a line by removing `signature`, serializing
 the remaining object as UTF-8 JSON with sorted keys and compact separators, and
@@ -188,6 +200,8 @@ read-only operations were sent:
 - pre-connection rejection of DML, DDL, multiple statements, locking reads and
   system-schema access
 - durable JSONL events, required context, HMAC signatures and denial auditing
+- two-phase fail-closed audit records persisted before database connection
+- output/source-column masking, including alias and CTE cases
 - absence of SQL text, database host and credentials from audit records
 - encrypted transport verification (`TLS_AES_128_GCM_SHA256` on the tested
   connection)

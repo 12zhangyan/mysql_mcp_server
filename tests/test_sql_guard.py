@@ -44,6 +44,8 @@ def test_allows_read_only_queries(query):
         "SELECT BENCHMARK(1000, SHA1('x'))",
         "SELECT 1; DELETE FROM users",
         "/*!50000 DROP TABLE users */",
+        "SELECT 1 /*M! INTO OUTFILE '/tmp/leak.txt' */",
+        "SELECT 2 /*M! + SLEEP(5) */",
     ],
 )
 def test_blocks_non_read_only_queries(query):
@@ -101,6 +103,43 @@ def test_internal_metadata_query_can_use_information_schema():
         internal=True,
     )
     assert accessed == {"app", "information_schema"}
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SHOW DATABASES",
+        "SHOW TABLES FROM mysql",
+        "SHOW COLUMNS FROM users FROM secret",
+        "SHOW INDEX FROM secret.users",
+        "SHOW TRIGGERS FROM secret",
+        "SHOW PROCESSLIST",
+    ],
+)
+def test_show_statements_cannot_bypass_database_scope(query):
+    with pytest.raises(ReadOnlyViolation):
+        validate_database_access(
+            query,
+            selected_database="app",
+            allowed_databases=("app",),
+            allow_system_databases=False,
+        )
+
+
+def test_schema_scoped_show_and_internal_grants_remain_available():
+    assert validate_database_access(
+        "SHOW TABLES FROM app",
+        selected_database="app",
+        allowed_databases=("app",),
+        allow_system_databases=False,
+    ) == {"app"}
+    assert validate_database_access(
+        "SHOW GRANTS",
+        selected_database="app",
+        allowed_databases=("app",),
+        allow_system_databases=False,
+        internal=True,
+    ) == {"app"}
 
 
 def test_query_fingerprint_omits_literal_differences():

@@ -1,6 +1,7 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const test = require("node:test");
@@ -8,6 +9,7 @@ const test = require("node:test");
 const manifest = require("../../package.json");
 const {
   cacheBase,
+  dependencyLock,
   detectPython,
   pythonCandidates,
   virtualenvPython,
@@ -21,6 +23,13 @@ test("manifest exposes the expected public CLI", () => {
   );
   assert.equal(manifest.publishConfig.access, "public");
   assert.match(manifest.repository.url, /12zhangyan\/mysql_mcp_server/);
+});
+
+test("hashed Python dependency lock is packaged", () => {
+  const lock = fs.readFileSync(dependencyLock(), "utf8");
+  assert.match(lock, /--hash=sha256:/);
+  assert.match(lock, /mcp==/);
+  assert.match(lock, /mysql-connector-python==/);
 });
 
 test("configured Python takes precedence", () => {

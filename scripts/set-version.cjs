@@ -8,7 +8,7 @@ const root = path.resolve(__dirname, "..");
 const requested = process.argv[2];
 if (!requested || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(requested)) {
   process.stderr.write(
-    "Usage: npm run release:version -- <semver>, for example 0.7.1\n",
+    "Usage: npm run release:version -- <semver>, for example 0.7.2\n",
   );
   process.exit(1);
 }
@@ -65,5 +65,5 @@ if (uvLock.error && uvLock.error.code === "ENOENT") {
 }
 
 process.stdout.write(
-  `Version set to ${requested}. Update CHANGELOG.md, run tests, commit, and push main.\n`,
+  `Version set to ${requested}. Update CHANGELOG.md, run tests, commit, and push the release branch.\n`,
 );

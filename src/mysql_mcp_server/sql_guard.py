@@ -76,6 +76,22 @@ BLOCKED_FUNCTIONS = {
 
 SYSTEM_DATABASES = {"information_schema", "mysql", "performance_schema", "sys"}
 
+# SHOW statements are parsed separately from ordinary table expressions by
+# sqlglot. Only schema-scoped metadata forms are safe for user-supplied SQL;
+# server-wide forms (DATABASES, PROCESSLIST, GRANTS, BINARY LOGS, ...) can leak
+# information outside a profile's database allowlist.
+SCOPED_SHOW_KINDS = {
+    "COLUMNS",
+    "EVENTS",
+    "INDEX",
+    "INDEXES",
+    "KEYS",
+    "OPEN TABLES",
+    "TABLE STATUS",
+    "TABLES",
+    "TRIGGERS",
+}
+
 # sqlglot represents well-known functions with dedicated AST classes. Only
 # unresolved/Anonymous calls need an explicit allowlist because they may be a
 # stored function or UDF with effects outside transaction read-only controls.
@@ -148,8 +164,11 @@ def _sanitize_sql(sql: str) -> tuple[str, list[int]]:
             continue
 
         if sql.startswith("/*", index):
-            if sql.startswith("/*!", index):
-                raise ReadOnlyViolation("MySQL executable comments are not allowed")
+            comment_prefix = sql[index : index + 4].upper()
+            if sql.startswith("/*!", index) or comment_prefix == "/*M!":
+                raise ReadOnlyViolation(
+                    "MySQL and MariaDB executable comments are not allowed"
+                )
             start = index
             end = sql.find("*/", index + 2)
             if end < 0:
@@ -287,6 +306,20 @@ def validate_database_access(
     accessed: set[str] = set()
     if selected_database:
         accessed.add(selected_database)
+
+    if isinstance(statement, exp.Show):
+        show_kind = str(statement.args.get("this") or "").upper()
+        show_database = statement.args.get("db")
+        if isinstance(show_database, exp.Identifier):
+            accessed.add(show_database.name)
+        elif show_database is not None:
+            raise ReadOnlyViolation("SHOW database scope could not be validated safely")
+
+        if not internal and show_kind not in SCOPED_SHOW_KINDS:
+            raise ReadOnlyViolation(
+                f"Server-wide SHOW {show_kind or 'statement'} is blocked; "
+                "use the dedicated metadata tools"
+            )
     for table in statement.find_all(exp.Table):
         database = table.db
         if database:

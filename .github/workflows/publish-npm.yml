@@ -67,6 +67,7 @@ jobs:
       - name: Test npm launcher
         run: |
           npm test
+          npm run test:install
           npm run stage:wheel
           npm pack --dry-run
 

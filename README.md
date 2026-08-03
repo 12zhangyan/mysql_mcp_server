@@ -34,7 +34,9 @@ npx -y @yanzhang123/readonly-db-mcp
 
 Python 3.11 or newer is required. On first use, the launcher creates a
 versioned virtual environment in the user cache and installs the bundled wheel
-plus its Python dependencies. Override Python with `MYSQL_MCP_PYTHON` or the
+plus exact Python dependencies from a version-controlled SHA-256 lock file.
+Downloads use the configured pip index and the completed environment is cached
+by wheel-and-lock fingerprint. Override Python with `MYSQL_MCP_PYTHON` or the
 cache location with `MYSQL_MCP_NPM_CACHE_DIR`.
 
 For MCP clients, use `npx` as the command and
@@ -77,6 +79,7 @@ query_timeout_ms = 30000
 max_rows = 500
 max_cell_length = 20000
 result_format = "json"
+mask_columns = ["password", "passwd", "*secret*", "*token*", "*api_key*", "*private_key*", "ssn", "id_card", "phone", "email"]
 pool_size = 3
 audit_enabled = true
 
@@ -91,6 +94,7 @@ allowed_functions = [] # reviewed deterministic UDF/stored-function names only
 query_timeout_ms = 15000
 max_rows = 200
 result_format = "json"
+mask_columns = ["password", "passwd", "*secret*", "*token*", "*api_key*", "*private_key*", "ssn", "id_card", "phone", "email"]
 pool_size = 5
 ssl_mode = "VERIFY_CA"
 ssl_ca = "C:/certs/company-ca.pem"
@@ -118,6 +122,7 @@ MYSQL_MAX_ROWS=500             # optional; 1-1000, default 500
 MYSQL_QUERY_TIMEOUT_MS=30000   # full-call timeout, 100-300000 ms
 MYSQL_MAX_CELL_LENGTH=20000    # truncate oversized values
 MYSQL_RESULT_FORMAT=json       # csv or json
+MYSQL_MASK_COLUMNS=password,passwd,*secret*,*token*,*api_key*,*private_key*,ssn,id_card,phone,email
 MYSQL_POOL_SIZE=0              # legacy mode; named profiles default to 5
 MYSQL_ALLOWED_DATABASES=app,reporting
 MYSQL_ALLOWED_FUNCTIONS=              # optional reviewed function names
@@ -160,7 +165,8 @@ MYSQL_PASSWORD=your_password
 MYSQL_DATABASE=your_database # Optional: Omit for multi-database mode
 
 # Advanced Configuration
-MYSQL_SSL_MODE=DISABLED  # DISABLED, REQUIRED, VERIFY_CA, VERIFY_IDENTITY
+MYSQL_SSL_MODE=REQUIRED  # DISABLED, REQUIRED, VERIFY_CA, VERIFY_IDENTITY
+MYSQL_SSL_CA=            # required for VERIFY_CA / VERIFY_IDENTITY
 MYSQL_CONNECT_TIMEOUT=10 # Timeout in seconds
 MYSQL_QUERY_TIMEOUT_MS=30000
 MYSQL_MAX_ROWS=500
@@ -385,6 +391,10 @@ pytest
 - **Resource limits:** Calls have full-operation, socket and server statement timeouts; at most 1000 rows are returned and oversized cells are truncated.
 - **Cancellation:** Cancelling the MCP request closes the active connector socket. The worker does not continue silently after the response is abandoned.
 - **Enterprise audit:** Versioned UTC JSONL events include an event ID, MCP request ID, operation, caller-supplied attribution, policy decision, target database, literal-free query fingerprint, duration, result size and outcome. SQL text and result data are never logged. Optional rotation, fsync, HMAC signatures, required context and fail-closed behavior are supported.
+- **Two-phase audit:** In fail-closed mode, an fsynced `started` event is persisted before opening a database connection, followed by the terminal outcome event.
+- **Result masking:** Sensitive output names are redacted by default. Queries whose expression tree references a sensitive source column are conservatively redacted even when aliases or CTEs hide the original name. Review `mask_columns` for each schema; setting it to an empty list explicitly disables masking.
+- **Encrypted by default:** Database TLS defaults to `REQUIRED` and the connected session is rejected if the connector reports plaintext. Production profiles should use `VERIFY_CA` or `VERIFY_IDENTITY` with `ssl_ca`.
+- **Parser hardening:** MySQL `/*!...*/` and MariaDB `/*M!...*/` executable comments are rejected, and server-wide `SHOW` variants are blocked unless they can be scoped to an allowed database.
 - **Identifier Validation:** Table and database names passed to `get_schema_info` and `get_table_sample` are validated against a strict whitelist (alphanumeric, underscore, and `$` only; a single dot is allowed as a `database.table` separator). Other special characters are rejected to prevent SQL injection.
 - **Encrypted Access:** Full support for SSL/TLS and SSH Tunneling for secure remote connections.
 - **Log Privacy:** SQL text, passwords, hosts, usernames and SSH private-key paths are not included in tool discovery or audit events.

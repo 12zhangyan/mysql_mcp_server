@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2] - 2026-08-03
+
+### Security
+- Reject MariaDB `/*M!...*/` as well as MySQL `/*!...*/` executable comments.
+- Enforce database scoping for `SHOW` statements and block unsafe server-wide
+  variants from user SQL.
+- Redact sensitive result columns, including sources hidden by aliases, CTEs,
+  or expressions, using configurable per-profile patterns.
+- Default database connections to TLS `REQUIRED` and reject a session when the
+  connector reports that transport encryption was not established.
+- Persist a durable `started` audit event before connecting in fail-closed mode.
+
+### Fixed
+- Dispose superseded connection pools during profile hot reload.
+- Install exact hash-verified Python dependencies for the npm launcher and
+  fingerprint its cache from both the embedded wheel and dependency lock.
+- Separate deterministic npm launcher tests from the explicit live package
+  installation test.
+
 ## [0.7.1] - 2026-08-03
 
 ### Fixed

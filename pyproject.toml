@@ -1,6 +1,6 @@
 [project]
 name = "mysql_mcp_server"
-version = "0.7.1"
+version = "0.7.2"
 description = "A strictly read-only Model Context Protocol (MCP) server for safely exploring multiple MySQL environments and databases."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -18,8 +18,8 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-    "mcp>=1.2.0,<2.0.0",
-    "mysql-connector-python>=9.1.0,<10.0.0",
+    "mcp>=1.9.0,<2.0.0",
+    "mysql-connector-python>=9.2.0,<10.0.0",
     "python-dotenv>=1.0.0,<2.0.0",
     "sqlglot>=26.0.0,<31.0.0",
 ]
