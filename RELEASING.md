@@ -34,16 +34,18 @@ exist. A `v0.7.2` tag can also trigger the same workflow.
 ## Initial npm Publication
 
 The package name is `@yanzhang123/readonly-db-mcp`. The first publication must be
-performed by an authenticated npm owner. Use staged publishing so that the
-package can be reviewed in npm before its public release:
+performed directly by an authenticated npm owner. npm does not allow staged
+publishing or Trusted Publisher configuration until the package already exists:
 
 ```bash
 npm login
-npx --yes npm@11.19.0 stage publish
+npm whoami
+npm publish --access public
 ```
 
-Then open npmjs.com, go to **Staged Packages**, inspect the staged artifact, and
-approve it with 2FA. No npm token belongs in this repository.
+Complete the 2FA prompt locally; never paste an OTP into source files, issues,
+chat, or logs. After the initial version exists, configure the Trusted Publisher
+below for subsequent releases. No npm token belongs in this repository.
 
 ## Automatic npm Authentication
 
