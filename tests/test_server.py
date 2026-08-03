@@ -20,7 +20,7 @@ from pydantic import AnyUrl
 def test_server_initialization():
     """Test that the server initializes correctly."""
     assert app.name == "mysql_mcp_server"
-    assert __version__ == "0.7.5"
+    assert __version__ == "0.7.6"
 
 
 def test_sse_public_bind_requires_authentication():

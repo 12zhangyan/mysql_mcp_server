@@ -18,6 +18,10 @@ const {
 test("manifest exposes the expected public CLI", () => {
   assert.equal(manifest.name, "@yanzhang123/readonly-db-mcp");
   assert.equal(
+    manifest.bin["readonly-db-mcp"],
+    "npm/bin/mysql-mcp-server-readonly.cjs",
+  );
+  assert.equal(
     manifest.bin["mysql-mcp-server-readonly"],
     "npm/bin/mysql-mcp-server-readonly.cjs",
   );

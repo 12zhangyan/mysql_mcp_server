@@ -1,6 +1,6 @@
 {
   "name": "@yanzhang123/readonly-db-mcp",
-  "version": "0.7.5",
+  "version": "0.7.6",
   "description": "Enterprise-auditable, strictly read-only MySQL MCP server with multi-environment profiles.",
   "license": "MIT",
   "type": "commonjs",
@@ -14,6 +14,7 @@
     "url": "git+https://github.com/12zhangyan/mysql_mcp_server.git"
   },
   "bin": {
+    "readonly-db-mcp": "npm/bin/mysql-mcp-server-readonly.cjs",
     "mysql-mcp-server-readonly": "npm/bin/mysql-mcp-server-readonly.cjs"
   },
   "files": [

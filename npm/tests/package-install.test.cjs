@@ -54,6 +54,20 @@ test(
       const tarball = path.join(temporary, filename);
       runNpm(["install", "--prefix", temporary, "--ignore-scripts", tarball]);
 
+      const publicShim = path.join(
+        temporary,
+        "node_modules",
+        ".bin",
+        process.platform === "win32"
+          ? "readonly-db-mcp.cmd"
+          : "readonly-db-mcp",
+      );
+      assert.ok(fs.existsSync(publicShim));
+      const shimVersion = checked(publicShim, ["--launcher-version"], {
+        shell: process.platform === "win32",
+      });
+      assert.equal(shimVersion.stdout.trim(), manifest.version);
+
       const launcher = path.join(
         temporary,
         "node_modules",
