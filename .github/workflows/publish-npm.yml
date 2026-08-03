@@ -34,9 +34,10 @@ jobs:
         with:
           node-version: "24"
           cache: npm
+          registry-url: "https://registry.npmjs.org"
 
-      - name: Use current npm with trusted publishing support
-        run: npm install --global npm@latest
+      - name: Use OIDC-capable npm CLI
+        run: npm install --global npm@11.18.0
 
       - name: Install build tools
         run: python -m pip install --upgrade build
