@@ -49,8 +49,11 @@ npx -y @yanzhang123/readonly-db-mcp
 For controlled production rollouts, pin the reviewed version:
 
 ```bash
-npx -y @yanzhang123/readonly-db-mcp@0.7.3
+npx -y @yanzhang123/readonly-db-mcp@x.y.z
 ```
+
+Replace `x.y.z` with the version approved by your organization. The unversioned
+examples below intentionally resolve the npm `latest` tag.
 
 On first use, the launcher creates a versioned virtual environment in the user
 cache and installs the bundled wheel plus exact Python dependencies from a
@@ -73,7 +76,7 @@ passwords in environment variables, and use an absolute path:
   "mcpServers": {
     "mysql-readonly": {
       "command": "npx",
-      "args": ["-y", "@yanzhang123/readonly-db-mcp@0.7.3"],
+      "args": ["-y", "@yanzhang123/readonly-db-mcp"],
       "env": {
         "MYSQL_PROFILES_FILE": "C:/absolute/path/mysql-connections.toml",
         "MYSQL_DEV_PASSWORD": "set-in-the-client-secret-store"
@@ -370,7 +373,7 @@ Add this to your `claude_desktop_config.json`:
   "mcpServers": {
     "mysql-readonly": {
       "command": "npx",
-      "args": ["-y", "@yanzhang123/readonly-db-mcp@0.7.3"],
+      "args": ["-y", "@yanzhang123/readonly-db-mcp"],
       "env": {
         "MYSQL_PROFILES_FILE": "C:/absolute/path/mysql-connections.toml",
         "MYSQL_DEV_PASSWORD": "your_dev_password",
@@ -391,7 +394,7 @@ Add this to your `mcp.json`:
     "mysql-readonly": {
       "type": "stdio",
       "command": "npx",
-      "args": ["-y", "@yanzhang123/readonly-db-mcp@0.7.3"],
+      "args": ["-y", "@yanzhang123/readonly-db-mcp"],
       "env": {
         "MYSQL_PROFILES_FILE": "C:/absolute/path/mysql-connections.toml",
         "MYSQL_DEV_PASSWORD": "your_dev_password",
