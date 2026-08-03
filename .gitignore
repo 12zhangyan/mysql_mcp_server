@@ -9,8 +9,6 @@ wheels/
 # Virtual environments
 .venv
 venv/
-Lib/
-Scripts/
 
 # Development environment
 .python-version
@@ -22,7 +20,16 @@ Scripts/
 # Claude Code
 .claude/
 
+# Local connection profiles may contain database credentials.
+mysql-connections.toml
+
+# Python wheel staged into the npm package during release builds.
+npm/vendor/*.whl
+
 # Distribution directories
 *.dist-info/
+
+# Local, untrusted web-research cache.
+.firecrawl/
 
 pypi_publishing_notes.md

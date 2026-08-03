@@ -1,0 +1,53 @@
+{
+  "name": "@yanzhang123/readonly-db-mcp",
+  "version": "0.7.3",
+  "description": "Enterprise-auditable, strictly read-only MySQL MCP server with multi-environment profiles.",
+  "license": "MIT",
+  "type": "commonjs",
+  "author": "zhangyan",
+  "homepage": "https://github.com/12zhangyan/mysql_mcp_server#readme",
+  "bugs": {
+    "url": "https://github.com/12zhangyan/mysql_mcp_server/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/12zhangyan/mysql_mcp_server.git"
+  },
+  "bin": {
+    "mysql-mcp-server-readonly": "npm/bin/mysql-mcp-server-readonly.cjs"
+  },
+  "files": [
+    "npm/bin",
+    "npm/lib",
+    "npm/requirements.lock",
+    "npm/vendor/*.whl",
+    "README.md",
+    "ENTERPRISE_DEPLOYMENT.md",
+    "SECURITY.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "verify": "node scripts/verify-versions.cjs",
+    "release:version": "node scripts/set-version.cjs",
+    "stage:wheel": "node scripts/stage-npm-wheel.cjs",
+    "prepack": "npm run verify && npm run stage:wheel",
+    "test": "npm run verify && node --test npm/tests/launcher.test.cjs",
+    "test:install": "node --test npm/tests/package-install.test.cjs",
+    "pack:check": "npm pack --dry-run"
+  },
+  "engines": {
+    "node": ">=18",
+    "npm": ">=9"
+  },
+  "keywords": [
+    "mcp",
+    "mysql",
+    "readonly",
+    "database",
+    "audit",
+    "model-context-protocol"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

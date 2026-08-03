@@ -1,0 +1,92 @@
+name: Publish npm
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+    paths:
+      - package.json
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: npm-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: npm
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Use OIDC-capable npm CLI
+        run: npm install --global npm@11.18.0
+
+      - name: Install build tools
+        run: python -m pip install --upgrade build
+
+      - name: Install npm metadata
+        run: npm ci --ignore-scripts
+
+      - name: Verify synchronized versions
+        run: npm run verify
+
+      - name: Verify release tag
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          package_version="$(node -p "require('./package.json').version")"
+          tag_version="${GITHUB_REF_NAME#v}"
+          test "$package_version" = "$tag_version"
+
+      - name: Build and test Python package
+        run: |
+          python -m pip install --upgrade -r requirements-dev.txt
+          python -m build
+          python -m pip install --force-reinstall dist/*.whl
+          python -c "import mysql_mcp_server; print(mysql_mcp_server.__version__)"
+          python -m pytest -q
+
+      - name: Test npm launcher
+        run: |
+          npm test
+          npm run test:install
+          npm run stage:wheel
+          npm pack --dry-run
+
+      - name: Configure npm token fallback
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        shell: bash
+        run: |
+          if [ -n "$NODE_AUTH_TOKEN" ]; then
+            npm config set //registry.npmjs.org/:_authToken "$NODE_AUTH_TOKEN"
+          fi
+
+      - name: Publish package
+        shell: bash
+        run: |
+          package_name="$(node -p "require('./package.json').name")"
+          package_version="$(node -p "require('./package.json').version")"
+          if npm view "${package_name}@${package_version}" version >/dev/null 2>&1; then
+            echo "${package_name}@${package_version} is already published"
+            exit 0
+          fi
+          npm publish --access public --provenance
