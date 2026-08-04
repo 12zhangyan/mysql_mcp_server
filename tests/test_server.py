@@ -20,7 +20,7 @@ from pydantic import AnyUrl
 def test_server_initialization():
     """Test that the server initializes correctly."""
     assert app.name == "mysql_mcp_server"
-    assert __version__ == "0.7.6"
+    assert __version__ == "0.8.0"
 
 
 def test_sse_public_bind_requires_authentication():
@@ -41,7 +41,7 @@ def test_sse_bearer_token_has_minimum_length():
 async def test_list_tools():
     """Test that list_tools returns expected tools."""
     tools = await list_tools()
-    assert len(tools) == 9
+    assert len(tools) == 10
     assert any(t.name == "list_connections" for t in tools)
     assert any(t.name == "validate_connections" for t in tools)
     assert any(t.name == "check_connection" for t in tools)
@@ -51,6 +51,7 @@ async def test_list_tools():
     assert any(t.name == "query" for t in tools)
     assert any(t.name == "get_schema_info" for t in tools)
     assert any(t.name == "get_table_sample" for t in tools)
+    assert any(t.name == "inspect_catalog" for t in tools)
     assert all(t.annotations.readOnlyHint for t in tools)
     assert all(not t.annotations.destructiveHint for t in tools)
 
@@ -253,6 +254,43 @@ async def test_get_table_sample_cross_database(monkeypatch):
     assert captured["kwargs"]["database"] == "otherdb"
     assert captured["kwargs"]["result_offset"] == 10
     assert captured["kwargs"]["bounded_result"] is True
+
+
+@pytest.mark.asyncio
+async def test_inspect_catalog_uses_fixed_projection(monkeypatch):
+    monkeypatch.setenv("MYSQL_USER", "u")
+    monkeypatch.setenv("MYSQL_PASSWORD", "p")
+    captured = {}
+
+    async def fake_run_query(query, **kwargs):
+        captured["query"] = query
+        captured["kwargs"] = kwargs
+        return []
+
+    with patch("mysql_mcp_server.server.run_query", side_effect=fake_run_query):
+        response = await call_tool(
+            "inspect_catalog",
+            {"kind": "indexes", "database": "app", "table_name": "orders"},
+        )
+
+    assert response == []
+    assert "FROM information_schema.STATISTICS" in captured["query"]
+    assert "TABLE_SCHEMA = 'app'" in captured["query"]
+    assert "TABLE_NAME = 'orders'" in captured["query"]
+    assert captured["kwargs"]["internal"] is True
+
+
+@pytest.mark.asyncio
+async def test_inspect_catalog_rejects_injected_table_before_query(monkeypatch):
+    monkeypatch.setenv("MYSQL_USER", "u")
+    monkeypatch.setenv("MYSQL_PASSWORD", "p")
+    with patch("mysql_mcp_server.server.run_query") as runner:
+        response = await call_tool(
+            "inspect_catalog",
+            {"kind": "columns", "database": "app", "table_name": "x' OR 1=1"},
+        )
+    assert "Invalid identifier" in response[0].text
+    runner.assert_not_called()
 
 
 @pytest.mark.asyncio

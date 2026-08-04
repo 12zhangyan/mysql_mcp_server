@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-08-04
+
+### Added
+- Add OS keyring credentials with an interactive `readonly-db-mcp credentials`
+  command, plus a bounded no-shell command provider for enterprise secret
+  managers. Credential values are never returned by diagnostics.
+- Add explicit logical connection routes so one environment name can map exact
+  database aliases to separate physical profiles without implicit guessing.
+- Add `inspect_catalog` for allowlisted table, column, index, constraint,
+  foreign-key and view metadata while raw system-schema SQL remains blocked.
+- Record requested logical targets, resolved physical targets and route use in
+  JSON results and audit events.
+
+### Changed
+- `list_connections` now reports credential provider types and configured
+  logical routes without exposing hosts, usernames, credential references or
+  secret values.
+
 ## [0.7.6] - 2026-08-03
 
 ### Fixed

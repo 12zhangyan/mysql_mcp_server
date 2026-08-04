@@ -1,5 +1,6 @@
 mcp>=1.9.0,<2.0.0
 mysql-connector-python>=9.2.0,<10.0.0
+keyring>=25.0.0,<26.0.0
 python-dotenv>=1.0.0,<2.0.0
 sqlglot>=26.0.0,<31.0.0
 starlette>=0.35.0

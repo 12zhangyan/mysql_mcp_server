@@ -176,6 +176,49 @@ MYSQL_ALLOWED_FUNCTIONS=              # optional reviewed function names
 
 `password_env` is recommended. A `password` field is accepted for local-only setups, but `mysql-connections.toml` is gitignored because it may contain secrets. Use an absolute `MYSQL_PROFILES_FILE` path in desktop MCP clients because their working directory is not guaranteed.
 
+For user-level `mcp.json` files, prefer the OS credential store so the password
+does not appear in either MCP configuration or TOML:
+
+```toml
+[connections.dev]
+host = "127.0.0.1"
+user = "readonly_user"
+credential_provider = "keyring"
+credential_ref = "dev"
+database = "app_dev"
+allowed_databases = ["app_dev"]
+```
+
+Store or manage it locally with a masked prompt:
+
+```powershell
+readonly-db-mcp credentials --profiles-file C:/absolute/path/mysql-connections.toml set dev
+readonly-db-mcp credentials --profiles-file C:/absolute/path/mysql-connections.toml status dev
+readonly-db-mcp credentials --profiles-file C:/absolute/path/mysql-connections.toml delete dev
+```
+
+The keyring backend uses the platform credential service (Windows Credential
+Manager on Windows). Headless services can instead set
+`credential_provider = "command"` and a `credential_command = ["executable",
+"arg1"]` array for an approved secret-manager CLI. It is executed directly,
+never through a shell; stderr is discarded, output is bounded, and exactly one
+non-empty UTF-8 line is accepted. Provider failures are explicit but never
+include the secret, command arguments, or keyring reference.
+
+When one logical environment is physically split, declare exact aliases:
+
+```toml
+[routes.shared-test]
+ubp = { connection = "test-ubp", database = "ubp" }
+gts = { connection = "test-gts", database = "gts" }
+eam = { connection = "test-eam", database = "eam" }
+```
+
+A call with `connection="shared-test", database="eam"` resolves only that
+declared route. Unknown aliases fail with the configured choices; the server
+does not search or guess another environment. JSON results and audit records
+contain both requested and resolved targets.
+
 Each tool call can now target an environment without restarting the server:
 
 ```json
@@ -287,7 +330,7 @@ All tools are declared with `readOnlyHint=true` and `destructiveHint=false`.
 Lists named profiles, default database, policy limits and readiness. It never returns hosts, usernames, passwords, or SSH key paths.
 It also returns a `database_routes` index so clients can select the correct
 profile when one environment is split across several database-specific
-connections.
+connections, plus `logical_routes` for exact configured environment aliases.
 
 ### `validate_connections`
 Forces a configuration reload and reports valid/invalid profiles plus missing
@@ -303,6 +346,8 @@ not provide read-only defense in depth.
 ### `list_databases`
 Lists accessible non-system databases.
 - **Arguments:** `connection` (optional)
+- For a configured logical connection, returns its declared database aliases
+  without opening a database connection.
 
 ### `list_tables`
 Lists tables and views in a database.
@@ -347,6 +392,12 @@ Fetches a representative sample of data.
 - **Bounded execution:** Sampling applies `LIMIT limit+1 OFFSET offset` in
   MySQL and fully consumes that small result. It does not open an unbounded
   table scan merely to return a few rows.
+
+### `inspect_catalog`
+Returns one fixed metadata projection for `tables`, `columns`, `indexes`,
+`constraints`, `foreign_keys`, or `views`, optionally filtered by a validated
+bare table name. `connection` and `database` follow the same explicit routing
+rules as other tools. This does not permit arbitrary `information_schema` SQL.
 
 ## Available Prompts
 
@@ -445,9 +496,12 @@ pytest
 - **Write-capable credentials:** Read-only behavior does not depend on account grants. Unrecognized stored functions/UDFs, side-effecting functions, sequence advancement and locking reads are rejected because they can hide effects inside `SELECT`.
 - **Database allowlist:** `allowed_databases` is enforced with a MySQL AST parser for tools and resource URIs; system schemas are blocked by default.
 - **Controlled metadata:** User SQL cannot query `information_schema` by
-  default. Dedicated `list_tables` and `get_schema_info` operations use narrowly
-  scoped internal metadata queries, so catalog access does not become a general
-  system-schema bypass.
+  default. Dedicated `list_tables`, `get_schema_info`, and `inspect_catalog`
+  operations use narrowly scoped internal metadata queries, so catalog access
+  does not become a general system-schema bypass.
+- **Credential isolation:** Named profiles can resolve passwords from an OS
+  keyring or an approved no-shell command. Discovery, logs, errors and audit
+  events omit credential values and keyring references.
 - **Resource limits:** Calls have full-operation, socket and server statement timeouts; at most 1000 rows are returned and oversized cells are truncated.
 - **Cancellation:** Cancelling the MCP request closes the active connector socket. The worker does not continue silently after the response is abandoned.
 - **Enterprise audit:** Versioned UTC JSONL events include an event ID, MCP request ID, operation, caller-supplied attribution, policy decision, target database, literal-free query fingerprint, duration, result size and outcome. SQL text and result data are never logged. Optional rotation, fsync, HMAC signatures, required context and fail-closed behavior are supported.

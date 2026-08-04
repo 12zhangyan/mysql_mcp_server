@@ -73,6 +73,62 @@ async def test_json_pagination_executes_read_only_controls_and_audits(caplog):
     assert '"read_only_enforced":true' in caplog.text
 
 
+@pytest.mark.asyncio
+async def test_logical_route_is_visible_in_result_and_audit(
+    tmp_path, monkeypatch, caplog
+):
+    profiles_file = tmp_path / "connections.toml"
+    profiles_file.write_text(
+        """
+[connections.shared]
+host = "core-db"
+user = "reader"
+password = "secret"
+database = "core"
+allowed_databases = ["core"]
+
+[connections.shared-eam]
+host = "eam-db"
+user = "reader"
+password = "secret"
+database = "eam_physical"
+allowed_databases = ["eam_physical"]
+
+[routes.shared]
+eam = { connection = "shared-eam", database = "eam_physical" }
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MYSQL_PROFILES_FILE", str(profiles_file))
+    connection, _cursor = fake_connection([(1,)], ["id"])
+    with (
+        patch(
+            "mysql_mcp_server.server._open_connection",
+            return_value=(connection, {"database": "eam_physical"}),
+        ),
+        caplog.at_level(logging.INFO, logger="mysql_mcp_server.audit"),
+    ):
+        response = await call_tool(
+            "execute_sql",
+            {
+                "query": "SELECT id FROM orders",
+                "connection": "shared",
+                "database": "eam",
+                "result_format": "json",
+            },
+        )
+
+    payload = json.loads(response[0].text)
+    assert payload["connection"] == "shared-eam"
+    assert payload["database"] == "eam_physical"
+    assert payload["requested_connection"] == "shared"
+    assert payload["requested_database"] == "eam"
+    assert payload["route_applied"] is True
+    assert '"requested_connection":"shared"' in caplog.text
+    assert '"requested_database":"eam"' in caplog.text
+    assert '"route_applied":true' in caplog.text
+
+
 def test_required_tls_rejects_plaintext_connection():
     connection = MagicMock()
     connection.is_secure = False

@@ -79,6 +79,26 @@ audit_fail_closed = true
 audit_fsync = true
 ```
 
+For desktop deployments, replace `password_env` with an OS keyring reference so
+user-level MCP configuration contains no database password:
+
+```toml
+credential_provider = "keyring"
+credential_ref = "prod"
+```
+
+Provision it interactively with `readonly-db-mcp credentials --profiles-file
+C:/absolute/path/mysql-connections.toml set prod`. The tool never prints the
+credential. For non-interactive services, the `command` provider accepts a
+reviewed argv array for a secret-manager CLI and executes it without a shell.
+Restrict the profiles file because command names and non-secret arguments can
+still reveal infrastructure topology.
+
+If an environment spans physical profiles, use `[routes.ENVIRONMENT]` with
+exact database aliases. Each audit event records `requested_connection`,
+`requested_database`, the resolved physical `connection`/`database`, and
+`route_applied`; unknown aliases fail rather than being guessed.
+
 All database tools accept:
 
 ```json
@@ -196,6 +216,10 @@ read-only operations were sent:
 - configuration validation, connection health and grants inspection
 - allowed-database discovery and system-schema filtering
 - table/schema metadata reads
+- controlled catalog projections for tables, columns, indexes, constraints,
+  foreign keys and views while arbitrary system-schema SQL remains denied
+- deterministic keyring, command-provider and explicit-route tests with no
+  production credential material
 - normal query execution and pagination
 - pre-connection rejection of DML, DDL, multiple statements, locking reads and
   system-schema access

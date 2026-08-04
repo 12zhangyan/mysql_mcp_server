@@ -11,10 +11,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .credential_store import get_keyring_password, run_credential_command
+
 PROFILE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_$]+$")
+CREDENTIAL_REFERENCE_PATTERN = re.compile(r"^[A-Za-z0-9_.:/-]+$")
 RESULT_FORMATS = {"csv", "json"}
 SSL_MODES = {"DISABLED", "REQUIRED", "VERIFY_CA", "VERIFY_IDENTITY"}
+CREDENTIAL_PROVIDERS = {"keyring", "command"}
 DEFAULT_MASK_COLUMNS = (
     "password",
     "passwd",
@@ -101,6 +105,11 @@ class ConnectionProfile:
     user: str
     password: str | None = None
     password_env: str | None = None
+    credential_provider: str | None = None
+    credential_ref: str = ""
+    credential_service: str = "readonly-db-mcp"
+    credential_command: tuple[str, ...] = ()
+    credential_timeout_seconds: float = 5.0
     database: str | None = None
     allowed_databases: tuple[str, ...] = ()
     allowed_functions: tuple[str, ...] = ()
@@ -142,21 +151,31 @@ class ConnectionProfile:
             return value
         if self.password is not None:
             return self.password
+        if self.credential_provider == "keyring":
+            return get_keyring_password(self.credential_service, self.credential_ref)
+        if self.credential_provider == "command":
+            return run_credential_command(
+                self.credential_command,
+                self.credential_timeout_seconds,
+            )
         raise ValueError(
-            f"Connection '{self.name}' must define password_env or password"
+            f"Connection '{self.name}' does not have a credential provider"
         )
 
     def runtime_status(self) -> tuple[bool, str]:
-        try:
-            self.resolve_password()
-        except ValueError as exc:
-            return False, str(exc)
+        if self.credential_provider != "command":
+            try:
+                self.resolve_password()
+            except ValueError as exc:
+                return False, str(exc)
         if self.audit_hmac_key_env and os.getenv(self.audit_hmac_key_env) is None:
             return (
                 False,
                 f"Connection '{self.name}' requires audit signing environment "
                 f"variable '{self.audit_hmac_key_env}'",
             )
+        if self.credential_provider == "command":
+            return True, "configured; credential command is checked when used"
         return True, "ready"
 
 
@@ -166,6 +185,7 @@ class ConnectionRegistry:
     default: str | None
     source: str
     errors: dict[str, str] = field(default_factory=dict)
+    routes: dict[str, dict[str, "RouteTarget"]] = field(default_factory=dict)
 
     def get(self, name: str | None = None) -> ConnectionProfile:
         selected = name or self.default
@@ -185,6 +205,81 @@ class ConnectionRegistry:
             raise ValueError(
                 f"Unknown connection '{selected}'. Available connections: {available}"
             ) from exc
+
+    def resolve(
+        self, name: str | None = None, database: str | None = None
+    ) -> "ResolvedTarget":
+        selected_name = name or self.default
+        if selected_name and database and selected_name in self.routes:
+            route = self.routes[selected_name].get(database)
+            if route is not None:
+                profile = self.get(route.connection)
+                selected_database = ensure_database_allowed(profile, route.database)
+                return ResolvedTarget(
+                    profile=profile,
+                    database=selected_database,
+                    requested_connection=selected_name,
+                    requested_database=database,
+                    route_applied=True,
+                )
+        if (
+            selected_name
+            and selected_name in self.routes
+            and selected_name not in self.profiles
+        ):
+            available = ", ".join(sorted(self.routes[selected_name]))
+            raise ValueError(
+                f"Logical connection '{selected_name}' requires a database route. "
+                f"Available database aliases: {available}"
+            )
+        profile = self.get(selected_name)
+        try:
+            selected_database = ensure_database_allowed(profile, database)
+        except ValueError as exc:
+            candidates = sorted(
+                candidate.name
+                for candidate in self.profiles.values()
+                if candidate.name != profile.name
+                and database
+                and (
+                    candidate.database == database
+                    or database in candidate.allowed_databases
+                )
+            )
+            routes = sorted(self.routes.get(selected_name or "", {}))
+            hints = []
+            if candidates:
+                hints.append(
+                    f"Connections declaring database '{database}': "
+                    + ", ".join(candidates)
+                )
+            if routes:
+                hints.append("route aliases: " + ", ".join(routes))
+            if not hints:
+                raise
+            raise ValueError(f"{exc}. " + "; ".join(hints)) from exc
+        return ResolvedTarget(
+            profile=profile,
+            database=selected_database,
+            requested_connection=selected_name,
+            requested_database=database,
+            route_applied=False,
+        )
+
+
+@dataclass(frozen=True)
+class RouteTarget:
+    connection: str
+    database: str
+
+
+@dataclass(frozen=True)
+class ResolvedTarget:
+    profile: ConnectionProfile
+    database: str | None
+    requested_connection: str | None
+    requested_database: str | None
+    route_applied: bool
 
 
 _cache_lock = threading.RLock()
@@ -207,20 +302,87 @@ def _validate_profile_name(name: str) -> str:
     return name
 
 
-def _password_fields(
-    name: str, values: dict[str, Any]
-) -> tuple[str | None, str | None]:
+def _credential_fields(name: str, values: dict[str, Any]) -> tuple[
+    str | None,
+    str | None,
+    str | None,
+    str,
+    str,
+    tuple[str, ...],
+    float,
+]:
     password_env = values.get("password_env")
+    has_password = "password" in values
+    provider_value = values.get("credential_provider")
+    provider = str(provider_value).strip().lower() if provider_value else None
+    source_count = sum((bool(password_env), has_password, provider is not None))
+    if source_count != 1:
+        raise ValueError(
+            f"Connection '{name}' must define exactly one of password_env, "
+            "password, or credential_provider"
+        )
+
     if password_env:
         env_name = str(password_env)
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env_name):
             raise ValueError(
                 f"Connection '{name}' has invalid password_env '{env_name}'"
             )
-        return None, env_name
-    if "password" in values:
-        return str(values["password"]), None
-    raise ValueError(f"Connection '{name}' must define password_env or password")
+        return None, env_name, None, "", "readonly-db-mcp", (), 5.0
+    if has_password:
+        return str(values["password"]), None, None, "", "readonly-db-mcp", (), 5.0
+
+    if provider not in CREDENTIAL_PROVIDERS:
+        supported = ", ".join(sorted(CREDENTIAL_PROVIDERS))
+        raise ValueError(
+            f"Connection '{name}'.credential_provider must be one of: {supported}"
+        )
+    timeout = _bounded_float(
+        values.get("credential_timeout_seconds"),
+        name=f"Connection '{name}'.credential_timeout_seconds",
+        default=5.0,
+        minimum=0.1,
+        maximum=60.0,
+    )
+    if provider == "keyring":
+        reference = str(values.get("credential_ref", "")).strip()
+        service = str(values.get("credential_service", "readonly-db-mcp")).strip()
+        if not reference or not CREDENTIAL_REFERENCE_PATTERN.fullmatch(reference):
+            raise ValueError(
+                f"Connection '{name}'.credential_ref must use letters, numbers, "
+                "'.', '_', ':', '/' or '-'"
+            )
+        if not service or not CREDENTIAL_REFERENCE_PATTERN.fullmatch(service):
+            raise ValueError(
+                f"Connection '{name}'.credential_service contains invalid characters"
+            )
+        if values.get("credential_command"):
+            raise ValueError(
+                f"Connection '{name}'.credential_command is only valid for the "
+                "command provider"
+            )
+        return None, None, provider, reference, service, (), timeout
+
+    raw_command = values.get("credential_command")
+    if not isinstance(raw_command, list) or not 1 <= len(raw_command) <= 32:
+        raise ValueError(
+            f"Connection '{name}'.credential_command must be an array with 1-32 items"
+        )
+    if any(not isinstance(item, str) for item in raw_command):
+        raise ValueError(
+            f"Connection '{name}'.credential_command items must be strings"
+        )
+    command = tuple(raw_command)
+    if any(not item or "\x00" in item for item in command):
+        raise ValueError(
+            f"Connection '{name}'.credential_command items must be non-empty strings"
+        )
+    if values.get("credential_ref") or values.get("credential_service"):
+        raise ValueError(
+            f"Connection '{name}'.credential_ref and credential_service are only "
+            "valid for the keyring provider"
+        )
+    return None, None, provider, "", "readonly-db-mcp", command, timeout
 
 
 def _profile_from_toml(name: str, values: dict[str, Any]) -> ConnectionProfile:
@@ -228,7 +390,15 @@ def _profile_from_toml(name: str, values: dict[str, Any]) -> ConnectionProfile:
     user = values.get("user")
     if not user:
         raise ValueError(f"Connection '{name}' must define user")
-    password, password_env = _password_fields(name, values)
+    (
+        password,
+        password_env,
+        credential_provider,
+        credential_ref,
+        credential_service,
+        credential_command,
+        credential_timeout_seconds,
+    ) = _credential_fields(name, values)
 
     database = str(values["database"]) if values.get("database") else None
     if database:
@@ -329,6 +499,11 @@ def _profile_from_toml(name: str, values: dict[str, Any]) -> ConnectionProfile:
         user=str(user),
         password=password,
         password_env=password_env,
+        credential_provider=credential_provider,
+        credential_ref=credential_ref,
+        credential_service=credential_service,
+        credential_command=credential_command,
+        credential_timeout_seconds=credential_timeout_seconds,
         database=database,
         allowed_databases=allowed_databases,
         allowed_functions=allowed_functions,
@@ -669,11 +844,58 @@ def _load_file_registry(path: Path) -> ConnectionRegistry:
         )
         default = next(iter(profiles))
 
+    routes: dict[str, dict[str, RouteTarget]] = {}
+    route_values = document.get("routes") or {}
+    if not isinstance(route_values, dict):
+        errors["@routes"] = "routes must be a TOML table"
+    else:
+        for logical_name, mappings in route_values.items():
+            try:
+                _validate_profile_name(str(logical_name))
+                if not isinstance(mappings, dict) or not mappings:
+                    raise ValueError("route group must be a non-empty TOML table")
+            except (TypeError, ValueError) as exc:
+                errors[f"@route.{logical_name}"] = str(exc)
+                continue
+            targets: dict[str, RouteTarget] = {}
+            for alias, target_values in mappings.items():
+                error_key = f"@route.{logical_name}.{alias}"
+                try:
+                    alias_name = _validate_identifier(
+                        str(alias), label="route database alias"
+                    )
+                    if not isinstance(target_values, dict):
+                        raise ValueError("route target must be an inline TOML table")
+                    target_connection = _validate_profile_name(
+                        str(target_values.get("connection", ""))
+                    )
+                    target_database = _validate_identifier(
+                        str(target_values.get("database", "")),
+                        label="route target database",
+                    )
+                    if target_connection not in profiles:
+                        raise ValueError(
+                            f"route references unknown or invalid connection "
+                            f"'{target_connection}'"
+                        )
+                    ensure_database_allowed(
+                        profiles[target_connection], target_database
+                    )
+                    targets[alias_name] = RouteTarget(
+                        connection=target_connection,
+                        database=target_database,
+                    )
+                except (TypeError, ValueError) as exc:
+                    errors[error_key] = str(exc)
+            if targets:
+                routes[str(logical_name)] = targets
+
     return ConnectionRegistry(
         profiles=profiles,
         default=default,
         source=str(path),
         errors=errors,
+        routes=routes,
     )
 
 

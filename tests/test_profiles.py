@@ -147,7 +147,7 @@ database = "app"
 
 @pytest.mark.asyncio
 async def test_wrong_connection_database_pair_suggests_declared_profile(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, caplog
 ):
     profiles_file = tmp_path / "connections.toml"
     profiles_file.write_text(
@@ -171,6 +171,7 @@ allowed_databases = ["gts"]
         encoding="utf-8",
     )
     monkeypatch.setenv("MYSQL_PROFILES_FILE", str(profiles_file))
+    caplog.set_level("INFO", logger="mysql_mcp_server.audit")
 
     with patch("mysql_mcp_server.server._open_connection") as connector:
         response = await call_tool(
@@ -183,6 +184,9 @@ allowed_databases = ["gts"]
         )
 
     assert "Connections declaring database 'gts': test-gts" in response[0].text
+    assert '"status":"denied"' in caplog.text
+    assert '"requested_connection":"test"' in caplog.text
+    assert '"requested_database":"gts"' in caplog.text
     connector.assert_not_called()
 
 
@@ -380,3 +384,97 @@ audit_fail_closed = true
 
     assert "prod" in registry.errors
     assert "requires audit_log_file" in registry.errors["prod"]
+
+
+def test_explicit_logical_route_resolves_physical_target(tmp_path: Path, monkeypatch):
+    profiles_file = tmp_path / "connections.toml"
+    profiles_file.write_text(
+        """
+default = "shared"
+
+[connections.shared]
+host = "core-db"
+user = "reader"
+password = "secret"
+database = "core"
+allowed_databases = ["core"]
+
+[connections.shared-eam]
+host = "eam-db"
+user = "reader"
+password = "secret"
+database = "eam_physical"
+allowed_databases = ["eam_physical"]
+
+[routes.shared]
+core = { connection = "shared", database = "core" }
+eam = { connection = "shared-eam", database = "eam_physical" }
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MYSQL_PROFILES_FILE", str(profiles_file))
+
+    target = load_connection_registry(force_reload=True).resolve("shared", "eam")
+    assert target.profile.name == "shared-eam"
+    assert target.database == "eam_physical"
+    assert target.requested_connection == "shared"
+    assert target.requested_database == "eam"
+    assert target.route_applied is True
+
+
+@pytest.mark.asyncio
+async def test_list_databases_returns_logical_aliases_without_connecting(
+    tmp_path: Path, monkeypatch
+):
+    profiles_file = tmp_path / "connections.toml"
+    profiles_file.write_text(
+        """
+[connections.eam]
+host = "eam-db"
+user = "reader"
+password = "secret"
+database = "eam_physical"
+allowed_databases = ["eam_physical"]
+
+[routes.shared]
+eam = { connection = "eam", database = "eam_physical" }
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MYSQL_PROFILES_FILE", str(profiles_file))
+
+    with patch("mysql_mcp_server.server._open_connection") as connector:
+        response = await call_tool(
+            "list_databases",
+            {"connection": "shared", "result_format": "json"},
+        )
+
+    payload = json.loads(response[0].text)
+    assert payload["rows"] == [["eam"]]
+    assert payload["connection"] == "shared"
+    connector.assert_not_called()
+
+
+def test_invalid_logical_route_is_reported_without_disabling_profiles(
+    tmp_path: Path, monkeypatch
+):
+    profiles_file = tmp_path / "connections.toml"
+    profiles_file.write_text(
+        """
+[connections.good]
+host = "db"
+user = "reader"
+password = "secret"
+database = "app"
+allowed_databases = ["app"]
+
+[routes.shared]
+bad = { connection = "missing", database = "app" }
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MYSQL_PROFILES_FILE", str(profiles_file))
+
+    registry = load_connection_registry(force_reload=True)
+    assert registry.get("good").database == "app"
+    assert "unknown or invalid connection" in registry.errors["@route.shared.bad"]

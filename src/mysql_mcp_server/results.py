@@ -105,6 +105,9 @@ class QueryResult:
     query_id: str
     masked_columns: list[str] = field(default_factory=list)
     retry_count: int = 0
+    requested_connection: str | None = None
+    requested_database: str | None = None
+    route_applied: bool = False
 
     @property
     def next_offset(self) -> int | None:
@@ -124,6 +127,9 @@ class QueryResult:
             "query_id": self.query_id,
             "masked_columns": self.masked_columns,
             "retry_count": self.retry_count,
+            "requested_connection": self.requested_connection,
+            "requested_database": self.requested_database,
+            "route_applied": self.route_applied,
         }
 
     def render(self, result_format: str) -> str:

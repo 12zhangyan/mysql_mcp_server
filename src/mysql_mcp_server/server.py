@@ -125,33 +125,6 @@ def get_db_config(
     )
 
 
-def _ensure_database_allowed_with_hint(
-    profile: ConnectionProfile, database: str | None
-) -> str | None:
-    """Enforce scope and suggest declared profiles without switching environments."""
-    try:
-        return ensure_database_allowed(profile, database)
-    except ValueError as exc:
-        if not database:
-            raise
-        registry = load_connection_registry()
-        candidates = sorted(
-            candidate.name
-            for candidate in registry.profiles.values()
-            if candidate.name != profile.name
-            and (
-                candidate.database == database
-                or database in candidate.allowed_databases
-            )
-        )
-        if not candidates:
-            raise
-        raise ValueError(
-            f"{exc}. Connections declaring database '{database}': "
-            + ", ".join(candidates)
-        ) from exc
-
-
 def _start_read_only_transaction(cursor) -> None:
     """Ask MySQL to enforce read-only mode before executing any exposed query."""
     cursor.execute("SET SESSION TRANSACTION READ ONLY")
@@ -251,6 +224,59 @@ def _database_listing_query(profile: ConnectionProfile) -> str:
         allowed = ",".join(f"'{name}'" for name in profile.allowed_databases)
         query += f" AND SCHEMA_NAME IN ({allowed})"
     return query + " ORDER BY SCHEMA_NAME"
+
+
+def _catalog_query(kind: str, database: str, table: str | None = None) -> str:
+    """Build a fixed, identifier-validated information_schema projection."""
+    validate_identifier(database)
+    if table:
+        validate_identifier(table)
+    table_filter = f" AND TABLE_NAME = '{table}'" if table else ""
+    queries = {
+        "tables": (
+            "SELECT TABLE_NAME, TABLE_TYPE, ENGINE, TABLE_ROWS, TABLE_COMMENT "
+            "FROM information_schema.TABLES "
+            f"WHERE TABLE_SCHEMA = '{database}'{table_filter} ORDER BY TABLE_NAME"
+        ),
+        "columns": (
+            "SELECT TABLE_NAME, COLUMN_NAME, ORDINAL_POSITION, COLUMN_TYPE, "
+            "IS_NULLABLE, COLUMN_DEFAULT, EXTRA, COLUMN_COMMENT "
+            "FROM information_schema.COLUMNS "
+            f"WHERE TABLE_SCHEMA = '{database}'{table_filter} "
+            "ORDER BY TABLE_NAME, ORDINAL_POSITION"
+        ),
+        "indexes": (
+            "SELECT TABLE_NAME, INDEX_NAME, NON_UNIQUE, SEQ_IN_INDEX, COLUMN_NAME, "
+            "COLLATION, CARDINALITY, INDEX_TYPE FROM information_schema.STATISTICS "
+            f"WHERE TABLE_SCHEMA = '{database}'{table_filter} "
+            "ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX"
+        ),
+        "constraints": (
+            "SELECT TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE "
+            "FROM information_schema.TABLE_CONSTRAINTS "
+            f"WHERE TABLE_SCHEMA = '{database}'{table_filter} "
+            "ORDER BY TABLE_NAME, CONSTRAINT_NAME"
+        ),
+        "foreign_keys": (
+            "SELECT TABLE_NAME, COLUMN_NAME, CONSTRAINT_NAME, REFERENCED_TABLE_SCHEMA, "
+            "REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME "
+            "FROM information_schema.KEY_COLUMN_USAGE "
+            f"WHERE TABLE_SCHEMA = '{database}'{table_filter} "
+            "AND REFERENCED_TABLE_NAME IS NOT NULL "
+            "ORDER BY TABLE_NAME, CONSTRAINT_NAME, ORDINAL_POSITION"
+        ),
+        "views": (
+            "SELECT TABLE_NAME, CHECK_OPTION, IS_UPDATABLE, SECURITY_TYPE "
+            "FROM information_schema.VIEWS "
+            f"WHERE TABLE_SCHEMA = '{database}'{table_filter} ORDER BY TABLE_NAME"
+        ),
+    }
+    try:
+        return queries[kind]
+    except KeyError as exc:
+        raise ValueError(
+            "kind must be tables, columns, indexes, constraints, foreign_keys, or views"
+        ) from exc
 
 
 def _sync_resource_query(
@@ -750,6 +776,42 @@ async def list_tools() -> list[Tool]:
                 destructiveHint=False,
             ),
         ),
+        Tool(
+            name="inspect_catalog",
+            description=(
+                "Inspect an allowlisted metadata projection for the selected user "
+                "database without granting arbitrary information_schema access."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": [
+                            "tables",
+                            "columns",
+                            "indexes",
+                            "constraints",
+                            "foreign_keys",
+                            "views",
+                        ],
+                    },
+                    "table_name": {
+                        "type": "string",
+                        "description": "Optional bare table name filter.",
+                    },
+                    **target_properties,
+                    "result_format": result_properties["result_format"],
+                    "timeout_ms": result_properties["timeout_ms"],
+                },
+                "required": ["kind"],
+            },
+            annotations=ToolAnnotations(
+                title="Inspect Controlled Catalog",
+                readOnlyHint=True,
+                destructiveHint=False,
+            ),
+        ),
     ]
 
 
@@ -817,6 +879,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                         "query_timeout_ms": profile.query_timeout_ms,
                         "max_rows": profile.max_rows,
                         "result_format": profile.result_format,
+                        "credential_provider": (
+                            profile.credential_provider
+                            or ("environment" if profile.password_env else "inline")
+                        ),
                         "audit": {
                             "enabled": profile.audit_enabled,
                             "durable": bool(profile.audit_log_file),
@@ -851,11 +917,20 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                         database_routes.items()
                     )
                 },
+                "logical_routes": {
+                    logical_name: {
+                        alias: {
+                            "connection": target.connection,
+                            "database": target.database,
+                        }
+                        for alias, target in sorted(mappings.items())
+                    }
+                    for logical_name, mappings in sorted(registry.routes.items())
+                },
                 "selection_guidance": (
-                    "Pass connection and database explicitly. If one environment "
-                    "uses several profiles, choose a connection listed for the "
-                    "target database; the server never switches environments "
-                    "implicitly."
+                    "Pass connection and database explicitly. Configured logical "
+                    "routes resolve only exact aliases; the server never switches "
+                    "environments implicitly."
                 ),
                 "errors": registry.errors,
             }
@@ -870,7 +945,31 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return await check_connection(connection=connection, database=database)
 
         if name == "list_databases":
-            profile = load_connection_registry().get(connection)
+            registry = load_connection_registry()
+            if connection and connection in registry.routes:
+                profile = registry.profiles.get(connection) or registry.get(
+                    next(iter(registry.routes[connection].values())).connection
+                )
+                result = QueryResult(
+                    connection=connection,
+                    database=None,
+                    columns=["database_name"],
+                    rows=[[alias] for alias in sorted(registry.routes[connection])],
+                    offset=0,
+                    truncated=False,
+                    duration_ms=0,
+                    query_id=hashlib.sha256(
+                        f"logical-routes:{connection}".encode("utf-8")
+                    ).hexdigest()[:16],
+                    requested_connection=connection,
+                )
+                selected_format = (
+                    arguments.get("result_format") or profile.result_format
+                ).lower()
+                if selected_format not in {"csv", "json"}:
+                    raise ValueError("result_format must be csv or json")
+                return [TextContent(type="text", text=result.render(selected_format))]
+            profile = registry.get(connection)
             query = _database_listing_query(profile)
             return await run_query(
                 query,
@@ -881,7 +980,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             )
 
         if name == "list_tables":
-            schema_filter = f"'{database}'" if database else "DATABASE()"
+            target = load_connection_registry().resolve(connection, database)
+            schema_filter = f"'{target.database}'" if target.database else "DATABASE()"
             query = (
                 "SELECT TABLE_NAME, TABLE_TYPE, TABLE_ROWS, TABLE_COMMENT "
                 "FROM information_schema.TABLES "
@@ -918,10 +1018,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     raise ValueError("table_name must be a string")
                 table_database, table = parse_table_arg(table_name)
                 selected_database = table_database or database
-                profile = load_connection_registry().get(connection)
-                _ensure_database_allowed_with_hint(profile, selected_database)
+                target = load_connection_registry().resolve(
+                    connection, selected_database
+                )
+                profile = target.profile
                 if (
-                    selected_database in SYSTEM_DATABASES
+                    target.database in SYSTEM_DATABASES
                     and not profile.allow_system_databases
                 ):
                     raise ValueError(
@@ -929,7 +1031,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                         f"connection '{profile.name}'"
                     )
                 schema_filter = (
-                    f"'{selected_database}'" if selected_database else "DATABASE()"
+                    f"'{target.database}'" if target.database else "DATABASE()"
                 )
                 query = (
                     "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT, "
@@ -938,7 +1040,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     f"AND TABLE_NAME = '{table}' ORDER BY ORDINAL_POSITION"
                 )
             else:
-                schema_filter = f"'{database}'" if database else "DATABASE()"
+                target = load_connection_registry().resolve(connection, database)
+                schema_filter = (
+                    f"'{target.database}'" if target.database else "DATABASE()"
+                )
                 query = (
                     "SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, IS_NULLABLE "
                     "FROM information_schema.COLUMNS "
@@ -948,7 +1053,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return await run_query(
                 query,
                 connection=connection,
-                database=database,
+                database=selected_database if table_name else database,
                 internal=True,
                 result_format=arguments.get("result_format"),
                 timeout_ms=arguments.get("timeout_ms"),
@@ -966,10 +1071,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             if not 0 <= page_offset <= 1_000_000:
                 raise ValueError("offset must be between 0 and 1000000")
             selected_database = table_database or database
-            profile = load_connection_registry().get(connection)
-            _ensure_database_allowed_with_hint(profile, selected_database)
+            target = load_connection_registry().resolve(connection, selected_database)
             table_ref = (
-                f"`{table_database}`.`{table}`" if table_database else f"`{table}`"
+                f"`{target.database}`.`{table}`" if target.database else f"`{table}`"
             )
             query = (
                 f"SELECT * FROM {table_ref} " f"LIMIT {limit + 1} OFFSET {page_offset}"
@@ -981,6 +1085,27 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 max_rows=limit,
                 result_offset=page_offset,
                 bounded_result=True,
+                result_format=arguments.get("result_format"),
+                timeout_ms=arguments.get("timeout_ms"),
+            )
+
+        if name == "inspect_catalog":
+            kind = arguments.get("kind")
+            if not isinstance(kind, str):
+                raise ValueError("kind is required")
+            table_name = arguments.get("table_name")
+            if table_name is not None and not isinstance(table_name, str):
+                raise ValueError("table_name must be a string")
+            table = validate_identifier(table_name) if table_name else None
+            target = load_connection_registry().resolve(connection, database)
+            if not target.database:
+                raise ValueError("database is required for inspect_catalog")
+            query = _catalog_query(kind, target.database, table)
+            return await run_query(
+                query,
+                connection=connection,
+                database=database,
+                internal=True,
                 result_format=arguments.get("result_format"),
                 timeout_ms=arguments.get("timeout_ms"),
             )
@@ -1130,6 +1255,9 @@ def _write_audit_event(
     truncated: bool = False,
     retry_count: int = 0,
     error_type: str | None = None,
+    requested_connection: str | None = None,
+    requested_database: str | None = None,
+    route_applied: bool = False,
 ) -> None:
     if not profile.audit_enabled:
         return
@@ -1147,6 +1275,9 @@ def _write_audit_event(
         "row_count": row_count,
         "truncated": truncated,
         "retry_count": retry_count,
+        "requested_connection": requested_connection,
+        "requested_database": requested_database,
+        "route_applied": route_applied,
     }
     if error_type:
         fields["error_type"] = error_type
@@ -1184,16 +1315,39 @@ async def execute_query(
     bounded_result: bool = False,
 ) -> QueryResult:
     """Execute one validated query with policy, timeout, cancellation and paging."""
-    profile = load_connection_registry().get(connection)
+    registry = load_connection_registry()
     started = time.monotonic()
-    selected_database = database or profile.database
+    try:
+        target = registry.resolve(connection, database)
+    except Exception as exc:
+        requested_connection = connection or registry.default
+        provisional_profile = registry.profiles.get(requested_connection or "")
+        if provisional_profile is not None:
+            _write_audit_event(
+                provisional_profile,
+                query=query,
+                status="denied",
+                policy="denied",
+                database=database or provisional_profile.database,
+                duration_ms=round((time.monotonic() - started) * 1000),
+                error_type=type(exc).__name__,
+                requested_connection=requested_connection,
+                requested_database=database,
+            )
+        raise
+    profile = target.profile
+    selected_database = target.database
+    route_fields = {
+        "requested_connection": target.requested_connection,
+        "requested_database": target.requested_database,
+        "route_applied": target.route_applied,
+    }
     try:
         ready, readiness = profile.runtime_status()
         if not ready:
             raise ValueError(readiness)
         validate_required_audit_context(profile, current_audit_context())
         query = validate_read_only_query(query)
-        selected_database = _ensure_database_allowed_with_hint(profile, database)
         if selected_database in SYSTEM_DATABASES and not profile.allow_system_databases:
             raise ValueError(
                 f"System database '{selected_database}' is blocked for connection "
@@ -1235,6 +1389,7 @@ async def execute_query(
             duration_ms=round((time.monotonic() - started) * 1000),
             database=selected_database,
             internal=internal,
+            **route_fields,
         )
     except Exception as exc:
         _write_audit_event(
@@ -1246,6 +1401,7 @@ async def execute_query(
             internal=internal,
             duration_ms=round((time.monotonic() - started) * 1000),
             error_type=type(exc).__name__,
+            **route_fields,
         )
         raise
 
@@ -1316,6 +1472,9 @@ async def execute_query(
                         query_id=query_fingerprint(query),
                         masked_columns=masked_columns,
                         retry_count=attempt,
+                        requested_connection=target.requested_connection,
+                        requested_database=target.requested_database,
+                        route_applied=target.route_applied,
                     )
             except Error as exc:
                 errno = getattr(exc, "errno", None)
@@ -1380,6 +1539,7 @@ async def execute_query(
             database=selected_database,
             internal=internal,
             error_type="TimeoutError",
+            **route_fields,
         )
         raise TimeoutError(
             f"Read-only query exceeded {effective_timeout} ms and was cancelled"
@@ -1395,6 +1555,7 @@ async def execute_query(
             database=selected_database,
             internal=internal,
             error_type="CancelledError",
+            **route_fields,
         )
         raise
     except Exception as exc:
@@ -1407,6 +1568,7 @@ async def execute_query(
             database=selected_database,
             internal=internal,
             error_type=type(exc).__name__,
+            **route_fields,
         )
         raise
 
@@ -1420,6 +1582,7 @@ async def execute_query(
         row_count=len(result.rows),
         truncated=result.truncated,
         retry_count=result.retry_count,
+        **route_fields,
     )
     return result
 
@@ -1437,9 +1600,8 @@ async def run_query(
     internal: bool = False,
     bounded_result: bool = False,
 ) -> list[TextContent]:
-    profile = load_connection_registry().get(connection)
-    selected_format = (result_format or profile.result_format).lower()
-    if selected_format not in {"csv", "json"}:
+    requested_format = result_format.lower() if result_format else None
+    if requested_format not in {None, "csv", "json"}:
         raise ValueError("result_format must be csv or json")
     result = await execute_query(
         query,
@@ -1452,6 +1614,8 @@ async def run_query(
         internal=internal,
         bounded_result=bounded_result,
     )
+    profile = load_connection_registry().get(result.connection)
+    selected_format = requested_format or profile.result_format
     return [TextContent(type="text", text=result.render(selected_format))]
 
 
@@ -1497,21 +1661,22 @@ async def check_connection(
     database: str | None = None,
 ) -> list[TextContent]:
     """Return a credential-safe read-only health and privilege summary."""
-    profile = load_connection_registry().get(connection)
-    selected_database = ensure_database_allowed(profile, database)
+    target = load_connection_registry().resolve(connection, database)
+    profile = target.profile
+    selected_database = target.database
     health = await execute_query(
         "SELECT VERSION() AS version, DATABASE() AS current_database, "
         "CURRENT_USER() AS authenticated_user, "
         "@@global.read_only AS global_read_only",
-        connection=profile.name,
-        database=selected_database,
+        connection=connection,
+        database=database,
         max_rows=1,
         internal=True,
     )
     grants = await execute_query(
         "SHOW GRANTS",
-        connection=profile.name,
-        database=selected_database,
+        connection=connection,
+        database=database,
         max_rows=min(100, profile.max_rows),
         internal=True,
     )
@@ -1526,6 +1691,9 @@ async def check_connection(
         "ok": True,
         "connection": profile.name,
         "database": selected_database,
+        "requested_connection": target.requested_connection,
+        "requested_database": target.requested_database,
+        "route_applied": target.route_applied,
         "description": profile.description,
         "allowed_databases": list(profile.allowed_databases),
         "ssh": profile.ssh.enabled,

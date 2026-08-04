@@ -59,6 +59,13 @@ FLUSH PRIVILEGES;
 
 When setting up the MCP server, use these restricted credentials in your environment:
 
+Prefer `credential_provider = "keyring"` for desktop MCP clients so passwords
+do not appear in user-level MCP JSON or TOML. The local credentials command uses
+a masked prompt and never returns stored values. Enterprise secret-manager
+commands must be configured as an argv array; they run with `shell=false`, no
+stdin, discarded stderr, a bounded timeout/output size, and a one-line output
+contract. Do not embed secrets in command arguments.
+
 ```bash
 MYSQL_USER=mcp_user
 MYSQL_PASSWORD=your_secure_password

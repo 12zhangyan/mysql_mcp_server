@@ -70,3 +70,21 @@ remote_port = 3306
 # 0 selects a free local port. The process is reused and automatically restarted.
 local_port = 0
 startup_timeout = 5
+
+# Password-free MCP configuration on Windows/macOS/Linux desktop keyrings:
+# [connections.secure-dev]
+# host = "127.0.0.1"
+# user = "readonly_user"
+# credential_provider = "keyring"
+# credential_ref = "secure-dev"
+# database = "app_dev"
+# allowed_databases = ["app_dev"]
+# Then store the password interactively (it is never printed):
+# readonly-db-mcp credentials --profiles-file C:/path/mysql-connections.toml set secure-dev
+
+# Explicit logical environment routing. Only exact aliases below are routed;
+# the server never guesses a target from similar connection or database names.
+# [routes.shared-test]
+# ubp = { connection = "test-ubp", database = "ubp" }
+# gts = { connection = "test-gts", database = "gts" }
+# eam = { connection = "test-eam", database = "eam" }
