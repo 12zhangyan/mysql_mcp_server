@@ -59,7 +59,7 @@ allowed_databases = ["application_database"]
 # Unrecognized stored functions/UDFs are blocked. This list should normally
 # remain empty. Add only reviewed deterministic functions with no side effects.
 allowed_functions = []
-mask_columns = ["password", "passwd", "*secret*", "*token*", "*api_key*", "*private_key*", "ssn", "id_card", "phone", "email"]
+mask_columns = ["password", "*password*", "*passwd*", "*pwd*", "*secret*", "token", "*token", "*_token", "token_*", "*tokenvalue*", "*accesstoken*", "*refreshtoken*", "*idtoken*", "*appsec*", "*api_key*", "*private_key*", "*ssn*", "*id_card*", "*phone*", "*mobile*", "*email*"]
 
 ssl_mode = "VERIFY_IDENTITY"
 ssl_ca = "/etc/mysql-mcp/company-ca.pem"

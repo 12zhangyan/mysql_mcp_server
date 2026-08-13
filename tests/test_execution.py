@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from mysql.connector import Error, InterfaceError
+from pydantic import AnyUrl
 
 from mysql_mcp_server.results import QueryResult
 from mysql_mcp_server.server import (
@@ -18,13 +19,13 @@ from mysql_mcp_server.server import (
     execute_query,
     read_resource,
 )
-from pydantic import AnyUrl
 
 
 def fake_connection(rows, columns):
     cursor = MagicMock()
     cursor.description = [(column,) for column in columns]
     cursor.fetchmany.return_value = rows
+    cursor.fetchall.return_value = rows
     connection = MagicMock()
     connection.cursor.return_value.__enter__.return_value = cursor
     return connection, cursor
@@ -62,15 +63,39 @@ async def test_json_pagination_executes_read_only_controls_and_audits(caplog):
         "SET SESSION MAX_EXECUTION_TIME = 30000",
         "SET SESSION TRANSACTION READ ONLY",
         "START TRANSACTION READ ONLY",
-        "SELECT id, name FROM users",
+        "SELECT id, name FROM users LIMIT 3",
     ]
-    connection.shutdown.assert_called_once_with()
-    connection.rollback.assert_not_called()
+    connection.shutdown.assert_not_called()
+    connection.rollback.assert_called_once_with()
     assert "SELECT id, name" not in caplog.text
     assert '"status":"success"' in caplog.text
     assert '"status":"started"' in caplog.text
     assert '"schema_version":1' in caplog.text
     assert '"read_only_enforced":true' in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_mcp_pagination_fully_consumes_server_bounded_result():
+    connection, cursor = fake_connection(
+        [(1,), (2,), (3,)],
+        ["id"],
+    )
+    with patch(
+        "mysql_mcp_server.server._open_connection",
+        return_value=(connection, {"database": "app"}),
+    ):
+        result = await execute_query(
+            "SELECT id FROM integratechannel",
+            database="app",
+            max_rows=2,
+        )
+
+    cursor.execute.assert_any_call("SELECT id FROM integratechannel LIMIT 3")
+    cursor.fetchall.assert_called_once_with()
+    assert result.rows == [[1], [2]]
+    assert result.truncated is True
+    connection.rollback.assert_called_once_with()
+    connection.shutdown.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -216,7 +241,7 @@ async def test_mysql_error_details_are_redacted_from_tool_response():
     connection, cursor = fake_connection([], ["id"])
 
     def execute(sql):
-        if sql == "SELECT id FROM users":
+        if sql == "SELECT id FROM users LIMIT 501":
             raise Error(
                 msg="Access denied for user sensitive_user@secret.internal",
                 errno=1045,
@@ -442,8 +467,7 @@ audit_fail_closed = true
 
 @pytest.mark.asyncio
 async def test_offset_discards_rows_before_returning_page():
-    connection, cursor = fake_connection([], ["id"])
-    cursor.fetchmany.side_effect = [[(1,), (2,)], [(3,), (4,), (5,)]]
+    connection, cursor = fake_connection([(3,), (4,), (5,)], ["id"])
     with patch(
         "mysql_mcp_server.server._open_connection",
         return_value=(connection, {"database": "app"}),
@@ -457,6 +481,7 @@ async def test_offset_discards_rows_before_returning_page():
 
     assert result.rows == [[3], [4]]
     assert result.next_offset == 4
+    cursor.execute.assert_any_call("SELECT id FROM users LIMIT 3 OFFSET 2")
 
 
 @pytest.mark.asyncio
@@ -468,7 +493,7 @@ async def test_query_timeout_closes_socket_and_returns_explicit_error():
     cursor.fetchmany.return_value = []
 
     def execute(sql):
-        if sql == "SELECT id FROM slow_table":
+        if sql == "SELECT id FROM slow_table LIMIT 501":
             query_started.set()
             released.wait(timeout=2)
             raise RuntimeError("socket closed")
@@ -504,7 +529,7 @@ async def test_task_cancellation_closes_socket():
     cursor.description = [("id",)]
 
     def execute(sql):
-        if sql == "SELECT id FROM slow_table":
+        if sql == "SELECT id FROM slow_table LIMIT 501":
             query_started.set()
             released.wait(timeout=2)
             raise RuntimeError("socket closed")

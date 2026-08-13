@@ -1,20 +1,23 @@
+from unittest.mock import MagicMock, patch
+
 import pytest
-from unittest.mock import patch, MagicMock
+from mcp.types import CallToolResult
+from pydantic import AnyUrl
+
 from mysql_mcp_server import __version__
 from mysql_mcp_server.server import (
-    app,
-    list_tools,
-    list_prompts,
-    get_prompt,
-    list_resources,
-    read_resource,
-    call_tool,
-    validate_identifier,
-    parse_table_arg,
-    get_db_config,
     _validate_sse_exposure,
+    app,
+    call_tool,
+    get_db_config,
+    get_prompt,
+    list_prompts,
+    list_resources,
+    list_tools,
+    parse_table_arg,
+    read_resource,
+    validate_identifier,
 )
-from pydantic import AnyUrl
 
 
 def test_server_initialization():
@@ -207,6 +210,8 @@ async def test_execute_sql_write_is_blocked_before_connect(mock_connect):
     )
 
     assert "read-only SQL" in response[0].text
+    assert isinstance(response, CallToolResult)
+    assert response.isError is True
     mock_connect.assert_not_called()
 
 
@@ -254,6 +259,40 @@ async def test_get_table_sample_cross_database(monkeypatch):
     assert captured["kwargs"]["database"] == "otherdb"
     assert captured["kwargs"]["result_offset"] == 10
     assert captured["kwargs"]["bounded_result"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["get_schema_info", "get_table_sample"])
+async def test_table_alias_is_accepted(tool_name, monkeypatch):
+    monkeypatch.setenv("MYSQL_USER", "u")
+    monkeypatch.setenv("MYSQL_PASSWORD", "p")
+
+    with patch("mysql_mcp_server.server.run_query", return_value=[]) as runner:
+        await call_tool(tool_name, {"table": "orders", "database": "app"})
+
+    runner.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_list_tables_supports_filter_and_pagination(monkeypatch):
+    monkeypatch.setenv("MYSQL_USER", "u")
+    monkeypatch.setenv("MYSQL_PASSWORD", "p")
+
+    with patch("mysql_mcp_server.server.run_query", return_value=[]) as runner:
+        await call_tool(
+            "list_tables",
+            {
+                "database": "app",
+                "table_pattern": "integrate*",
+                "max_rows": 20,
+                "offset": 40,
+            },
+        )
+
+    query = runner.await_args.args[0]
+    assert "TABLE_NAME LIKE 'integrate%'" in query
+    assert runner.await_args.kwargs["max_rows"] == 20
+    assert runner.await_args.kwargs["offset"] == 40
 
 
 @pytest.mark.asyncio

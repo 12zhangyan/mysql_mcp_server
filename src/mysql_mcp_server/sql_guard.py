@@ -82,6 +82,8 @@ SYSTEM_DATABASES = {"information_schema", "mysql", "performance_schema", "sys"}
 # information outside a profile's database allowlist.
 SCOPED_SHOW_KINDS = {
     "COLUMNS",
+    "CREATE TABLE",
+    "CREATE VIEW",
     "EVENTS",
     "INDEX",
     "INDEXES",
@@ -249,7 +251,17 @@ def validate_read_only_query(sql: str) -> str:
     if "INTO" in tokens:
         raise ReadOnlyViolation("SELECT ... INTO is not allowed")
 
-    blocked = next((token for token in tokens if token in BLOCKED_KEYWORDS), None)
+    show_create = bool(
+        re.match(r"^\s*SHOW\s+CREATE\s+(?:TABLE|VIEW)\b", sanitized_trimmed, re.I)
+    )
+    blocked = next(
+        (
+            token
+            for token in tokens
+            if token in BLOCKED_KEYWORDS and not (show_create and token == "CREATE")
+        ),
+        None,
+    )
     if blocked:
         raise ReadOnlyViolation(
             f"Only read-only SQL is allowed; keyword '{blocked}' is blocked"
@@ -339,8 +351,16 @@ def validate_database_access(
     if not internal and not allow_system_databases:
         blocked_system = sorted(accessed & SYSTEM_DATABASES)
         if blocked_system:
+            guidance = (
+                "; use inspect_catalog, get_schema_info, or list_tables for "
+                "controlled metadata access"
+                if "information_schema" in blocked_system
+                else ""
+            )
             raise ReadOnlyViolation(
-                "System database access is blocked: " + ", ".join(blocked_system)
+                "System database access is blocked: "
+                + ", ".join(blocked_system)
+                + guidance
             )
 
     if allowed_databases:

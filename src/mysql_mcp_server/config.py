@@ -21,14 +21,25 @@ SSL_MODES = {"DISABLED", "REQUIRED", "VERIFY_CA", "VERIFY_IDENTITY"}
 CREDENTIAL_PROVIDERS = {"keyring", "command"}
 DEFAULT_MASK_COLUMNS = (
     "password",
-    "passwd",
+    "*password*",
+    "*passwd*",
+    "*pwd*",
     "*secret*",
-    "*token*",
+    "token",
+    "*token",
+    "*_token",
+    "token_*",
+    "*tokenvalue*",
+    "*accesstoken*",
+    "*refreshtoken*",
+    "*idtoken*",
+    "*appsec*",
     "*api_key*",
     "*private_key*",
     "*ssn*",
     "*id_card*",
     "*phone*",
+    "*mobile*",
     "*email*",
 )
 

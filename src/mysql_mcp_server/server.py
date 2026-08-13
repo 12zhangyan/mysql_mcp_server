@@ -11,21 +11,24 @@ from contextlib import contextmanager
 from typing import Optional, Tuple
 
 import anyio
-from mysql.connector import connect, Error
+import sqlglot
+from dotenv import load_dotenv
 from mcp.server import Server
 from mcp.types import (
-    Resource,
-    Tool,
-    TextContent,
-    ToolAnnotations,
-    ResourceTemplate,
+    CallToolResult,
+    GetPromptResult,
     Prompt,
     PromptArgument,
     PromptMessage,
-    GetPromptResult,
+    Resource,
+    ResourceTemplate,
+    TextContent,
+    Tool,
+    ToolAnnotations,
 )
+from mysql.connector import Error, connect
 from pydantic import AnyUrl
-from dotenv import load_dotenv
+from sqlglot import exp
 
 from .audit import (
     AuditWriteError,
@@ -90,6 +93,84 @@ def parse_table_arg(name: str) -> Tuple[Optional[str], str]:
         db, tbl = name.split(".", 1)
         return validate_identifier(db), validate_identifier(tbl)
     return None, validate_identifier(name)
+
+
+def _table_argument(arguments: dict, *, required: bool = False) -> str | None:
+    """Read the canonical table_name argument or its common MCP alias, table."""
+    table_name = arguments.get("table_name")
+    table_alias = arguments.get("table")
+    if table_name is not None and table_alias is not None and table_name != table_alias:
+        raise ValueError("table and table_name must match when both are provided")
+    value = table_name if table_name is not None else table_alias
+    if value is None:
+        if required:
+            raise ValueError("table_name or table is required")
+        return None
+    if not isinstance(value, str):
+        raise ValueError("table_name or table must be a string")
+    return value
+
+
+def _table_pattern_sql(pattern: str) -> str:
+    """Convert a restricted shell-style table glob to an escaped SQL LIKE value."""
+    if not isinstance(pattern, str) or not 1 <= len(pattern) <= 128:
+        raise ValueError(
+            "table_pattern must be a non-empty string up to 128 characters"
+        )
+    if not re.fullmatch(r"[A-Za-z0-9_$*?-]+", pattern):
+        raise ValueError(
+            "table_pattern may contain only letters, numbers, _, $, -, *, or ?"
+        )
+    escaped = (
+        pattern.replace("\\", "\\\\")
+        .replace("_", "\\_")
+        .replace("*", "%")
+        .replace("?", "_")
+    )
+    return escaped
+
+
+def _bounded_query_sql(query: str, *, row_limit: int, page_offset: int) -> str | None:
+    """Push MCP paging into an outer query when it can be preserved exactly."""
+    try:
+        statement = sqlglot.parse_one(query, read="mysql")
+    except Exception:
+        return None
+    if not isinstance(statement, exp.Query):
+        return None
+
+    existing_limit = statement.args.get("limit")
+    existing_offset = statement.args.get("offset")
+
+    def integer_value(clause) -> int | None:
+        if clause is None:
+            return 0
+        value = clause.expression
+        if isinstance(value, exp.Literal) and not value.is_string:
+            try:
+                return int(value.this)
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    original_offset = integer_value(existing_offset)
+    if original_offset is None:
+        return None
+    if existing_limit is None:
+        fetch_limit = row_limit + 1
+    else:
+        original_limit = integer_value(existing_limit)
+        if original_limit is None:
+            return None
+        fetch_limit = min(row_limit + 1, max(original_limit - page_offset, 0))
+
+    statement = statement.limit(fetch_limit, copy=False)
+    effective_offset = original_offset + page_offset
+    if effective_offset:
+        statement = statement.offset(effective_offset, copy=False)
+    else:
+        statement.set("offset", None)
+    return statement.sql(dialect="mysql")
 
 
 @contextmanager
@@ -213,6 +294,16 @@ def _verify_connection_transport(profile: ConnectionProfile, connection_object) 
 app = Server("mysql_mcp_server")
 
 
+class ToolErrorResult(CallToolResult):
+    """Protocol error result with backward-compatible direct-handler indexing."""
+
+    def __len__(self) -> int:
+        return len(self.content)
+
+    def __getitem__(self, index):
+        return self.content[index]
+
+
 def _database_listing_query(profile: ConnectionProfile) -> str:
     query = (
         "SELECT SCHEMA_NAME AS database_name "
@@ -328,10 +419,14 @@ def _sync_resource_query(
         with connection_object.cursor() as cursor:
             _apply_server_query_timeout(cursor, profile.query_timeout_ms)
             _start_read_only_transaction(cursor)
-            cursor.execute(query)
-            columns = [str(item[0]) for item in cursor.description]
             row_limit = min(max_rows, profile.max_rows)
+            executed_query = _bounded_query_sql(
+                query, row_limit=row_limit, page_offset=0
+            )
+            cursor.execute(executed_query or query)
+            columns = [str(item[0]) for item in cursor.description]
             raw_rows = list(cursor.fetchmany(size=row_limit + 1))
+            raw_rows.extend(cursor.fetchall())
             truncated = len(raw_rows) > row_limit
             rows = raw_rows[:row_limit]
             _write_audit_event(
@@ -491,21 +586,21 @@ async def read_resource(uri: AnyUrl) -> str:
                 f"SELECT * FROM `{table}` LIMIT 100",
                 max_rows=100,
             )
-            serialized_rows = [
-                [serialize_value(value, profile.max_cell_length) for value in row]
-                for row in rows
-            ]
             masked_rows, masked_columns = mask_result_rows(
                 f"SELECT * FROM `{table}` LIMIT 100",
                 columns,
-                serialized_rows,
+                [list(row) for row in rows],
                 profile.mask_columns,
             )
+            serialized_rows = [
+                [serialize_value(value, profile.max_cell_length) for value in row]
+                for row in masked_rows
+            ]
             result = QueryResult(
                 connection=profile.name,
                 database=profile.database,
                 columns=columns,
-                rows=masked_rows,
+                rows=serialized_rows,
                 offset=0,
                 truncated=False,
                 duration_ms=0,
@@ -657,11 +752,33 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="list_tables",
-            description="List tables and views in a selected database.",
+            description=(
+                "List tables and views in a selected database, with optional "
+                "name filtering and pagination for large schemas."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     **target_properties,
+                    "table_name": {
+                        "type": "string",
+                        "description": "Optional exact bare table name filter.",
+                    },
+                    "table": {
+                        "type": "string",
+                        "description": "Compatibility alias for table_name.",
+                    },
+                    "table_pattern": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "description": (
+                            "Optional name glob; use * for many characters and ? "
+                            "for one character."
+                        ),
+                    },
+                    "max_rows": result_properties["max_rows"],
+                    "offset": result_properties["offset"],
                     "result_format": result_properties["result_format"],
                     "timeout_ms": result_properties["timeout_ms"],
                 },
@@ -736,6 +853,10 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Optional bare table name or database.table.",
                     },
+                    "table": {
+                        "type": "string",
+                        "description": "Compatibility alias for table_name.",
+                    },
                     **target_properties,
                     "result_format": result_properties["result_format"],
                     "timeout_ms": result_properties["timeout_ms"],
@@ -757,6 +878,10 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Bare table name or database.table.",
                     },
+                    "table": {
+                        "type": "string",
+                        "description": "Compatibility alias for table_name.",
+                    },
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
@@ -768,7 +893,7 @@ async def list_tools() -> list[Tool]:
                     "result_format": result_properties["result_format"],
                     "timeout_ms": result_properties["timeout_ms"],
                 },
-                "required": ["table_name"],
+                "anyOf": [{"required": ["table_name"]}, {"required": ["table"]}],
             },
             annotations=ToolAnnotations(
                 title="Get Table Sample",
@@ -799,6 +924,10 @@ async def list_tools() -> list[Tool]:
                     "table_name": {
                         "type": "string",
                         "description": "Optional bare table name filter.",
+                    },
+                    "table": {
+                        "type": "string",
+                        "description": "Compatibility alias for table_name.",
                     },
                     **target_properties,
                     "result_format": result_properties["result_format"],
@@ -831,7 +960,7 @@ def _request_identity() -> tuple[str, str | None, str | None]:
 
 
 @app.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolResult:
     """Dispatch read-only tools with explicit connection and database scope."""
     arguments = arguments or {}
     connection = arguments.get("connection")
@@ -982,16 +1111,33 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         if name == "list_tables":
             target = load_connection_registry().resolve(connection, database)
             schema_filter = f"'{target.database}'" if target.database else "DATABASE()"
+            table_name = _table_argument(arguments)
+            table_pattern = arguments.get("table_pattern")
+            if table_name and table_pattern is not None:
+                raise ValueError(
+                    "Use either table_name/table or table_pattern, not both"
+                )
+            name_filter = ""
+            if table_name:
+                table = validate_identifier(table_name)
+                name_filter = f" AND TABLE_NAME = '{table}'"
+            elif table_pattern is not None:
+                name_filter = (
+                    f" AND TABLE_NAME LIKE '{_table_pattern_sql(table_pattern)}' "
+                    "ESCAPE '\\\\'"
+                )
             query = (
                 "SELECT TABLE_NAME, TABLE_TYPE, TABLE_ROWS, TABLE_COMMENT "
                 "FROM information_schema.TABLES "
-                f"WHERE TABLE_SCHEMA = {schema_filter} "
+                f"WHERE TABLE_SCHEMA = {schema_filter}{name_filter} "
                 "ORDER BY TABLE_NAME"
             )
             return await run_query(
                 query,
                 connection=connection,
                 database=database,
+                max_rows=arguments.get("max_rows"),
+                offset=arguments.get("offset", 0),
                 internal=True,
                 result_format=arguments.get("result_format"),
                 timeout_ms=arguments.get("timeout_ms"),
@@ -1012,10 +1158,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             )
 
         if name == "get_schema_info":
-            table_name = arguments.get("table_name")
+            table_name = _table_argument(arguments)
             if table_name:
-                if not isinstance(table_name, str):
-                    raise ValueError("table_name must be a string")
                 table_database, table = parse_table_arg(table_name)
                 selected_database = table_database or database
                 target = load_connection_registry().resolve(
@@ -1060,9 +1204,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             )
 
         if name == "get_table_sample":
-            table_name = arguments.get("table_name")
-            if not isinstance(table_name, str):
-                raise ValueError("table_name is required")
+            table_name = _table_argument(arguments, required=True)
+            assert table_name is not None
             table_database, table = parse_table_arg(table_name)
             limit = int(arguments.get("limit", 5))
             if not 1 <= limit <= 100:
@@ -1093,14 +1236,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             kind = arguments.get("kind")
             if not isinstance(kind, str):
                 raise ValueError("kind is required")
-            table_name = arguments.get("table_name")
-            if table_name is not None and not isinstance(table_name, str):
-                raise ValueError("table_name must be a string")
-            table = validate_identifier(table_name) if table_name else None
+            table_name = _table_argument(arguments)
+            catalog_table = validate_identifier(table_name) if table_name else None
             target = load_connection_registry().resolve(connection, database)
             if not target.database:
                 raise ValueError("database is required for inspect_catalog")
-            query = _catalog_query(kind, target.database, table)
+            query = _catalog_query(kind, target.database, catalog_table)
             return await run_query(
                 query,
                 connection=connection,
@@ -1113,7 +1254,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         raise ValueError(f"Unknown tool: {name}")
     except Exception as exc:
         logger.error("Error in call_tool %s (%s)", name, type(exc).__name__)
-        return [TextContent(type="text", text=f"Error calling tool {name}: {str(exc)}")]
+        return ToolErrorResult(
+            content=[
+                TextContent(type="text", text=f"Error calling tool {name}: {str(exc)}")
+            ],
+            isError=True,
+        )
     finally:
         if audit_token is not None:
             reset_audit_context(audit_token)
@@ -1337,11 +1483,6 @@ async def execute_query(
         raise
     profile = target.profile
     selected_database = target.database
-    route_fields = {
-        "requested_connection": target.requested_connection,
-        "requested_database": target.requested_database,
-        "route_applied": target.route_applied,
-    }
     try:
         ready, readiness = profile.runtime_status()
         if not ready:
@@ -1389,7 +1530,9 @@ async def execute_query(
             duration_ms=round((time.monotonic() - started) * 1000),
             database=selected_database,
             internal=internal,
-            **route_fields,
+            requested_connection=target.requested_connection,
+            requested_database=target.requested_database,
+            route_applied=target.route_applied,
         )
     except Exception as exc:
         _write_audit_event(
@@ -1401,7 +1544,9 @@ async def execute_query(
             internal=internal,
             duration_ms=round((time.monotonic() - started) * 1000),
             error_type=type(exc).__name__,
-            **route_fields,
+            requested_connection=target.requested_connection,
+            requested_database=target.requested_database,
+            route_applied=target.route_applied,
         )
         raise
 
@@ -1424,14 +1569,23 @@ async def execute_query(
                     _apply_server_query_timeout(cursor, effective_timeout)
                     _start_read_only_transaction(cursor)
                     phase = "execute"
-                    cursor.execute(query)
+                    executed_query = query
+                    if not bounded_result:
+                        bounded_query = _bounded_query_sql(
+                            query,
+                            row_limit=row_limit,
+                            page_offset=page_offset,
+                        )
+                        if bounded_query is not None:
+                            executed_query = bounded_query
+                    cursor.execute(executed_query)
                     if cursor.description is None:
                         raise RuntimeError(
                             "Read-only query did not return a result set"
                         )
 
                     phase = "fetch"
-                    remaining = page_offset
+                    remaining = page_offset if executed_query == query else 0
                     while remaining:
                         skipped = cursor.fetchmany(size=min(remaining, 1000))
                         if not skipped:
@@ -1443,29 +1597,33 @@ async def execute_query(
                     ]
                     if bounded_result:
                         raw_rows = list(cursor.fetchall())
+                    elif executed_query != query:
+                        raw_rows = list(cursor.fetchall())
                     else:
                         raw_rows = list(cursor.fetchmany(size=row_limit + 1))
                     truncated = len(raw_rows) > row_limit
-                    discard_connection = truncated and not bounded_result
+                    discard_connection = (
+                        truncated and not bounded_result and executed_query == query
+                    )
                     raw_rows = raw_rows[:row_limit]
+                    rows, masked_columns = mask_result_rows(
+                        query,
+                        columns,
+                        [list(row) for row in raw_rows],
+                        profile.mask_columns,
+                    )
                     serialized_rows = [
                         [
                             serialize_value(value, profile.max_cell_length)
                             for value in row
                         ]
-                        for row in raw_rows
+                        for row in rows
                     ]
-                    rows, masked_columns = mask_result_rows(
-                        query,
-                        columns,
-                        serialized_rows,
-                        profile.mask_columns,
-                    )
                     return QueryResult(
                         connection=profile.name,
                         database=config.get("database"),
                         columns=columns,
-                        rows=rows,
+                        rows=serialized_rows,
                         offset=reported_offset,
                         truncated=truncated,
                         duration_ms=round((time.monotonic() - started) * 1000),
@@ -1539,7 +1697,9 @@ async def execute_query(
             database=selected_database,
             internal=internal,
             error_type="TimeoutError",
-            **route_fields,
+            requested_connection=target.requested_connection,
+            requested_database=target.requested_database,
+            route_applied=target.route_applied,
         )
         raise TimeoutError(
             f"Read-only query exceeded {effective_timeout} ms and was cancelled"
@@ -1555,7 +1715,9 @@ async def execute_query(
             database=selected_database,
             internal=internal,
             error_type="CancelledError",
-            **route_fields,
+            requested_connection=target.requested_connection,
+            requested_database=target.requested_database,
+            route_applied=target.route_applied,
         )
         raise
     except Exception as exc:
@@ -1568,7 +1730,9 @@ async def execute_query(
             database=selected_database,
             internal=internal,
             error_type=type(exc).__name__,
-            **route_fields,
+            requested_connection=target.requested_connection,
+            requested_database=target.requested_database,
+            route_applied=target.route_applied,
         )
         raise
 
@@ -1582,7 +1746,9 @@ async def execute_query(
         row_count=len(result.rows),
         truncated=result.truncated,
         retry_count=result.retry_count,
-        **route_fields,
+        requested_connection=target.requested_connection,
+        requested_database=target.requested_database,
+        route_applied=target.route_applied,
     )
     return result
 
@@ -1766,11 +1932,11 @@ async def _run_sse_server():
     Requires 'starlette' and 'uvicorn' dependencies.
     """
     try:
+        import uvicorn
         from mcp.server.sse import SseServerTransport
         from starlette.applications import Starlette
-        from starlette.routing import Mount, Route
         from starlette.responses import Response
-        import uvicorn
+        from starlette.routing import Mount, Route
     except ImportError:
         logger.error(
             "SSE transport requires additional dependencies. Install with: pip install mysql_mcp_server[sse]"

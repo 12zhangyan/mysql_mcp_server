@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.1] - 2026-08-13
+
+### Added
+- Add exact/glob filtering and pagination to `list_tables`, and accept `table`
+  as a compatibility alias for `table_name` in table metadata/sample tools.
+
+### Changed
+- Allow database-scoped `SHOW CREATE TABLE` and `SHOW CREATE VIEW` while
+  keeping arbitrary system-schema SQL and `USE` blocked.
+
+### Fixed
+- Push MCP pagination into eligible read queries and fully consume the bounded
+  result, preventing Connector/Python `errno=-1` failures on client-side row
+  truncation.
+- Return tool failures with MCP `isError: true`.
+- Mask password/PWD, mobile, secret and credential-token source columns without
+  redacting unrelated sibling columns, and redact sensitive keys inside JSON
+  configuration values.
+- Avoid broad `*token*` matching that hid business fields such as channel codes
+  and token duration values.
+
 ## [0.8.0] - 2026-08-04
 
 ### Added
