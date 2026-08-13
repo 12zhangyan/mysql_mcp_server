@@ -4,117 +4,92 @@
 
 # MySQL MCP Server
 
-An enterprise-auditable, strictly read-only Model Context Protocol (MCP) server
-for exploring multiple MySQL environments and databases from one process.
+一个可审计、严格只读的 MySQL Model Context Protocol（MCP）服务。单个进程即可安全访问多个 MySQL 环境和数据库。
 
-The supported npm distribution for this fork is
-[`@yanzhang123/readonly-db-mcp`](https://www.npmjs.com/package/@yanzhang123/readonly-db-mcp).
-It includes the matching Python wheel and a cross-platform launcher, so MCP
-clients do not need a repository checkout or a separate package installation.
+本分支推荐通过 npm 包 [`@yanzhang123/readonly-db-mcp`](https://www.npmjs.com/package/@yanzhang123/readonly-db-mcp) 使用。npm 包内置匹配版本的 Python wheel 和跨平台启动器，MCP 客户端无需检出仓库或单独安装 Python 包。
 
-> **Note**: MySQL MCP Server supports both standard input/output (STDIO) and Streamable HTTP (SSE) transport modes. The SSE mode is recommended for remote/self-hosted deployments.
+> [!NOTE]
+> 服务同时支持标准输入输出（STDIO）和 Streamable HTTP（SSE）传输。远程或自托管场景可使用 SSE，并应按本文配置认证和网络边界。
 
 > [!IMPORTANT]
-> Read-only enforcement does not trust the MySQL account grants. Even if the
-> supplied account has `INSERT`, `UPDATE`, `DELETE`, or DDL privileges, the MCP
-> SQL gate only accepts reviewed read statement families, runs them in a
-> read-only transaction, and always rolls back. A database-level `SELECT`-only
-> account is still strongly recommended as independent defense in depth.
+> 只读约束不依赖 MySQL 账号权限。即使账号拥有 `INSERT`、`UPDATE`、`DELETE` 或 DDL 权限，SQL 闸门也只接受经过审查的只读语句，并在只读事务中执行后统一回滚。生产环境仍强烈建议使用仅授予 `SELECT` 的数据库账号，形成独立的纵深防御。
 
-## Features
-- **Named connection profiles** for dev/test/staging/prod and multiple servers
-- Select a `connection` and `database` independently on every tool call
-- Database-to-profile routing hints without implicit cross-environment switching
-- **Strictly read-only SQL** with fail-closed validation, a MySQL read-only transaction, and unconditional rollback
-- Discover connections, databases, tables, schemas, and sample rows
-- Return-size protection (`MYSQL_MAX_ROWS`, hard maximum 1000)
-- Legacy single-connection `MYSQL_*` configuration remains supported
-- **SSE/HTTP transport support** (`MCP_TRANSPORT=sse`)
-- Per-profile SSL/TLS and SSH tunneling
-- Passwords can stay in environment variables instead of the profiles file
-- Compatibility `query` alias for clients migrating from older MySQL MCP servers
+## 功能特性
 
-## Installation
+- 使用命名连接配置管理开发、测试、预发、生产等多个环境
+- 每次工具调用都显式选择 `connection` 和 `database`，避免并发客户端相互污染状态
+- 支持逻辑数据库到物理连接的精确路由，不会隐式跨环境切换
+- 严格只读 SQL：失败即拒绝的语法校验、MySQL 只读事务、无条件回滚
+- 可发现连接、数据库、表、字段、索引、约束和样例数据
+- 查询分页下推到 MySQL，避免客户端截断结果引发 Connector/Python `errno=-1`
+- 内置结果行数和单元格长度限制，最大返回 1000 行
+- 按源字段精确脱敏，支持别名、CTE 以及 JSON 内敏感键
+- 支持 SSL/TLS、SSH 隧道和 SSE/HTTP 传输
+- 密码可保存在环境变量、操作系统凭据库或受控的密钥命令中
+- 保留旧版单连接 `MYSQL_*` 环境变量和 `query` 工具别名
 
-### npm / npx
+## 安装
 
-Requirements: Node.js 18+, npm 9+, and Python 3.11+ available on `PATH`.
+### npm / npx（推荐）
 
-Run the current release without installing it globally:
+环境要求：Node.js 18+、npm 9+，并确保 Python 3.11+ 可从 `PATH` 找到。
+
+直接运行最新版本：
 
 ```bash
 npx -y @yanzhang123/readonly-db-mcp
 ```
 
-For controlled production rollouts, pin the reviewed version:
+生产环境建议固定经过审核的版本：
 
 ```bash
-npx -y @yanzhang123/readonly-db-mcp@x.y.z
+npx -y @yanzhang123/readonly-db-mcp@0.8.1
 ```
 
-Replace `x.y.z` with the version approved by your organization. The unversioned
-examples below intentionally resolve the npm `latest` tag.
+首次运行时，启动器会在用户缓存目录创建版本化虚拟环境，并安装包内 wheel 与带 SHA-256 锁定的 Python 依赖。完成后的环境按 wheel 和依赖锁指纹复用。可通过 `MYSQL_MCP_PYTHON` 指定 Python，通过 `MYSQL_MCP_NPM_CACHE_DIR` 修改缓存位置。
 
-On first use, the launcher creates a versioned virtual environment in the user
-cache and installs the bundled wheel plus exact Python dependencies from a
-version-controlled SHA-256 lock file. Downloads use the configured pip index
-and the completed environment is cached by wheel-and-lock fingerprint. Override
-Python with `MYSQL_MCP_PYTHON` or the cache location with
-`MYSQL_MCP_NPM_CACHE_DIR`.
+### 最小 MCP 配置
 
-For MCP clients, use `npx` as the command and
-`["-y", "@yanzhang123/readonly-db-mcp"]` as its arguments.
-
-### Minimal MCP client configuration
-
-Create `mysql-connections.toml` from
-[`mysql-connections.example.toml`](mysql-connections.example.toml), keep
-passwords in environment variables, and use an absolute path:
+复制 [`mysql-connections.example.toml`](mysql-connections.example.toml) 为本地配置文件，把密码放入环境变量，并在 MCP 配置中使用绝对路径：
 
 ```json
 {
   "mcpServers": {
     "mysql-readonly": {
       "command": "npx",
-      "args": ["-y", "@yanzhang123/readonly-db-mcp"],
+      "args": ["-y", "@yanzhang123/readonly-db-mcp@0.8.1"],
       "env": {
         "MYSQL_PROFILES_FILE": "C:/absolute/path/mysql-connections.toml",
-        "MYSQL_DEV_PASSWORD": "set-in-the-client-secret-store"
+        "MYSQL_DEV_PASSWORD": "由客户端密钥存储提供"
       }
     }
   }
 }
 ```
 
-On Windows clients that do not resolve npm command shims correctly, set
-`"command": "npx.cmd"`. Do not commit the populated profile, passwords, audit
-HMAC keys, connection strings, or client configuration containing secrets.
+部分 Windows MCP 客户端无法正确解析 npm 命令垫片，此时将 `command` 改为 `npx.cmd`。不要提交真实连接配置、密码、审计 HMAC 密钥、连接串或含有敏感信息的 MCP 客户端配置。
 
-After startup, call `validate_connections`, then `check_connection`, before
-running discovery queries. `check_connection` reports an irreversible account
-fingerprint and privilege classification without returning the username or raw
-grant statements.
+服务启动后，建议依次调用 `validate_connections` 和 `check_connection`，确认配置有效、网络可达、账号权限符合预期。`check_connection` 只返回不可逆账号指纹和权限分类，不会暴露用户名或原始授权语句。
 
-### Manual Python installation
+### 手动安装 Python 包
 
 ```bash
 pip install mysql-mcp-server
 ```
 
-The Python package remains available for source-oriented deployments, but the
-scoped npm package is the documented distribution path for this fork.
+Python 包仍适用于源码部署，但本分支的主要分发方式是上述 npm 包。
 
-## Configuration
+## 配置
 
-### Recommended: named connections
+### 推荐：命名连接
 
-Copy [`mysql-connections.example.toml`](mysql-connections.example.toml) to an ignored local file named `mysql-connections.toml`, then define all environments in one place:
+将 [`mysql-connections.example.toml`](mysql-connections.example.toml) 复制为已被 Git 忽略的 `mysql-connections.toml`，然后集中声明各环境：
 
 ```toml
 default = "dev"
 
 [connections.dev]
-description = "Local development"
+description = "本地开发环境"
 host = "127.0.0.1"
 port = 3306
 user = "readonly_user"
@@ -125,27 +100,26 @@ query_timeout_ms = 30000
 max_rows = 500
 max_cell_length = 20000
 result_format = "json"
-mask_columns = ["password", "passwd", "*secret*", "*token*", "*api_key*", "*private_key*", "ssn", "id_card", "phone", "email"]
+mask_columns = ["password", "*password*", "*passwd*", "*pwd*", "*secret*", "token", "*token", "*_token", "token_*", "*tokenvalue*", "*accesstoken*", "*refreshtoken*", "*idtoken*", "*appsec*", "*api_key*", "*private_key*", "*ssn*", "*id_card*", "*phone*", "*mobile*", "*email*"]
 pool_size = 3
 audit_enabled = true
 
 [connections.prod]
-description = "Production read replica"
+description = "生产只读副本"
 host = "prod-read.example.internal"
 user = "readonly_user"
 password_env = "MYSQL_PROD_PASSWORD"
 database = "app"
 allowed_databases = ["app", "reporting"]
-allowed_functions = [] # reviewed deterministic UDF/stored-function names only
+allowed_functions = [] # 仅填写已经审核、确定无副作用的 UDF/存储函数
 query_timeout_ms = 15000
 max_rows = 200
 result_format = "json"
-mask_columns = ["password", "passwd", "*secret*", "*token*", "*api_key*", "*private_key*", "ssn", "id_card", "phone", "email"]
 pool_size = 5
 ssl_mode = "VERIFY_CA"
 ssl_ca = "C:/certs/company-ca.pem"
 
-# Enterprise audit controls
+# 企业审计配置
 audit_enabled = true
 audit_log_file = "C:/var/log/mysql-mcp/audit.jsonl"
 audit_log_max_bytes = 10000000
@@ -156,28 +130,28 @@ audit_fail_closed = true
 audit_fsync = true
 ```
 
-Point the MCP process at that file and supply only the secrets through environment variables:
+通过环境变量提供配置路径和密钥：
 
 ```bash
 MYSQL_PROFILES_FILE=C:/absolute/path/mysql-connections.toml
 MYSQL_DEV_PASSWORD=...
 MYSQL_PROD_PASSWORD=...
-MYSQL_MCP_AUDIT_SIGNING_KEY=... # secret-manager supplied; never commit
-MYSQL_DEFAULT_CONNECTION=dev  # optional; overrides `default` in TOML
-MYSQL_MAX_ROWS=500             # optional; 1-1000, default 500
-MYSQL_QUERY_TIMEOUT_MS=30000   # full-call timeout, 100-300000 ms
-MYSQL_MAX_CELL_LENGTH=20000    # truncate oversized values
-MYSQL_RESULT_FORMAT=json       # csv or json
-MYSQL_MASK_COLUMNS=password,passwd,*secret*,*token*,*api_key*,*private_key*,ssn,id_card,phone,email
-MYSQL_POOL_SIZE=0              # legacy mode; named profiles default to 5
+MYSQL_MCP_AUDIT_SIGNING_KEY=... # 由密钥管理系统提供，禁止提交
+MYSQL_DEFAULT_CONNECTION=dev    # 可选，覆盖 TOML 中的 default
+MYSQL_MAX_ROWS=500              # 可选，1-1000，默认 500
+MYSQL_QUERY_TIMEOUT_MS=30000    # 整次调用超时，100-300000 毫秒
+MYSQL_MAX_CELL_LENGTH=20000     # 超长单元格截断长度
+MYSQL_RESULT_FORMAT=json        # json 或 csv
+MYSQL_POOL_SIZE=0               # 旧单连接模式；命名配置默认 5
 MYSQL_ALLOWED_DATABASES=app,reporting
-MYSQL_ALLOWED_FUNCTIONS=              # optional reviewed function names
+MYSQL_ALLOWED_FUNCTIONS=        # 可选，经过审核的函数名
 ```
 
-`password_env` is recommended. A `password` field is accepted for local-only setups, but `mysql-connections.toml` is gitignored because it may contain secrets. Use an absolute `MYSQL_PROFILES_FILE` path in desktop MCP clients because their working directory is not guaranteed.
+推荐使用 `password_env`。本地环境也支持 `password` 字段，但 `mysql-connections.toml` 已加入 `.gitignore`，因为它可能包含敏感信息。桌面 MCP 客户端的工作目录不固定，因此 `MYSQL_PROFILES_FILE` 必须使用绝对路径。
 
-For user-level `mcp.json` files, prefer the OS credential store so the password
-does not appear in either MCP configuration or TOML:
+### 使用操作系统凭据库
+
+用户级 MCP 配置可使用系统凭据库，让密码不出现在 MCP JSON 或 TOML 中：
 
 ```toml
 [connections.dev]
@@ -189,7 +163,7 @@ database = "app_dev"
 allowed_databases = ["app_dev"]
 ```
 
-Store or manage it locally with a masked prompt:
+使用遮罩输入在本机管理凭据：
 
 ```powershell
 readonly-db-mcp credentials --profiles-file C:/absolute/path/mysql-connections.toml set dev
@@ -197,15 +171,11 @@ readonly-db-mcp credentials --profiles-file C:/absolute/path/mysql-connections.t
 readonly-db-mcp credentials --profiles-file C:/absolute/path/mysql-connections.toml delete dev
 ```
 
-The keyring backend uses the platform credential service (Windows Credential
-Manager on Windows). Headless services can instead set
-`credential_provider = "command"` and a `credential_command = ["executable",
-"arg1"]` array for an approved secret-manager CLI. It is executed directly,
-never through a shell; stderr is discarded, output is bounded, and exactly one
-non-empty UTF-8 line is accepted. Provider failures are explicit but never
-include the secret, command arguments, or keyring reference.
+Windows 下 `keyring` 使用 Windows 凭据管理器。无桌面的服务环境可设置 `credential_provider = "command"`，并通过 `credential_command = ["executable", "arg1"]` 调用经过批准的密钥管理 CLI。程序不会通过 shell 执行命令；stderr 会被丢弃，输出长度受限，且只接受一行非空 UTF-8 文本。失败信息不会包含密钥、命令参数或凭据引用。
 
-When one logical environment is physically split, declare exact aliases:
+### 逻辑环境路由
+
+一个逻辑环境分布在多个物理实例时，可声明精确别名：
 
 ```toml
 [routes.shared-test]
@@ -214,12 +184,9 @@ gts = { connection = "test-gts", database = "gts" }
 eam = { connection = "test-eam", database = "eam" }
 ```
 
-A call with `connection="shared-test", database="eam"` resolves only that
-declared route. Unknown aliases fail with the configured choices; the server
-does not search or guess another environment. JSON results and audit records
-contain both requested and resolved targets.
+调用 `connection="shared-test", database="eam"` 时，只会解析到声明的目标。未知别名会明确失败，服务不会搜索或猜测其他环境。JSON 结果和审计记录会同时保留请求目标与实际目标。
 
-Each tool call can now target an environment without restarting the server:
+每次调用都可以选择环境，无需重启：
 
 ```json
 {
@@ -228,337 +195,274 @@ Each tool call can now target an environment without restarting the server:
   "query": "SELECT COUNT(*) FROM orders",
   "audit_context": {
     "actor": "reporting-service",
-    "purpose": "month-end reconciliation",
+    "purpose": "月末对账",
     "ticket_id": "FIN-2026-042"
   }
 }
 ```
 
-There is deliberately no process-global “switch” tool: explicit per-call selection prevents one concurrent MCP client from silently changing another client's active environment.
+服务刻意不提供进程级“切换连接/数据库”工具。显式逐次选择可防止一个并发客户端悄悄改变另一个客户端的活动环境。
 
-The profiles file is hot-reloaded when its size or modification time changes.
-One invalid profile is reported by `validate_connections` without disabling other
-valid profiles. Password environment variables are resolved only when their
-profile is used, so an unavailable production credential does not break local
-development.
+配置文件的大小或修改时间变化后会自动热加载。单个配置无效时，`validate_connections` 会报告该配置，但不会停用其他有效配置。密码环境变量只在使用对应连接时解析，因此生产凭据暂时不可用不会影响本地开发环境。
 
-### Legacy single connection
+### 旧版单连接环境变量
 
-If `MYSQL_PROFILES_FILE` is not set, the original environment variables still work:
+未设置 `MYSQL_PROFILES_FILE` 时，仍可使用原有环境变量：
 
 ```bash
-MYSQL_HOST=localhost     # Database host
-MYSQL_PORT=3306         # Optional: Database port (defaults to 3306 if not specified)
+MYSQL_HOST=localhost
+MYSQL_PORT=3306
 MYSQL_USER=readonly_user
 MYSQL_PASSWORD=your_password
-MYSQL_DATABASE=your_database # Optional: Omit for multi-database mode
+MYSQL_DATABASE=your_database
+MYSQL_ALLOWED_DATABASES=your_database
 
-# Advanced Configuration
-MYSQL_SSL_MODE=REQUIRED  # DISABLED, REQUIRED, VERIFY_CA, VERIFY_IDENTITY
-MYSQL_SSL_CA=            # required for VERIFY_CA / VERIFY_IDENTITY
-MYSQL_CONNECT_TIMEOUT=10 # Timeout in seconds
+MYSQL_SSL_MODE=REQUIRED          # DISABLED、REQUIRED、VERIFY_CA、VERIFY_IDENTITY
+MYSQL_SSL_CA=                   # VERIFY_CA / VERIFY_IDENTITY 必填
+MYSQL_CONNECT_TIMEOUT=10
 MYSQL_QUERY_TIMEOUT_MS=30000
 MYSQL_MAX_ROWS=500
 MYSQL_MAX_CELL_LENGTH=20000
 MYSQL_RESULT_FORMAT=json
 MYSQL_POOL_SIZE=0
-MYSQL_AUDIT_ENABLED=true
-MYSQL_AUDIT_LOG_FILE=C:/var/log/mysql-mcp/audit.jsonl
-MYSQL_AUDIT_LOG_MAX_BYTES=10000000
-MYSQL_AUDIT_LOG_BACKUP_COUNT=10
-MYSQL_AUDIT_HMAC_KEY_ENV=MYSQL_MCP_AUDIT_SIGNING_KEY
-MYSQL_MCP_AUDIT_SIGNING_KEY=replace-with-secret-manager-value
-MYSQL_AUDIT_REQUIRED_CONTEXT=actor,purpose,ticket_id
-MYSQL_AUDIT_FAIL_CLOSED=true
-MYSQL_AUDIT_FSYNC=true
-MYSQL_ALLOWED_DATABASES=your_database
-
-# Connection behaviour (Optional)
-MYSQL_SQL_MODE=TRADITIONAL           # SQL mode applied to the connection (default: TRADITIONAL)
-
-# Compatibility (Optional)
+MYSQL_SQL_MODE=TRADITIONAL
 MYSQL_CHARSET=utf8mb4
 MYSQL_COLLATION=utf8mb4_unicode_ci
-MYSQL_AUTH_PLUGIN=       # e.g., mysql_native_password for older MySQL versions
-MYSQL_USE_PURE=false     # Force the pure-Python connector (default: false)
-MYSQL_RAISE_ON_WARNINGS=false        # Raise on SQL warnings (default: false)
-
-# SSE Transport (Optional)
-MCP_TRANSPORT=stdio      # stdio or sse
-MCP_SSE_HOST=127.0.0.1   # Safe default: loopback only
-PORT=8000                # HTTP port (fallback for MCP_SSE_PORT)
-MCP_SSE_ALLOWED_HOSTS=   # Comma-separated allowed Host headers (default: localhost:{port},127.0.0.1:{port})
-MCP_SSE_BEARER_TOKEN=    # Optional; at least 32 characters
-# Set only when an authenticated reverse proxy is the sole network entry point:
-MCP_SSE_TRUST_PROXY_AUTH=false
-
-# SSH Tunneling (Optional)
-MYSQL_SSH_ENABLE=false   # Set to true to enable
-MYSQL_SSH_HOST=          # SSH jump host
-MYSQL_SSH_PORT=22        # SSH port
-MYSQL_SSH_USER=          # SSH username
-MYSQL_SSH_KEY_PATH=      # Path to SSH private key
-MYSQL_SSH_REMOTE_HOST=localhost # Host from the perspective of the jump host
-MYSQL_SSH_REMOTE_PORT=3306
-MYSQL_LOCAL_PORT=0       # 0 selects a free port; the tunnel is reused
+MYSQL_USE_PURE=false
+MYSQL_RAISE_ON_WARNINGS=false
 ```
 
-### `.env` file loading
-
-On startup the server automatically loads a `.env` file via `python-dotenv`, so for local use you can simply:
+### SSE 传输
 
 ```bash
-cp .env.example .env   # then edit with your credentials
+MCP_TRANSPORT=stdio             # stdio 或 sse
+MCP_SSE_HOST=127.0.0.1          # 默认仅监听回环地址
+PORT=8000                       # MCP_SSE_PORT 的后备值
+MCP_SSE_ALLOWED_HOSTS=          # 允许的 Host，逗号分隔
+MCP_SSE_BEARER_TOKEN=           # 可选，至少 32 个字符
+MCP_SSE_TRUST_PROXY_AUTH=false  # 仅在认证反向代理是唯一入口时启用
 ```
 
-The file is read from the **process working directory** (and parent directories), which works when you run the server yourself from the project folder.
+非回环地址只有在启用 Bearer 认证，或显式确认由认证反向代理保护时才允许启动。部署细节见 [`ENTERPRISE_DEPLOYMENT.md`](ENTERPRISE_DEPLOYMENT.md)。
 
-> ⚠️ **Claude Code / Claude Desktop:** these hosts launch the server from their own working directory, so the project's `.env` will **not** be found and you'll see `Missing required database configuration`. Put your `MYSQL_*` values in the `env` block of the MCP config (shown in the Usage section below) rather than relying on `.env`.
+### SSH 隧道
 
-### Multi-database mode
+```bash
+MYSQL_SSH_ENABLE=false
+MYSQL_SSH_HOST=
+MYSQL_SSH_PORT=22
+MYSQL_SSH_USER=
+MYSQL_SSH_KEY_PATH=
+MYSQL_SSH_REMOTE_HOST=localhost
+MYSQL_SSH_REMOTE_PORT=3306
+MYSQL_LOCAL_PORT=0              # 0 表示自动选择端口，隧道会复用
+```
 
-When `MYSQL_DATABASE` is not set, the server operates in multi-database mode:
-- `list_resources` returns all user databases (system databases are filtered out)
-- Pass `database` to any data tool, or use fully qualified names such as `mydb.mytable`
-- `USE` and multiple statements are intentionally blocked
+### `.env` 文件
 
-## Available Tools
+服务启动时会通过 `python-dotenv` 从进程工作目录及父目录加载 `.env`：
 
-All tools are declared with `readOnlyHint=true` and `destructiveHint=false`.
+```bash
+cp .env.example .env
+```
+
+Claude Desktop、Codex 等宿主通常从自己的目录启动 MCP 服务，未必能找到项目内 `.env`。这类场景应将 `MYSQL_*` 配置放入 MCP 配置的 `env` 节点，或使用命名配置文件和凭据库。
+
+### 多数据库模式
+
+未设置 `MYSQL_DATABASE` 时，服务进入多数据库模式：
+
+- `list_resources` 返回过滤系统库后的可访问数据库
+- 数据工具通过 `database` 参数或 `database.table` 全限定名选择数据库
+- `USE` 和多语句始终被拦截
+
+## 可用工具
+
+所有工具都声明 `readOnlyHint=true` 和 `destructiveHint=false`。
 
 ### `list_connections`
-Lists named profiles, default database, policy limits and readiness. It never returns hosts, usernames, passwords, or SSH key paths.
-It also returns a `database_routes` index so clients can select the correct
-profile when one environment is split across several database-specific
-connections, plus `logical_routes` for exact configured environment aliases.
+
+列出命名配置、默认数据库、策略限制和就绪状态，不返回主机、用户名、密码或 SSH 私钥路径。还会返回数据库路由索引和逻辑环境别名。
 
 ### `validate_connections`
-Forces a configuration reload and reports valid/invalid profiles plus missing
-password environment variables without opening database connections.
+
+强制重新加载配置，报告有效/无效配置及缺少的密码环境变量，不建立数据库连接。
 
 ### `check_connection`
-Runs `SELECT`/`SHOW GRANTS` health checks and returns MySQL version, current
-database, an irreversible account fingerprint, global read-only state, grant
-count, latency and active profile policy. Raw usernames and grant statements are
-not returned. It classifies non-read privileges and warns when the account does
-not provide read-only defense in depth.
+
+通过只读健康检查返回 MySQL 版本、当前数据库、不可逆账号指纹、全局只读状态、授权数量、延迟和当前策略。原始用户名和 `SHOW GRANTS` 内容不会返回。
 
 ### `list_databases`
-Lists accessible non-system databases.
-- **Arguments:** `connection` (optional)
-- For a configured logical connection, returns its declared database aliases
-  without opening a database connection.
+
+列出可访问的非系统数据库。
+
+- 参数：`connection`（可选）
+- 对逻辑连接返回声明的数据库别名，不建立数据库连接
 
 ### `list_tables`
-Lists tables and views in a database.
-- **Arguments:** `connection`, `database` (both optional)
+
+列出指定数据库中的表和视图。
+
+- 参数：`connection`、`database`、`table_name`/`table`（精确匹配）、`table_pattern`（支持 `*`/`?`）、`max_rows`、`offset`、`timeout_ms`、`result_format`，均可选
+- 大库使用与 `execute_sql` 相同的 `truncated`/`next_offset` 分页契约
 
 ### `execute_sql`
-Executes exactly one read-only statement.
-- **Arguments:** `query` (required); `connection`, `database`, `max_rows`, `offset`, `timeout_ms`, `result_format`, `audit_context` (optional unless required by the profile)
-- **Allowed statement families:** `SELECT`, `WITH`, `SHOW`, `DESCRIBE`, `DESC`, `EXPLAIN`, `TABLE`
-- **Always blocked:** DML, DDL, `USE`, transaction control, locks, `SELECT ... INTO`, session-variable assignment, MySQL executable comments, and multiple statements
-- **Function policy:** unresolved stored functions/UDFs are blocked by default because `SELECT function(...)` can hide database or external side effects. `allowed_functions` is an explicit reviewed-function exception.
-- **Defense in depth:** validation occurs before connecting; MySQL then executes inside `START TRANSACTION READ ONLY`. Completed calls roll back; truncated/cancelled calls close the socket so MySQL rolls back and stops producing unread rows.
-- **Cross-database:** use the `database` argument or a qualified `database.table` name
-- **Timeout/cancellation:** profile timeout, Connector socket timeout and MySQL/MariaDB statement timeout are combined. MCP cancellation closes the active socket; no `KILL` privilege is required.
-- **Pagination:** JSON output includes `truncated` and `next_offset`; pass that value back as `offset`.
-- **Formats:** `json` preserves structured rows and metadata; `csv` uses RFC-style quoting and explicit `NULL`.
-- **Attribution:** `audit_context` supports `actor`, `purpose`, and `ticket_id`. A profile can require any of these fields before a connection is opened.
-- **Transient connector recovery:** client-side Connector/Python failures with
-  `errno=-1` are retried once. Persistent failures report only a safe exception
-  type and lifecycle phase; connector messages are not exposed.
+
+执行且只执行一条只读语句。
+
+- 必填参数：`query`
+- 可选参数：`connection`、`database`、`max_rows`、`offset`、`timeout_ms`、`result_format`、`audit_context`
+- 允许：`SELECT`、`WITH`、受数据库范围约束的 `SHOW`（包括 `SHOW CREATE TABLE/VIEW`）、`DESCRIBE`、`DESC`、`EXPLAIN`、`TABLE`
+- 始终拦截：DML、DDL、`USE`、事务控制、锁、`SELECT ... INTO`、会话变量赋值、MySQL 可执行注释和多语句
+- 函数策略：默认拦截无法识别的存储函数/UDF；只有 `allowed_functions` 中经过审核的确定性函数可放行
+- 纵深防御：连接前先校验；随后在 `START TRANSACTION READ ONLY` 中执行并回滚
+- 分页：对适用的 `SELECT`/CTE/UNION 下推 `LIMIT max_rows+1 OFFSET offset`，完整消费该有界结果后再回滚；JSON 结果返回 `truncated` 和 `next_offset`
+- 跨库：使用 `database` 参数或 `database.table` 全限定名
+- 超时/取消：统一限制完整操作、Connector socket 和 MySQL/MariaDB 语句时间；取消请求会关闭活动连接，无需 `KILL` 权限
+- 格式：`json` 保留结构化数据和元信息；`csv` 使用标准引号规则，并明确表示 `NULL`
+- 审计归因：`audit_context` 支持 `actor`、`purpose`、`ticket_id`，配置可要求调用前必须提供指定字段
+- 临时故障恢复：Connector/Python 客户端侧 `errno=-1` 会重试一次；持续失败只返回安全的异常类型和生命周期阶段
 
 ### `query`
-Compatibility alias for `execute_sql` with the same schema and all the same
-read-only, database allowlist, masking, timeout, pagination, and audit controls.
-Stateful legacy tools such as `use_connection` and `use_database` are
-intentionally not restored because process-global selection is unsafe with
-concurrent MCP clients.
+
+`execute_sql` 的兼容别名，使用相同的只读、白名单、脱敏、超时、分页和审计策略。不会恢复不安全的进程级 `use_connection` 或 `use_database`。
 
 ### `get_schema_info`
-Provides detailed metadata about database structures.
-- **Arguments:** `table_name`, `connection`, `database` (all optional)
-- **Output:** Column names, types, nullability, default values, and comments.
-- **Cross-database:** Pass `database.table` to query a table outside `MYSQL_DATABASE`; bare names use the configured database.
-- **Identifier rules:** Names must contain only alphanumeric characters, underscores, and `$` (dots are allowed as a separator between database and table names).
+
+返回数据库结构详情，包括字段名、类型、可空性、默认值和注释。
+
+- 参数：`table_name` 或兼容别名 `table`，以及 `connection`、`database`
+- 可用 `database.table` 访问允许列表中的其他数据库
+- 标识符只允许字母、数字、下划线、`$`，数据库与表之间允许一个点
 
 ### `get_table_sample`
-Fetches a representative sample of data.
-- **Arguments:** `table_name` (required), `limit` (optional integer, max 100), `offset`, `connection`, `database`, `timeout_ms`, `result_format`
-- **Use Case:** Quickly understand data formats and content without fetching large result sets.
-- **Cross-database:** Pass `database.table` to sample a table outside `MYSQL_DATABASE`; bare names use the configured database.
-- **Identifier rules:** Names must contain only alphanumeric characters, underscores, and `$` (dots are allowed as a separator between database and table names).
-- **Bounded execution:** Sampling applies `LIMIT limit+1 OFFSET offset` in
-  MySQL and fully consumes that small result. It does not open an unbounded
-  table scan merely to return a few rows.
+
+返回具有代表性的少量样例数据。
+
+- `table_name` 或兼容别名 `table` 必须提供一个
+- 可选参数：`limit`（最大 100）、`offset`、`connection`、`database`、`timeout_ms`、`result_format`
+- 采样会在 MySQL 中应用 `LIMIT limit+1 OFFSET offset` 并完整消费小结果集，不会为了返回几行数据而开启无界扫描结果
 
 ### `inspect_catalog`
-Returns one fixed metadata projection for `tables`, `columns`, `indexes`,
-`constraints`, `foreign_keys`, or `views`, optionally filtered by a validated
-bare table name. `connection` and `database` follow the same explicit routing
-rules as other tools. This does not permit arbitrary `information_schema` SQL.
 
-## Available Prompts
+返回 `tables`、`columns`、`indexes`、`constraints`、`foreign_keys` 或 `views` 的固定元数据投影。可通过 `table_name` 或 `table` 精确过滤。该工具不会开放任意 `information_schema` SQL。
 
-In addition to tools, the server exposes **MCP prompts** — guided, multi-step workflows that a client can launch on demand. In Claude Code they appear as slash commands (`/mcp__<server>__<prompt>`); in Claude Desktop they appear in the prompts (`+`) menu.
+## 可用提示词
 
-| Prompt | Arguments | Description |
+| 提示词 | 参数 | 说明 |
 | --- | --- | --- |
-| `explore_database` | `connection`, `database` *(optional)* | Systematically explore the selected database: discover tables, inspect schemas, sample data, and summarize it. |
-| `analyze_table` | `table_name` *(required)*; `connection`, `database` *(optional)* | Deep-dive into a specific table. Accepts `database.table` notation. |
+| `explore_database` | `connection`、`database`（可选） | 依次发现表、检查结构、采样并总结数据库 |
+| `analyze_table` | `table_name`（必填）、`connection`、`database`（可选） | 深入分析指定表，支持 `database.table` |
 
-**Example (Claude Code):**
-```
-/mcp__mysql__explore_database
-/mcp__mysql__analyze_table customers
-```
+这些提示词只编排只读的发现、结构检查和采样工具。
 
-Both prompts orchestrate the read-only discovery, schema, and sampling tools.
+## MCP 客户端配置
 
-## Usage
-### With Claude Desktop
-Add this to your `claude_desktop_config.json`:
+### Claude Desktop
+
+在 `claude_desktop_config.json` 中加入：
+
 ```json
 {
   "mcpServers": {
     "mysql-readonly": {
       "command": "npx",
-      "args": ["-y", "@yanzhang123/readonly-db-mcp"],
+      "args": ["-y", "@yanzhang123/readonly-db-mcp@0.8.1"],
       "env": {
         "MYSQL_PROFILES_FILE": "C:/absolute/path/mysql-connections.toml",
-        "MYSQL_DEV_PASSWORD": "your_dev_password",
-        "MYSQL_PROD_PASSWORD": "your_prod_password"
+        "MYSQL_DEV_PASSWORD": "your_dev_password"
       }
     }
   }
 }
 ```
 
-For more detailed examples and agent-specific guidance, see [MCP_USECASES.md](MCP_USECASES.md).
+### Visual Studio Code / Codex
 
-### With Visual Studio Code
-Add this to your `mcp.json`:
+在 `mcp.json` 或对应 MCP 配置中加入：
+
 ```json
 {
   "mcpServers": {
     "mysql-readonly": {
       "type": "stdio",
       "command": "npx",
-      "args": ["-y", "@yanzhang123/readonly-db-mcp"],
+      "args": ["-y", "@yanzhang123/readonly-db-mcp@0.8.1"],
       "env": {
         "MYSQL_PROFILES_FILE": "C:/absolute/path/mysql-connections.toml",
-        "MYSQL_DEV_PASSWORD": "your_dev_password",
-        "MYSQL_PROD_PASSWORD": "your_prod_password"
+        "MYSQL_DEV_PASSWORD": "your_dev_password"
       }
     }
   }
 }
 ```
 
-Use `npx.cmd` instead of `npx` if required by your Windows MCP host.
+Windows 宿主如无法解析 `npx`，改用 `npx.cmd`。更多调用场景见 [`MCP_USECASES.md`](MCP_USECASES.md)。
 
-### Debugging with MCP Inspector
-While MySQL MCP Server isn't intended to be run standalone or directly from the command line with Python, you can use the MCP Inspector to debug it.
-
-The MCP Inspector provides a convenient way to test and debug your MCP implementation:
+## 开发与测试
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
-# Use the MCP Inspector for debugging (do not run directly with Python)
-```
-
-The MySQL MCP Server is designed to be integrated with AI applications like Claude Desktop and should not be run directly as a standalone Python program.
-
-## Development
-```bash
-# Clone the repository
 git clone https://github.com/12zhangyan/mysql_mcp_server.git
 cd mysql_mcp_server
-# Create virtual environment
-python -m venv venv
-# Linux/macOS: source venv/bin/activate
-# Windows PowerShell: .\venv\Scripts\Activate.ps1
-# Install development dependencies
+python -m venv .venv
+
+# Linux/macOS
+source .venv/bin/activate
+
+# Windows PowerShell
+.\.venv\Scripts\Activate.ps1
+
 pip install -r requirements-dev.txt
-# Copy the example config and edit with your credentials
-# Linux/macOS: cp .env.example .env
-# Windows PowerShell: Copy-Item .env.example .env
-# Edit .env with your MySQL connection details
-# Run tests
 pytest
+npm test
 ```
 
-## Security Considerations
-- **Read-only SQL gate:** Only result-producing read statements are accepted; write/DDL/transaction/locking constructs are rejected before a connection is opened.
-- **Database enforcement:** Every exposed query runs with `autocommit=false` in a read-only transaction. Normal completion rolls back; cancellation or truncation closes the socket and forces server-side rollback.
-- **Write-capable credentials:** Read-only behavior does not depend on account grants. Unrecognized stored functions/UDFs, side-effecting functions, sequence advancement and locking reads are rejected because they can hide effects inside `SELECT`.
-- **Database allowlist:** `allowed_databases` is enforced with a MySQL AST parser for tools and resource URIs; system schemas are blocked by default.
-- **Controlled metadata:** User SQL cannot query `information_schema` by
-  default. Dedicated `list_tables`, `get_schema_info`, and `inspect_catalog`
-  operations use narrowly scoped internal metadata queries, so catalog access
-  does not become a general system-schema bypass.
-- **Credential isolation:** Named profiles can resolve passwords from an OS
-  keyring or an approved no-shell command. Discovery, logs, errors and audit
-  events omit credential values and keyring references.
-- **Resource limits:** Calls have full-operation, socket and server statement timeouts; at most 1000 rows are returned and oversized cells are truncated.
-- **Cancellation:** Cancelling the MCP request closes the active connector socket. The worker does not continue silently after the response is abandoned.
-- **Enterprise audit:** Versioned UTC JSONL events include an event ID, MCP request ID, operation, caller-supplied attribution, policy decision, target database, literal-free query fingerprint, duration, result size and outcome. SQL text and result data are never logged. Optional rotation, fsync, HMAC signatures, required context and fail-closed behavior are supported.
-- **Two-phase audit:** In fail-closed mode, an fsynced `started` event is persisted before opening a database connection, followed by the terminal outcome event.
-- **Result masking:** Sensitive output names are redacted by default. Queries whose expression tree references a sensitive source column are conservatively redacted even when aliases or CTEs hide the original name. Review `mask_columns` for each schema; setting it to an empty list explicitly disables masking.
-- **Encrypted by default:** Database TLS defaults to `REQUIRED` and the connected session is rejected if the connector reports plaintext. Production profiles should use `VERIFY_CA` or `VERIFY_IDENTITY` with `ssl_ca`.
-- **Parser hardening:** MySQL `/*!...*/` and MariaDB `/*M!...*/` executable comments are rejected, and server-wide `SHOW` variants are blocked unless they can be scoped to an allowed database.
-- **Identifier Validation:** Table and database names passed to `get_schema_info` and `get_table_sample` are validated against a strict whitelist (alphanumeric, underscore, and `$` only; a single dot is allowed as a `database.table` separator). Other special characters are rejected to prevent SQL injection.
-- **Encrypted Access:** Full support for SSL/TLS and SSH Tunneling for secure remote connections.
-- **Log Privacy:** SQL text, passwords, hosts, usernames and SSH private-key paths are not included in tool discovery or audit events.
-- **Diagnostic Privacy:** Connection diagnostics expose an account fingerprint and privilege summary, not raw usernames or `SHOW GRANTS`; configuration paths and database-supplied error text are redacted.
-- **Least Privilege:** A dedicated `SELECT` account is recommended as additional defense, but it is not assumed by the MCP read-only enforcement. `check_connection` warns about broader grants without disabling the profile.
-- **SSE is loopback-only by default.** Configure `MCP_SSE_BEARER_TOKEN` with at least 32 characters to enable built-in bearer authentication. A non-loopback bind is refused unless bearer authentication is enabled or `MCP_SSE_TRUST_PROXY_AUTH=true` explicitly confirms that an authenticated reverse proxy is the only network entry point. Example with nginx and HTTP Basic Auth:
+调试 MCP 协议交互时可使用 MCP Inspector，不建议直接把 Python 进程当作普通命令行程序交互。
 
-  ```nginx
-  location /sse {
-      auth_basic "MCP";
-      auth_basic_user_file /etc/nginx/.htpasswd;
-      proxy_pass http://127.0.0.1:8000;
-      proxy_set_header Host $host;
-      proxy_buffering off;
-  }
-  location /messages/ {
-      auth_basic "MCP";
-      auth_basic_user_file /etc/nginx/.htpasswd;
-      proxy_pass http://127.0.0.1:8000;
-      proxy_set_header Host $host;
-  }
-  ```
+## 安全设计
 
-  Keep `MCP_SSE_HOST=127.0.0.1` so the proxy is the sole public entry point. If a container requires `0.0.0.0`, set `MCP_SSE_TRUST_PROXY_AUTH=true` only after network policy prevents direct access. Set `MCP_SSE_ALLOWED_HOSTS` to the hostname forwarded by the proxy.
+- **只读 SQL 闸门**：仅允许产生结果的只读语句；写入、DDL、事务、锁和有副作用的结构在连接前被拒绝
+- **数据库侧约束**：所有查询以 `autocommit=false` 运行在只读事务中，正常结束统一回滚，取消时关闭连接触发服务端回滚
+- **可写账号防护**：MCP 的只读行为不依赖账号授权；仍建议用专用 `SELECT` 账号作为独立防线
+- **数据库白名单**：工具和资源 URI 均通过 MySQL AST 解析执行 `allowed_databases`，系统库默认禁止
+- **受控元数据**：用户 SQL 默认不能直接查询 `information_schema`；使用 `list_tables`、`get_schema_info`、`inspect_catalog` 获取限定范围的元数据
+- **凭据隔离**：密码可来自环境变量、操作系统凭据库或无 shell 的受控命令；发现接口、日志和错误均不返回凭据值或引用
+- **资源限制**：整次调用、socket 和服务端语句均有超时；最多返回 1000 行，超长单元格会截断
+- **精确脱敏**：依据表达式源字段脱敏，别名不能绕过规则，也不会连带遮罩无关列；JSON 中 `clientSecret`、`AppSec` 等敏感键递归脱敏
+- **安全默认规则**：覆盖常见 password/PWD、mobile/phone、secret、凭据 token、API key、private key 命名；不会用宽泛的 `*token*` 误伤通道代码或 token 有效时长
+- **企业审计**：UTC JSONL 事件包含事件 ID、MCP 请求 ID、操作、调用方归因、策略决定、目标库、无字面量查询指纹、耗时、结果大小和结果状态；不记录 SQL 原文和结果数据
+- **两阶段审计**：失败关闭模式下，建立连接前先 fsync 写入 `started` 事件，随后记录终态事件
+- **默认加密**：数据库 TLS 默认 `REQUIRED`；生产配置建议使用 `VERIFY_CA` 或 `VERIFY_IDENTITY`
+- **解析器加固**：拒绝 MySQL `/*!...*/` 和 MariaDB `/*M!...*/` 可执行注释；未限定到允许数据库的全局 `SHOW` 被拦截
+- **诊断隐私**：连接诊断只公开不可逆账号指纹和权限摘要，不返回用户名、授权原文、配置路径或数据库错误原文
+- **SSE 安全边界**：默认仅绑定回环地址；非回环部署必须配置 Bearer 认证或由唯一入口的认证反向代理保护
 
-See [SECURITY.md](SECURITY.md) and [ENTERPRISE_DEPLOYMENT.md](ENTERPRISE_DEPLOYMENT.md) for deployment and audit guidance.
-Maintainers should follow [RELEASING.md](RELEASING.md) for synchronized Python/npm version releases.
+详细安全和企业部署说明：
 
-## Security Best Practices
-This MCP implementation requires database access to function. For security:
-1. **Prefer a dedicated MySQL user** with `SELECT` only as defense in depth; MCP enforcement remains read-only even when broader credentials are supplied
-2. **Never use root credentials** or administrative accounts
-3. **Restrict `allowed_databases`** to the schemas each profile needs
-4. **Require audit attribution** and protect the optional HMAC key in a secret manager
-5. **Review masking patterns, audit events, dependency updates, and account grants regularly**
+- [`SECURITY.md`](SECURITY.md)
+- [`ENTERPRISE_DEPLOYMENT.md`](ENTERPRISE_DEPLOYMENT.md)
 
-See [MySQL Security Configuration Guide](https://github.com/12zhangyan/mysql_mcp_server/blob/main/SECURITY.md) for detailed instructions on:
-- Creating a restricted MySQL user
-- Setting appropriate permissions
-- Monitoring database access
-- Security best practices
+## 安全最佳实践
 
-⚠️ IMPORTANT: Always follow the principle of least privilege when configuring database access.
+1. 使用仅授予 `SELECT` 的专用 MySQL 用户，不使用 root 或管理员账号
+2. 通过 `allowed_databases` 将每个连接限制到实际需要的数据库
+3. 对生产连接启用证书校验，并限制网络访问来源
+4. 对重要环境要求完整的 `audit_context`，审计 HMAC 密钥由密钥管理系统提供
+5. 定期复核脱敏规则、审计事件、依赖版本和账号授权
 
-## License
-MIT License - see LICENSE file for details.
+## 发布
 
-## Contributing
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add some amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+Python 与 npm 使用同一版本号。维护者应按 [`RELEASING.md`](RELEASING.md) 完成同步版本、测试、打包和发布。
+
+## 参与贡献
+
+1. Fork 仓库
+2. 创建功能分支
+3. 提交修改并运行相关测试
+4. 推送分支并创建 Pull Request
+
+提交安全问题前请先阅读 [`SECURITY.md`](SECURITY.md)。
+
+## 许可证
+
+本项目使用 MIT License，详见 [`LICENSE`](LICENSE)。

@@ -14,6 +14,7 @@ from typing import Any
 
 import sqlglot
 from sqlglot import exp
+from sqlglot.lineage import lineage
 
 TRUNCATION_SUFFIX = "…[truncated]"
 MASKED_VALUE = "[REDACTED]"
@@ -48,13 +49,142 @@ def _column_candidates(column: exp.Column) -> set[str]:
     return {".".join(parts[index:]) for index in range(len(parts))}
 
 
+def _name_candidates(name: str) -> set[str]:
+    parts = [part.strip('`"').lower() for part in name.split(".") if part]
+    return {".".join(parts[index:]) for index in range(len(parts))}
+
+
+def _result_source_candidates(query: str, columns: list[str]) -> list[set[str] | None]:
+    """Resolve each SELECT output to its source columns, including CTE aliases.
+
+    ``None`` means the projection contains a star or could not be mapped safely;
+    callers then use the connector's output name as the source-column fallback.
+    """
+    statement = sqlglot.parse_one(query, read="mysql")
+    if not isinstance(statement, exp.Query):
+        return [None] * len(columns)
+
+    if not isinstance(statement, exp.Select):
+        query_resolved: list[set[str] | None] = []
+        query_columns = {
+            candidate
+            for column in statement.find_all(exp.Column)
+            for candidate in _column_candidates(column)
+        }
+        for column_name in columns:
+            query_candidates: set[str] = set()
+            try:
+                node = lineage(column_name, statement, dialect="mysql")
+                for lineage_node in node.walk():
+                    query_candidates.update(_name_candidates(str(lineage_node.name)))
+            except Exception:
+                query_resolved.append(query_columns or None)
+                continue
+            query_resolved.append(query_candidates or None)
+        return query_resolved
+
+    projections = list(statement.expressions)
+    if len(projections) != len(columns):
+        mismatched_resolved: list[set[str] | None] = []
+        for column_name in columns:
+            mismatched_candidates: set[str] = set()
+            try:
+                node = lineage(column_name, statement, dialect="mysql")
+                for lineage_node in node.walk():
+                    mismatched_candidates.update(
+                        _name_candidates(str(lineage_node.name))
+                    )
+            except Exception:
+                mismatched_resolved.append(None)
+                continue
+            mismatched_resolved.append(mismatched_candidates or None)
+        return mismatched_resolved
+    if any(projection.find(exp.Star) is not None for projection in projections):
+        return [None] * len(columns)
+
+    traced_statement = statement.copy()
+    traced_projections = list(traced_statement.expressions)
+    aliases = [f"__mcp_output_{index}" for index in range(len(columns))]
+    traced_statement.set(
+        "expressions",
+        [
+            projection.as_(alias, copy=False)
+            for projection, alias in zip(traced_projections, aliases)
+        ],
+    )
+
+    resolved: list[set[str] | None] = []
+    for projection, alias in zip(projections, aliases):
+        candidates = {
+            candidate
+            for column in projection.find_all(exp.Column)
+            for candidate in _column_candidates(column)
+        }
+        try:
+            node = lineage(alias, traced_statement, dialect="mysql")
+            for lineage_node in node.walk():
+                candidates.update(_name_candidates(str(lineage_node.name)))
+        except Exception:
+            # Direct projection columns still give a safe result for ordinary
+            # SELECTs. When lineage cannot resolve an indirect source, fall back
+            # to the connector output name rather than silently trusting it.
+            if not candidates:
+                resolved.append(None)
+                continue
+        resolved.append(candidates)
+    return resolved
+
+
+def _mask_json_keys(value: Any, matches) -> tuple[Any, bool]:
+    """Redact sensitive keys inside serialized JSON without hiding safe siblings."""
+    parsed = value
+    serialized = isinstance(value, str)
+    if serialized:
+        stripped = value.lstrip()
+        if not stripped.startswith(("{", "[")):
+            return value, False
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return value, False
+
+    def visit(item: Any) -> tuple[Any, bool]:
+        if isinstance(item, dict):
+            changed = False
+            output = {}
+            for key, nested in item.items():
+                if matches({str(key).lower()}):
+                    output[key] = MASKED_VALUE if nested is not None else None
+                    changed = changed or nested is not None
+                else:
+                    output[key], nested_changed = visit(nested)
+                    changed = changed or nested_changed
+            return output, changed
+        if isinstance(item, list):
+            list_output = []
+            changed = False
+            for nested in item:
+                masked, nested_changed = visit(nested)
+                list_output.append(masked)
+                changed = changed or nested_changed
+            return list_output, changed
+        return item, False
+
+    masked, changed = visit(parsed)
+    if serialized:
+        if changed:
+            return json.dumps(masked, ensure_ascii=False, separators=(",", ":")), True
+        return value, False
+    return masked, changed
+
+
 def mask_result_rows(
     query: str,
     columns: list[str],
     rows: list[list[Any]],
     patterns: tuple[str, ...],
 ) -> tuple[list[list[Any]], list[str]]:
-    """Mask configured columns, failing conservatively across aliases and CTEs."""
+    """Mask sensitive source columns and sensitive keys nested in JSON values."""
     normalized_patterns = tuple(pattern.lower() for pattern in patterns if pattern)
     if not normalized_patterns or not rows:
         return rows, []
@@ -66,31 +196,36 @@ def mask_result_rows(
             for pattern in normalized_patterns
         )
 
+    try:
+        source_candidates = _result_source_candidates(query, columns)
+    except Exception:
+        source_candidates = [None] * len(columns)
+
     masked_indexes = {
-        index for index, name in enumerate(columns) if matches({str(name).lower()})
+        index
+        for index, (name, candidates) in enumerate(zip(columns, source_candidates))
+        if (
+            matches(candidates)
+            if candidates is not None
+            else matches({str(name).lower()})
+        )
     }
 
-    # If a sensitive source column appears anywhere in the statement, mask the
-    # complete result. This intentionally favors confidentiality over precision:
-    # aliases, CTEs and expressions must not turn `password AS value` into a
-    # masking bypass.
-    statement = sqlglot.parse_one(query, read="mysql")
-    if any(
-        matches(_column_candidates(column)) for column in statement.find_all(exp.Column)
-    ):
-        masked_indexes = set(range(len(columns)))
+    changed_indexes = set(masked_indexes)
+    masked_rows: list[list[Any]] = []
+    for row in rows:
+        masked_row = []
+        for index, value in enumerate(row):
+            if index in masked_indexes and value is not None:
+                masked_row.append(MASKED_VALUE)
+                continue
+            masked_value, changed = _mask_json_keys(value, matches)
+            masked_row.append(masked_value)
+            if changed:
+                changed_indexes.add(index)
+        masked_rows.append(masked_row)
 
-    if not masked_indexes:
-        return rows, []
-
-    masked_rows = [
-        [
-            MASKED_VALUE if index in masked_indexes and value is not None else value
-            for index, value in enumerate(row)
-        ]
-        for row in rows
-    ]
-    return masked_rows, [columns[index] for index in sorted(masked_indexes)]
+    return masked_rows, [columns[index] for index in sorted(changed_indexes)]
 
 
 @dataclass(frozen=True)

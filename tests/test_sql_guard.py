@@ -16,6 +16,8 @@ from mysql_mcp_server.sql_guard import (
         "SELECT * FROM users",
         "WITH recent AS (SELECT * FROM orders) SELECT * FROM recent",
         "SHOW TABLES",
+        "SHOW CREATE TABLE users",
+        "SHOW CREATE VIEW active_users",
         "DESCRIBE users",
         "EXPLAIN SELECT * FROM users",
         "SELECT 'delete from users' AS example",
@@ -133,6 +135,16 @@ def test_schema_scoped_show_and_internal_grants_remain_available():
         allowed_databases=("app",),
         allow_system_databases=False,
     ) == {"app"}
+
+
+def test_information_schema_error_points_to_controlled_metadata_tools():
+    with pytest.raises(ReadOnlyViolation, match="inspect_catalog"):
+        validate_database_access(
+            "SELECT * FROM information_schema.COLUMNS",
+            selected_database="app",
+            allowed_databases=("app",),
+            allow_system_databases=False,
+        )
     assert validate_database_access(
         "SHOW GRANTS",
         selected_database="app",

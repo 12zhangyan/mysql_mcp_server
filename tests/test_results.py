@@ -3,6 +3,7 @@ import json
 from datetime import datetime
 from decimal import Decimal
 
+from mysql_mcp_server.config import DEFAULT_MASK_COLUMNS
 from mysql_mcp_server.results import (
     MASKED_VALUE,
     QueryResult,
@@ -68,8 +69,8 @@ def test_sensitive_results_are_masked_across_aliases_and_ctes():
         ("password",),
     )
 
-    assert rows == [[MASKED_VALUE, MASKED_VALUE]]
-    assert masked == ["safe", "status"]
+    assert rows == [[MASKED_VALUE, "active"]]
+    assert masked == ["safe"]
 
 
 def test_output_column_patterns_mask_only_matching_columns():
@@ -82,3 +83,57 @@ def test_output_column_patterns_mask_only_matching_columns():
 
     assert rows == [[1, MASKED_VALUE]]
     assert masked == ["email_address"]
+
+
+def test_real_world_sensitive_names_mask_the_source_not_safe_siblings():
+    rows, masked = mask_result_rows(
+        "SELECT UserPWD AS harmless, Mobile, DisplayName FROM user",
+        ["harmless", "Mobile", "DisplayName"],
+        [["pwd", "13800000000", "Alice"]],
+        DEFAULT_MASK_COLUMNS,
+    )
+
+    assert rows == [[MASKED_VALUE, MASKED_VALUE, "Alice"]]
+    assert masked == ["harmless", "Mobile"]
+
+
+def test_sensitive_alias_does_not_mask_a_safe_source_column():
+    rows, masked = mask_result_rows(
+        "SELECT DisplayName AS secret_col FROM user",
+        ["secret_col"],
+        [["Alice"]],
+        DEFAULT_MASK_COLUMNS,
+    )
+
+    assert rows == [["Alice"]]
+    assert masked == []
+
+
+def test_json_secret_keys_are_masked_without_hiding_the_config_column():
+    rows, masked = mask_result_rows(
+        "SELECT AccountConfig FROM opentityintegratechannelinfo",
+        ["AccountConfig"],
+        [['{"clientId":"visible","clientSecret":"secret","nested":{"AppSec":"key"}}']],
+        DEFAULT_MASK_COLUMNS,
+    )
+
+    assert rows == [
+        [
+            '{"clientId":"visible","clientSecret":"[REDACTED]",'
+            '"nested":{"AppSec":"[REDACTED]"}}'
+        ]
+    ]
+    assert masked == ["AccountConfig"]
+
+
+def test_token_business_fields_are_not_masked_by_substring_alone():
+    rows, masked = mask_result_rows(
+        "SELECT IntegrateChannelCode, TokenCallConfig, TokenEffectiveDuration "
+        "FROM integratechannel",
+        ["IntegrateChannelCode", "TokenCallConfig", "TokenEffectiveDuration"],
+        [["channel-a", "{}", 12]],
+        DEFAULT_MASK_COLUMNS,
+    )
+
+    assert rows == [["channel-a", "{}", 12]]
+    assert masked == []
