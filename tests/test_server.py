@@ -1,3 +1,4 @@
+from importlib.metadata import version
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -23,7 +24,7 @@ from mysql_mcp_server.server import (
 def test_server_initialization():
     """Test that the server initializes correctly."""
     assert app.name == "mysql_mcp_server"
-    assert __version__ == "0.8.0"
+    assert __version__ == version("mysql-mcp-server")
 
 
 def test_sse_public_bind_requires_authentication():
