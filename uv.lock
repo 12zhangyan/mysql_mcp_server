@@ -422,7 +422,7 @@ wheels = [
 
 [[package]]
 name = "mysql-mcp-server"
-version = "0.8.1"
+version = "0.8.2"
 source = { editable = "." }
 dependencies = [
     { name = "keyring" },
@@ -433,6 +433,10 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+http = [
+    { name = "starlette" },
+    { name = "uvicorn" },
+]
 sse = [
     { name = "starlette" },
     { name = "uvicorn" },
@@ -445,10 +449,12 @@ requires-dist = [
     { name = "mysql-connector-python", specifier = ">=9.2.0,<10.0.0" },
     { name = "python-dotenv", specifier = ">=1.0.0,<2.0.0" },
     { name = "sqlglot", specifier = ">=26.0.0,<31.0.0" },
+    { name = "starlette", marker = "extra == 'http'", specifier = ">=0.35.0" },
     { name = "starlette", marker = "extra == 'sse'", specifier = ">=0.35.0" },
+    { name = "uvicorn", marker = "extra == 'http'", specifier = ">=0.27.0" },
     { name = "uvicorn", marker = "extra == 'sse'", specifier = ">=0.27.0" },
 ]
-provides-extras = ["sse"]
+provides-extras = ["http", "sse"]
 
 [[package]]
 name = "pycparser"

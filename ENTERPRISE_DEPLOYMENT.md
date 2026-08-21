@@ -171,7 +171,31 @@ files.
 For strong human identity, an authenticated gateway must bind its verified
 principal to the MCP request and protect access to the MCP endpoint.
 
-## SSE Deployment
+## Streamable HTTP Deployment
+
+New remote MCP clients, including DeepSeek Harness, should use the standard
+Streamable HTTP endpoint:
+
+```dotenv
+MCP_TRANSPORT=streamable-http
+MCP_HTTP_HOST=127.0.0.1
+MCP_HTTP_PORT=8000
+MCP_HTTP_PATH=/mcp
+MCP_HTTP_SESSION_IDLE_TIMEOUT_SECONDS=1800
+```
+
+For built-in bearer authentication:
+
+```dotenv
+MCP_HTTP_BEARER_TOKEN=<secret-manager-value-of-at-least-32-characters>
+```
+
+The token protects `/mcp`; `/` remains a non-sensitive health endpoint. Keep
+the service on loopback behind an authenticated reverse proxy. A container
+that must bind `0.0.0.0` may set `MCP_HTTP_TRUST_PROXY_AUTH=true` only when
+network policy prevents direct access to the container port.
+
+## Legacy SSE Deployment
 
 The safe default is:
 
