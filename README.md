@@ -9,7 +9,7 @@
 本分支推荐通过 npm 包 [`@yanzhang123/readonly-db-mcp`](https://www.npmjs.com/package/@yanzhang123/readonly-db-mcp) 使用。npm 包内置匹配版本的 Python wheel 和跨平台启动器，MCP 客户端无需检出仓库或单独安装 Python 包。
 
 > [!NOTE]
-> 服务同时支持标准输入输出（STDIO）和 Streamable HTTP（SSE）传输。远程或自托管场景可使用 SSE，并应按本文配置认证和网络边界。
+> 服务支持标准输入输出（STDIO）、标准 Streamable HTTP 和旧版 SSE 传输。远程或自托管场景推荐使用 Streamable HTTP，并应按本文配置认证和网络边界。
 
 > [!IMPORTANT]
 > 只读约束不依赖 MySQL 账号权限。即使账号拥有 `INSERT`、`UPDATE`、`DELETE` 或 DDL 权限，SQL 闸门也只接受经过审查的只读语句，并在只读事务中执行后统一回滚。生产环境仍强烈建议使用仅授予 `SELECT` 的数据库账号，形成独立的纵深防御。
@@ -24,7 +24,7 @@
 - 查询分页下推到 MySQL，避免客户端截断结果引发 Connector/Python `errno=-1`
 - 内置结果行数和单元格长度限制，最大返回 1000 行
 - 按源字段精确脱敏，支持别名、CTE 以及 JSON 内敏感键
-- 支持 SSL/TLS、SSH 隧道和 SSE/HTTP 传输
+- 支持 SSL/TLS、SSH 隧道、Streamable HTTP 和旧版 SSE 传输
 - 密码可保存在环境变量、操作系统凭据库或受控的密钥命令中
 - 保留旧版单连接 `MYSQL_*` 环境变量和 `query` 工具别名
 
@@ -43,7 +43,7 @@ npx -y @yanzhang123/readonly-db-mcp
 生产环境建议固定经过审核的版本：
 
 ```bash
-npx -y @yanzhang123/readonly-db-mcp@0.8.1
+npx -y @yanzhang123/readonly-db-mcp@0.8.2
 ```
 
 首次运行时，启动器会在用户缓存目录创建版本化虚拟环境，并安装包内 wheel 与带 SHA-256 锁定的 Python 依赖。完成后的环境按 wheel 和依赖锁指纹复用。可通过 `MYSQL_MCP_PYTHON` 指定 Python，通过 `MYSQL_MCP_NPM_CACHE_DIR` 修改缓存位置。
@@ -57,7 +57,7 @@ npx -y @yanzhang123/readonly-db-mcp@0.8.1
   "mcpServers": {
     "mysql-readonly": {
       "command": "npx",
-      "args": ["-y", "@yanzhang123/readonly-db-mcp@0.8.1"],
+      "args": ["-y", "@yanzhang123/readonly-db-mcp@0.8.2"],
       "env": {
         "MYSQL_PROFILES_FILE": "C:/absolute/path/mysql-connections.toml",
         "MYSQL_DEV_PASSWORD": "由客户端密钥存储提供"
@@ -232,10 +232,28 @@ MYSQL_USE_PURE=false
 MYSQL_RAISE_ON_WARNINGS=false
 ```
 
-### SSE 传输
+### Streamable HTTP 传输（推荐）
+
+DeepSeek Harness 等新客户端可直接连接标准 MCP Streamable HTTP 端点：
 
 ```bash
-MCP_TRANSPORT=stdio             # stdio 或 sse
+MCP_TRANSPORT=streamable-http
+MCP_HTTP_HOST=127.0.0.1
+MCP_HTTP_PORT=8000
+MCP_HTTP_PATH=/mcp
+MCP_HTTP_ALLOWED_HOSTS=localhost:8000,127.0.0.1:8000
+MCP_HTTP_BEARER_TOKEN=          # 可选，至少 32 个字符
+MCP_HTTP_TRUST_PROXY_AUTH=false # 仅在认证反向代理是唯一入口时启用
+MCP_HTTP_SESSION_IDLE_TIMEOUT_SECONDS=1800
+```
+
+默认端点是 `http://127.0.0.1:8000/mcp`。非回环地址只有在启用 Bearer
+认证，或显式确认由认证反向代理保护时才允许启动。
+
+### 旧版 SSE 传输
+
+```bash
+MCP_TRANSPORT=sse
 MCP_SSE_HOST=127.0.0.1          # 默认仅监听回环地址
 PORT=8000                       # MCP_SSE_PORT 的后备值
 MCP_SSE_ALLOWED_HOSTS=          # 允许的 Host，逗号分隔
@@ -243,7 +261,8 @@ MCP_SSE_BEARER_TOKEN=           # 可选，至少 32 个字符
 MCP_SSE_TRUST_PROXY_AUTH=false  # 仅在认证反向代理是唯一入口时启用
 ```
 
-非回环地址只有在启用 Bearer 认证，或显式确认由认证反向代理保护时才允许启动。部署细节见 [`ENTERPRISE_DEPLOYMENT.md`](ENTERPRISE_DEPLOYMENT.md)。
+旧版端点为 `/sse` 和 `/messages/`，仅用于兼容现有客户端。部署细节见
+[`ENTERPRISE_DEPLOYMENT.md`](ENTERPRISE_DEPLOYMENT.md)。
 
 ### SSH 隧道
 
@@ -367,7 +386,7 @@ Claude Desktop、Codex 等宿主通常从自己的目录启动 MCP 服务，未�
   "mcpServers": {
     "mysql-readonly": {
       "command": "npx",
-      "args": ["-y", "@yanzhang123/readonly-db-mcp@0.8.1"],
+      "args": ["-y", "@yanzhang123/readonly-db-mcp@0.8.2"],
       "env": {
         "MYSQL_PROFILES_FILE": "C:/absolute/path/mysql-connections.toml",
         "MYSQL_DEV_PASSWORD": "your_dev_password"
@@ -387,7 +406,7 @@ Claude Desktop、Codex 等宿主通常从自己的目录启动 MCP 服务，未�
     "mysql-readonly": {
       "type": "stdio",
       "command": "npx",
-      "args": ["-y", "@yanzhang123/readonly-db-mcp@0.8.1"],
+      "args": ["-y", "@yanzhang123/readonly-db-mcp@0.8.2"],
       "env": {
         "MYSQL_PROFILES_FILE": "C:/absolute/path/mysql-connections.toml",
         "MYSQL_DEV_PASSWORD": "your_dev_password"
@@ -398,6 +417,44 @@ Claude Desktop、Codex 等宿主通常从自己的目录启动 MCP 服务，未�
 ```
 
 Windows 宿主如无法解析 `npx`，改用 `npx.cmd`。更多调用场景见 [`MCP_USECASES.md`](MCP_USECASES.md)。
+
+### DeepSeek Harness
+
+Harness 自带 `@deepseek-ai/dsh-mcp-client`。本地使用推荐挂载 npm 包的
+STDIO 入口；在 Windows 上使用 `npx.cmd`：
+
+```yaml
+- insert:
+    - id: mcp-mysql-readonly
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: mysql-readonly
+        transport: stdio
+        command: npx.cmd
+        args: ['-y', '@yanzhang123/readonly-db-mcp@0.8.2']
+        env:
+          MYSQL_PROFILES_FILE: 'C:/absolute/path/mysql-connections.toml'
+        toolCallTimeoutMs: 60000
+        failOnStartupError: true
+```
+
+远程或集中部署时使用 Streamable HTTP。先按上文启动服务，然后在 Harness
+配置中挂载端点；`MYSQL_MCP_AUTHORIZATION` 的值应为 `Bearer <token>`，并
+从进程环境或密钥管理系统注入，不要提交到仓库：
+
+```yaml
+- insert:
+    - id: mcp-mysql-readonly
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: mysql-readonly
+        transport: streamable-http
+        url: 'https://mcp.example.com/mcp'
+        headers:
+          Authorization: !!js process.env.MYSQL_MCP_AUTHORIZATION
+        toolCallTimeoutMs: 60000
+        failOnStartupError: true
+```
 
 ## 开发与测试
 

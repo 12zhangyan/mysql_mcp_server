@@ -1883,12 +1883,14 @@ async def check_connection(
 async def main():
     """
     Main entry point for the MCP server.
-    Supports both STDIO (default) and SSE (HTTP) transport modes.
+    Supports STDIO (default), legacy SSE, and Streamable HTTP transports.
     """
-    transport = os.getenv("MCP_TRANSPORT", "stdio").lower()
+    transport = os.getenv("MCP_TRANSPORT", "stdio").lower().replace("_", "-")
     try:
         if transport == "sse":
             await _run_sse_server()
+        elif transport in {"streamable-http", "http"}:
+            await _run_streamable_http_server()
         else:
             await _run_stdio_server()
     finally:
@@ -2045,6 +2047,129 @@ async def _run_sse_server():
     server_config = uvicorn.Config(secured_app, host=host, port=port, log_level="info")
     server = uvicorn.Server(server_config)
     await server.serve()
+
+
+async def _run_streamable_http_server():
+    """Run the MCP server over the standard Streamable HTTP transport."""
+    try:
+        import uvicorn
+        from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+        from mcp.server.transport_security import TransportSecuritySettings
+        from starlette.applications import Starlette
+        from starlette.responses import Response
+        from starlette.routing import Route
+    except ImportError:
+        logger.error(
+            "Streamable HTTP requires additional dependencies. "
+            "Install with: pip install mysql_mcp_server[http]"
+        )
+        raise
+
+    host = os.getenv("MCP_HTTP_HOST", "127.0.0.1")
+    port = int(os.getenv("MCP_HTTP_PORT") or os.getenv("PORT") or "8000")
+    path = os.getenv("MCP_HTTP_PATH", "/mcp").strip()
+    bearer_token = os.getenv("MCP_HTTP_BEARER_TOKEN") or None
+    trust_proxy_auth = os.getenv("MCP_HTTP_TRUST_PROXY_AUTH", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if not path.startswith("/") or path == "/":
+        raise ValueError("MCP_HTTP_PATH must start with '/' and cannot be '/'")
+    _validate_http_exposure(host, bearer_token, trust_proxy_auth)
+
+    allowed_hosts_env = os.getenv("MCP_HTTP_ALLOWED_HOSTS", "")
+    if allowed_hosts_env:
+        allowed_hosts = [
+            value.strip() for value in allowed_hosts_env.split(",") if value.strip()
+        ]
+    else:
+        allowed_hosts = [f"localhost:{port}", f"127.0.0.1:{port}"]
+        if host not in ("0.0.0.0", "127.0.0.1", "localhost", "::"):
+            allowed_hosts.append(f"{host}:{port}")
+
+    security_settings = TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=allowed_hosts,
+    )
+    session_manager = StreamableHTTPSessionManager(
+        app=app,
+        security_settings=security_settings,
+        session_idle_timeout=float(
+            os.getenv("MCP_HTTP_SESSION_IDLE_TIMEOUT_SECONDS", "1800")
+        ),
+    )
+
+    class StreamableHTTPASGIApp:
+        async def __call__(self, scope, receive, send):
+            await session_manager.handle_request(scope, receive, send)
+
+    async def health_check(request):
+        return Response("MySQL MCP Server is running", media_type="text/plain")
+
+    starlette_app = Starlette(
+        routes=[
+            Route("/", endpoint=health_check),
+            Route(path, endpoint=StreamableHTTPASGIApp()),
+        ],
+        lifespan=lambda _: session_manager.run(),
+    )
+    secured_app = _with_bearer_auth(starlette_app, bearer_token, Response)
+
+    logger.info(
+        "Starting MySQL MCP server (Streamable HTTP) at http://%s:%s%s",
+        host,
+        port,
+        path,
+    )
+    server_config = uvicorn.Config(secured_app, host=host, port=port, log_level="info")
+    server = uvicorn.Server(server_config)
+    await server.serve()
+
+
+def _validate_http_exposure(
+    host: str, bearer_token: str | None, trust_proxy_auth: bool
+) -> None:
+    """Fail closed when Streamable HTTP would be exposed without authentication."""
+    loopback_hosts = {"127.0.0.1", "localhost", "::1"}
+    public_bind = host not in loopback_hosts
+    if bearer_token is not None and len(bearer_token) < 32:
+        raise ValueError("MCP_HTTP_BEARER_TOKEN must be at least 32 characters")
+    if public_bind and not bearer_token and not trust_proxy_auth:
+        raise ValueError(
+            "Refusing unauthenticated public Streamable HTTP bind. Configure "
+            "MCP_HTTP_BEARER_TOKEN, bind to 127.0.0.1, or explicitly set "
+            "MCP_HTTP_TRUST_PROXY_AUTH=true when an authenticated reverse proxy "
+            "is the only network entry point."
+        )
+
+
+def _with_bearer_auth(asgi_app, bearer_token: str | None, response_type):
+    """Protect every non-health HTTP route with an optional static bearer token."""
+    if not bearer_token:
+        return asgi_app
+
+    class BearerAuthMiddleware:
+        def __init__(self, wrapped_app, token: str):
+            self.wrapped_app = wrapped_app
+            self.expected = f"Bearer {token}"
+
+        async def __call__(self, scope, receive, send):
+            if scope["type"] == "http" and scope.get("path") != "/":
+                headers = dict(scope.get("headers", []))
+                provided = headers.get(b"authorization", b"").decode("latin-1")
+                if not hmac.compare_digest(provided, self.expected):
+                    response = response_type(
+                        "Unauthorized",
+                        status_code=401,
+                        headers={"WWW-Authenticate": "Bearer"},
+                    )
+                    await response(scope, receive, send)
+                    return
+            await self.wrapped_app(scope, receive, send)
+
+    return BearerAuthMiddleware(asgi_app, bearer_token)
 
 
 if __name__ == "__main__":
