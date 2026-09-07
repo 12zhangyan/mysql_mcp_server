@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -73,6 +74,45 @@ audit_logger = logging.getLogger("mysql_mcp_server.audit")
 
 # System databases that are typically filtered out from resource listings.
 SYSTEM_DATABASES = {"information_schema", "mysql", "performance_schema", "sys"}
+
+
+def _server_port(primary_env: str) -> int:
+    """Read an HTTP server port with a shared PORT fallback and clear errors."""
+    primary_value = os.getenv(primary_env)
+    fallback_value = os.getenv("PORT")
+    value = primary_value or fallback_value or "8000"
+    source = primary_env if primary_value else "PORT" if fallback_value else primary_env
+    try:
+        port = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{source} must be an integer between 1 and 65535") from exc
+    if not 1 <= port <= 65535:
+        raise ValueError(f"{source} must be between 1 and 65535")
+    return port
+
+
+def _positive_seconds_env(name: str, default: float) -> float:
+    """Read a positive, finite duration from an environment variable."""
+    value = os.getenv(name, str(default))
+    try:
+        seconds = float(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive finite number") from exc
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError(f"{name} must be a positive finite number")
+    return seconds
+
+
+def _default_allowed_hosts(host: str, port: int) -> list[str]:
+    """Build exact safe Host header values, including bracketed IPv6 forms."""
+    allowed = [f"localhost:{port}", f"127.0.0.1:{port}"]
+    if host in {"0.0.0.0", "::"}:
+        return allowed
+    authority = f"[{host}]" if ":" in host else host
+    host_header = f"{authority}:{port}"
+    if host_header not in allowed:
+        allowed.append(host_header)
+    return allowed
 
 
 def validate_identifier(name: str) -> str:
@@ -253,7 +293,11 @@ def _open_connection(
         config,
         connect_factory=connect,
     )
-    _verify_connection_transport(profile, connection)
+    try:
+        _verify_connection_transport(profile, connection)
+    except Exception:
+        connection_pool_manager.discard(profile, endpoint, config)
+        raise
     return connection, config
 
 
@@ -283,6 +327,10 @@ def _verify_connection_transport(profile: ConnectionProfile, connection_object) 
         inspection_error = exc
 
     try:
+        try:
+            connection_object.shutdown()
+        except Exception:
+            logger.debug("Socket shutdown failed after TLS verification failure")
         connection_object.close()
     finally:
         raise RuntimeError(
@@ -381,6 +429,7 @@ def _sync_resource_query(
     selected_database = database or profile.database
     policy_allowed = False
     connection_object = None
+    discard_connection = False
     try:
         ready, readiness = profile.runtime_status()
         if not ready:
@@ -426,8 +475,8 @@ def _sync_resource_query(
             cursor.execute(executed_query or query)
             columns = [str(item[0]) for item in cursor.description]
             raw_rows = list(cursor.fetchmany(size=row_limit + 1))
-            raw_rows.extend(cursor.fetchall())
             truncated = len(raw_rows) > row_limit
+            discard_connection = truncated and executed_query is None
             rows = raw_rows[:row_limit]
             _write_audit_event(
                 profile,
@@ -454,10 +503,20 @@ def _sync_resource_query(
         raise
     finally:
         if connection_object is not None:
+            if discard_connection:
+                try:
+                    connection_object.shutdown()
+                except Exception:
+                    logger.debug("Socket shutdown failed for resource result cleanup")
+            else:
+                try:
+                    connection_object.rollback()
+                except Exception:
+                    logger.debug("Rollback failed during resource connection cleanup")
             try:
-                connection_object.rollback()
-            finally:
                 connection_object.close()
+            except Exception:
+                logger.debug("Connection close failed during resource cleanup")
 
 
 @app.list_resources()
@@ -578,7 +637,7 @@ async def read_resource(uri: AnyUrl) -> str:
                     + [str(row[0]) for row in rows]
                 )
 
-            if not parts or len(parts) > 2:
+            if len(parts) != 2 or parts[1] != "data":
                 raise ValueError(f"Invalid MySQL resource URI: {uri_str}")
             table = validate_identifier(parts[0])
             columns, rows = _sync_resource_query(
@@ -978,7 +1037,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
             )
         )
         logger.info(
-            "Calling tool %s (connection=%s, database=%s)",
+            "Calling tool %r (connection=%r, database=%r)",
             name,
             connection or "<default>",
             database or "<profile default>",
@@ -1253,7 +1312,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
 
         raise ValueError(f"Unknown tool: {name}")
     except Exception as exc:
-        logger.error("Error in call_tool %s (%s)", name, type(exc).__name__)
+        logger.error("Error in call_tool %r (%s)", name, type(exc).__name__)
         return ToolErrorResult(
             content=[
                 TextContent(type="text", text=f"Error calling tool {name}: {str(exc)}")
@@ -1885,14 +1944,18 @@ async def main():
     Main entry point for the MCP server.
     Supports STDIO (default), legacy SSE, and Streamable HTTP transports.
     """
-    transport = os.getenv("MCP_TRANSPORT", "stdio").lower().replace("_", "-")
+    transport = os.getenv("MCP_TRANSPORT", "stdio").strip().lower().replace("_", "-")
     try:
         if transport == "sse":
             await _run_sse_server()
         elif transport in {"streamable-http", "http"}:
             await _run_streamable_http_server()
-        else:
+        elif transport == "stdio":
             await _run_stdio_server()
+        else:
+            raise ValueError(
+                "MCP_TRANSPORT must be stdio, sse, streamable-http, or http"
+            )
     finally:
         close_runtime_resources()
 
@@ -1948,8 +2011,7 @@ async def _run_sse_server():
     logger.info("Starting MySQL MCP server (SSE)...")
 
     host = os.getenv("MCP_SSE_HOST", "127.0.0.1")
-    port_str = os.getenv("MCP_SSE_PORT") or os.getenv("PORT") or "8000"
-    port = int(port_str)
+    port = _server_port("MCP_SSE_PORT")
     bearer_token = os.getenv("MCP_SSE_BEARER_TOKEN") or None
     trust_proxy_auth = os.getenv("MCP_SSE_TRUST_PROXY_AUTH", "").strip().lower() in {
         "1",
@@ -1971,9 +2033,7 @@ async def _run_sse_server():
                 h.strip() for h in allowed_hosts_env.split(",") if h.strip()
             ]
         else:
-            allowed_hosts = [f"localhost:{port}", f"127.0.0.1:{port}"]
-            if host not in ("0.0.0.0", "127.0.0.1", "localhost", "::"):
-                allowed_hosts.append(f"{host}:{port}")
+            allowed_hosts = _default_allowed_hosts(host, port)
 
         logger.info(
             "SSE DNS rebinding protection enabled. Allowed hosts: %s. "
@@ -2066,7 +2126,7 @@ async def _run_streamable_http_server():
         raise
 
     host = os.getenv("MCP_HTTP_HOST", "127.0.0.1")
-    port = int(os.getenv("MCP_HTTP_PORT") or os.getenv("PORT") or "8000")
+    port = _server_port("MCP_HTTP_PORT")
     path = os.getenv("MCP_HTTP_PATH", "/mcp").strip()
     bearer_token = os.getenv("MCP_HTTP_BEARER_TOKEN") or None
     trust_proxy_auth = os.getenv("MCP_HTTP_TRUST_PROXY_AUTH", "").strip().lower() in {
@@ -2085,9 +2145,7 @@ async def _run_streamable_http_server():
             value.strip() for value in allowed_hosts_env.split(",") if value.strip()
         ]
     else:
-        allowed_hosts = [f"localhost:{port}", f"127.0.0.1:{port}"]
-        if host not in ("0.0.0.0", "127.0.0.1", "localhost", "::"):
-            allowed_hosts.append(f"{host}:{port}")
+        allowed_hosts = _default_allowed_hosts(host, port)
 
     security_settings = TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
@@ -2096,8 +2154,8 @@ async def _run_streamable_http_server():
     session_manager = StreamableHTTPSessionManager(
         app=app,
         security_settings=security_settings,
-        session_idle_timeout=float(
-            os.getenv("MCP_HTTP_SESSION_IDLE_TIMEOUT_SECONDS", "1800")
+        session_idle_timeout=_positive_seconds_env(
+            "MCP_HTTP_SESSION_IDLE_TIMEOUT_SECONDS", 1800
         ),
     )
 

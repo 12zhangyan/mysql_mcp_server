@@ -247,6 +247,10 @@ MCP_HTTP_TRUST_PROXY_AUTH=false # 仅在认证反向代理是唯一入口时启�
 MCP_HTTP_SESSION_IDLE_TIMEOUT_SECONDS=1800
 ```
 
+`MCP_TRANSPORT` 支持 `stdio`、`sse`、`streamable-http`（及别名 `http`）；
+未知值会在启动时直接报错，避免配置拼写错误被静默降级为 STDIO。
+HTTP/SSE 端口必须在 `1-65535` 范围内；会话空闲超时必须为正有限数。
+
 默认端点是 `http://127.0.0.1:8000/mcp`。非回环地址只有在启用 Bearer
 认证，或显式确认由认证反向代理保护时才允许启动。
 

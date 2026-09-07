@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.3] - 2026-09-04
+
+### Changed
+- Reject unknown transport names and invalid HTTP/SSE port or idle-timeout
+  settings at startup instead of silently falling back or failing later.
+- Keep the unit suite isolated from live database connections.
+- Escape request-controlled identifiers in operational logs so control
+  characters cannot create forged log lines.
+
+### Fixed
+- Stop reading unbounded resource results after the configured row limit and
+  discard connections that still have unread rows.
+- Require the documented `/data` action for table resource URIs.
+- Generate valid bracketed Host allowlist entries for IPv6 listeners.
+- Retire obsolete pools and SSH processes when profiles switch runtime modes,
+  and invalidate pooled connections whenever an SSH tunnel is restarted.
+- Close and remove connection pools that fail required TLS verification, and
+  close database pools before stopping their SSH tunnels during shutdown.
+
 ## [0.8.2] - 2026-08-21
 
 ### Added

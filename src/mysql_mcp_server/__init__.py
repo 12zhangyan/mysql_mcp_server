@@ -8,7 +8,7 @@ try:
     __version__ = version("mysql-mcp-server")
 except PackageNotFoundError:
     # Supports direct source-tree imports before the package is installed.
-    __version__ = "0.8.2"
+    __version__ = "0.8.3"
 
 
 def main():
