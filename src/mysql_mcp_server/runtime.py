@@ -9,7 +9,8 @@ import socket
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from mysql.connector import connect
@@ -23,6 +24,7 @@ class TunnelEndpoint:
     host: str
     port: int
     tunneled: bool = False
+    generation: str = field(default="", repr=False, compare=False)
 
 
 @dataclass
@@ -96,6 +98,10 @@ class SshTunnelManager:
 
     def endpoint(self, profile: ConnectionProfile) -> TunnelEndpoint:
         if not profile.ssh.enabled:
+            with self._lock:
+                existing = self._tunnels.pop(profile.name, None)
+                if existing is not None:
+                    self._stop(existing)
             return TunnelEndpoint(profile.host, profile.port, False)
 
         self._validate(profile)
@@ -159,7 +165,9 @@ class SshTunnelManager:
             if self._readiness_check("127.0.0.1", local_port):
                 return _ManagedTunnel(
                     process=process,
-                    endpoint=TunnelEndpoint("127.0.0.1", local_port, True),
+                    endpoint=TunnelEndpoint(
+                        "127.0.0.1", local_port, True, uuid.uuid4().hex
+                    ),
                     fingerprint=fingerprint,
                 )
             time.sleep(0.05)
@@ -240,7 +248,13 @@ class ConnectionPoolManager:
             )
             for key, value in config.items()
         }
-        value = (profile.name, endpoint.host, endpoint.port, redacted)
+        value = (
+            profile.name,
+            endpoint.host,
+            endpoint.port,
+            endpoint.generation,
+            redacted,
+        )
         return hashlib.sha256(repr(value).encode()).hexdigest()
 
     def get_connection(
@@ -252,6 +266,13 @@ class ConnectionPoolManager:
         connect_factory: Callable[..., Any] = connect,
     ) -> Any:
         if profile.pool_size == 0:
+            with self._lock:
+                previous_key = self._profile_keys.pop(profile.name, None)
+                previous_pool = (
+                    self._pools.pop(previous_key, None) if previous_key else None
+                )
+                if previous_pool is not None:
+                    self._dispose_pool(previous_pool)
             return connect_factory(**config)
 
         key = self._key(profile, endpoint, config)
@@ -272,6 +293,21 @@ class ConnectionPoolManager:
                 self._pools[key] = pool
             self._profile_keys[profile.name] = key
         return pool.get_connection()
+
+    def discard(
+        self,
+        profile: ConnectionProfile,
+        endpoint: TunnelEndpoint,
+        config: dict[str, Any],
+    ) -> None:
+        """Remove a pool whose effective connection failed a safety check."""
+        key = self._key(profile, endpoint, config)
+        with self._lock:
+            pool = self._pools.pop(key, None)
+            if self._profile_keys.get(profile.name) == key:
+                self._profile_keys.pop(profile.name, None)
+            if pool is not None:
+                self._dispose_pool(pool)
 
     def clear(self) -> None:
         """Close idle pool connections and drop cached references."""
@@ -323,8 +359,8 @@ connection_pool_manager = ConnectionPoolManager()
 
 
 def close_runtime_resources() -> None:
-    ssh_tunnel_manager.close_all()
     connection_pool_manager.clear()
+    ssh_tunnel_manager.close_all()
 
 
 atexit.register(close_runtime_resources)

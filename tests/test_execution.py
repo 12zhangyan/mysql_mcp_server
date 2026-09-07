@@ -9,10 +9,13 @@ import pytest
 from mysql.connector import Error, InterfaceError
 from pydantic import AnyUrl
 
+from mysql_mcp_server.config import load_connection_registry
 from mysql_mcp_server.results import QueryResult
 from mysql_mcp_server.server import (
     _apply_server_query_timeout,
     _assess_grants,
+    _open_connection,
+    _sync_resource_query,
     _verify_connection_transport,
     call_tool,
     check_connection,
@@ -29,6 +32,31 @@ def fake_connection(rows, columns):
     connection = MagicMock()
     connection.cursor.return_value.__enter__.return_value = cursor
     return connection, cursor
+
+
+def test_unbounded_resource_query_stops_reading_after_row_limit():
+    connection, cursor = fake_connection(
+        [("a",), ("b",), ("c",)],
+        ["Tables_in_app"],
+    )
+    profile = load_connection_registry().get()
+    with patch(
+        "mysql_mcp_server.server._open_connection",
+        return_value=(connection, {"database": "app"}),
+    ):
+        columns, rows = _sync_resource_query(
+            profile,
+            "SHOW TABLES",
+            database="app",
+            max_rows=2,
+        )
+
+    assert columns == ["Tables_in_app"]
+    assert rows == [("a",), ("b",)]
+    cursor.fetchall.assert_not_called()
+    connection.shutdown.assert_called_once_with()
+    connection.rollback.assert_not_called()
+    connection.close.assert_called_once_with()
 
 
 @pytest.mark.asyncio
@@ -162,6 +190,7 @@ def test_required_tls_rejects_plaintext_connection():
     with pytest.raises(RuntimeError, match="requires TLS"):
         _verify_connection_transport(profile, connection)
 
+    connection.shutdown.assert_called_once_with()
     connection.close.assert_called_once_with()
 
 
@@ -186,7 +215,33 @@ def test_required_tls_rejects_empty_c_extension_cipher():
     with pytest.raises(RuntimeError, match="requires TLS"):
         _verify_connection_transport(profile, connection)
 
+    connection.shutdown.assert_called_once_with()
     connection.close.assert_called_once_with()
+
+
+def test_open_connection_discards_pool_after_tls_verification_failure():
+    connection = MagicMock()
+    connection.is_secure = False
+    connection._cmysql.get_ssl_cipher.return_value = None
+    profile = load_connection_registry().get()
+
+    with (
+        patch(
+            "mysql_mcp_server.server.ssh_tunnel_manager.endpoint",
+            return_value=MagicMock(host="127.0.0.1", port=3306),
+        ) as endpoint,
+        patch(
+            "mysql_mcp_server.server.connection_pool_manager.get_connection",
+            return_value=connection,
+        ),
+        patch("mysql_mcp_server.server.connection_pool_manager.discard") as discard,
+    ):
+        with pytest.raises(RuntimeError, match="requires TLS"):
+            _open_connection(profile, database=None, query_timeout_ms=1000)
+
+    discard.assert_called_once()
+    assert discard.call_args.args[0] is profile
+    assert discard.call_args.args[1] is endpoint.return_value
 
 
 @pytest.mark.asyncio
@@ -430,6 +485,15 @@ audit_required_context = ["actor"]
     with patch("mysql_mcp_server.server._open_connection") as connector:
         with pytest.raises(ValueError, match="Missing required audit_context"):
             await read_resource(AnyUrl("mysql://users/data"))
+
+    connector.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resource_uri_rejects_unknown_table_action_before_connecting():
+    with patch("mysql_mcp_server.server._open_connection") as connector:
+        with pytest.raises(ValueError, match="Invalid MySQL resource URI"):
+            await read_resource(AnyUrl("mysql://users/schema"))
 
     connector.assert_not_called()
 

@@ -1,3 +1,4 @@
+import logging
 from importlib.metadata import version
 from unittest.mock import MagicMock, patch
 
@@ -67,6 +68,22 @@ async def test_call_tool_invalid_name():
     assert len(response) == 1
     assert "Error calling tool" in response[0].text
     assert "Unknown tool" in response[0].text
+
+
+@pytest.mark.asyncio
+async def test_call_tool_escapes_control_characters_in_operational_logs(caplog):
+    forged_name = "unknown\nforged-entry"
+    forged_connection = "missing\nforged-connection"
+
+    with caplog.at_level(logging.INFO, logger="mysql_mcp_server"):
+        response = await call_tool(forged_name, {"connection": forged_connection})
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert response.isError is True
+    assert any("unknown\\nforged-entry" in message for message in messages)
+    assert any("missing\\nforged-connection" in message for message in messages)
+    assert all(forged_name not in message for message in messages)
+    assert all(forged_connection not in message for message in messages)
 
 
 @pytest.mark.asyncio
@@ -363,21 +380,19 @@ async def test_query_compatibility_alias_uses_read_only_runner(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(
-    not all(
-        [
-            pytest.importorskip("mysql.connector"),
-            pytest.importorskip("mysql_mcp_server"),
-        ]
-    ),
-    reason="MySQL connection not available",
-)
 async def test_list_resources():
-    """Test listing resources (requires database connection)."""
-    try:
+    """List resources without depending on a live database connection."""
+    connection = MagicMock()
+    cursor = MagicMock()
+    cursor.description = [("database_name",)]
+    cursor.fetchmany.return_value = []
+    connection.cursor.return_value.__enter__.return_value = cursor
+
+    with patch(
+        "mysql_mcp_server.server._open_connection",
+        return_value=(connection, {}),
+    ) as connector:
         resources = await list_resources()
-        assert isinstance(resources, list)
-    except ValueError as e:
-        if "Missing required database configuration" in str(e):
-            pytest.skip("Database configuration not available")
-        raise
+
+    assert resources == []
+    connector.assert_called_once()
