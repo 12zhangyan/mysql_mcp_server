@@ -16,7 +16,7 @@ from .credential_store import get_keyring_password, run_credential_command
 PROFILE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_$]+$")
 CREDENTIAL_REFERENCE_PATTERN = re.compile(r"^[A-Za-z0-9_.:/-]+$")
-RESULT_FORMATS = {"csv", "json"}
+RESULT_FORMATS = {"csv", "json", "compact"}
 SSL_MODES = {"DISABLED", "REQUIRED", "VERIFY_CA", "VERIFY_IDENTITY"}
 CREDENTIAL_PROVIDERS = {"keyring", "command"}
 DEFAULT_MASK_COLUMNS = (
@@ -132,6 +132,10 @@ class ConnectionProfile:
     connect_timeout: int = 10
     query_timeout_ms: int = 30_000
     max_rows: int = 500
+    max_response_bytes: int = 262_144
+    max_concurrent_queries: int = 5
+    max_queued_queries: int = 16
+    queue_timeout_ms: int = 1000
     max_cell_length: int = 20_000
     mask_columns: tuple[str, ...] = DEFAULT_MASK_COLUMNS
     result_format: str = "csv"
@@ -443,7 +447,9 @@ def _profile_from_toml(name: str, values: dict[str, Any]) -> ConnectionProfile:
 
     result_format = str(values.get("result_format", "csv")).lower()
     if result_format not in RESULT_FORMATS:
-        raise ValueError(f"Connection '{name}'.result_format must be csv or json")
+        raise ValueError(
+            f"Connection '{name}'.result_format must be csv, json or compact"
+        )
     ssl_mode = str(values.get("ssl_mode", "REQUIRED")).upper()
     if ssl_mode not in SSL_MODES:
         raise ValueError(
@@ -549,6 +555,34 @@ def _profile_from_toml(name: str, values: dict[str, Any]) -> ConnectionProfile:
             default=20_000,
             minimum=100,
             maximum=1_000_000,
+        ),
+        max_response_bytes=_bounded_int(
+            values.get("max_response_bytes"),
+            name=f"Connection '{name}'.max_response_bytes",
+            default=262144,
+            minimum=4096,
+            maximum=4194304,
+        ),
+        max_concurrent_queries=_bounded_int(
+            values.get("max_concurrent_queries"),
+            name=f"Connection '{name}'.max_concurrent_queries",
+            default=5,
+            minimum=1,
+            maximum=32,
+        ),
+        max_queued_queries=_bounded_int(
+            values.get("max_queued_queries"),
+            name=f"Connection '{name}'.max_queued_queries",
+            default=16,
+            minimum=0,
+            maximum=128,
+        ),
+        queue_timeout_ms=_bounded_int(
+            values.get("queue_timeout_ms"),
+            name=f"Connection '{name}'.queue_timeout_ms",
+            default=1000,
+            minimum=1,
+            maximum=300000,
         ),
         mask_columns=mask_columns,
         result_format=result_format,
@@ -662,7 +696,7 @@ def _legacy_profile() -> ConnectionProfile:
         )
     result_format = os.getenv("MYSQL_RESULT_FORMAT", "csv").lower()
     if result_format not in RESULT_FORMATS:
-        raise ValueError("MYSQL_RESULT_FORMAT must be csv or json")
+        raise ValueError("MYSQL_RESULT_FORMAT must be csv, json or compact")
     ssl_mode = os.getenv("MYSQL_SSL_MODE", "REQUIRED").upper()
     if ssl_mode not in SSL_MODES:
         raise ValueError(
@@ -748,6 +782,34 @@ def _legacy_profile() -> ConnectionProfile:
             default=20_000,
             minimum=100,
             maximum=1_000_000,
+        ),
+        max_response_bytes=_bounded_int(
+            os.getenv("MYSQL_MAX_RESPONSE_BYTES"),
+            name="MYSQL_MAX_RESPONSE_BYTES",
+            default=262144,
+            minimum=4096,
+            maximum=4194304,
+        ),
+        max_concurrent_queries=_bounded_int(
+            os.getenv("MYSQL_MAX_CONCURRENT_QUERIES"),
+            name="MYSQL_MAX_CONCURRENT_QUERIES",
+            default=5,
+            minimum=1,
+            maximum=32,
+        ),
+        max_queued_queries=_bounded_int(
+            os.getenv("MYSQL_MAX_QUEUED_QUERIES"),
+            name="MYSQL_MAX_QUEUED_QUERIES",
+            default=16,
+            minimum=0,
+            maximum=128,
+        ),
+        queue_timeout_ms=_bounded_int(
+            os.getenv("MYSQL_QUEUE_TIMEOUT_MS"),
+            name="MYSQL_QUEUE_TIMEOUT_MS",
+            default=1000,
+            minimum=1,
+            maximum=300000,
         ),
         mask_columns=mask_columns,
         result_format=result_format,

@@ -12,6 +12,13 @@ allowed_databases = ["app_dev", "analytics_dev"]
 query_timeout_ms = 30000
 max_rows = 500
 max_cell_length = 20000
+# UTF-8 query response text budget (not DB scan/memory limit).
+max_response_bytes = 262144
+# Effective concurrency is also capped by pool_size when pooling is enabled.
+max_concurrent_queries = 5
+max_queued_queries = 16
+queue_timeout_ms = 1000
+# csv (legacy), json (typed), or compact (JSON metadata + CSV).
 result_format = "json"
 mask_columns = ["password", "*password*", "*passwd*", "*pwd*", "*secret*", "token", "*token", "*_token", "token_*", "*tokenvalue*", "*accesstoken*", "*refreshtoken*", "*idtoken*", "*appsec*", "*api_key*", "*private_key*", "*ssn*", "*id_card*", "*phone*", "*mobile*", "*email*"]
 pool_size = 3
