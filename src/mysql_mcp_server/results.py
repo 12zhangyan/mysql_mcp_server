@@ -6,7 +6,7 @@ import base64
 import csv
 import io
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time
 from decimal import Decimal
 from fnmatch import fnmatchcase
@@ -15,6 +15,8 @@ from typing import Any
 import sqlglot
 from sqlglot import exp
 from sqlglot.lineage import lineage
+
+from .errors import QueryFailure
 
 TRUNCATION_SUFFIX = "…[truncated]"
 MASKED_VALUE = "[REDACTED]"
@@ -243,6 +245,9 @@ class QueryResult:
     requested_connection: str | None = None
     requested_database: str | None = None
     route_applied: bool = False
+    content_truncated: bool = False
+    truncation_reasons: tuple[str, ...] = ()
+    queue_wait_ms: int = 0
 
     @property
     def next_offset(self) -> int | None:
@@ -265,9 +270,58 @@ class QueryResult:
             "requested_connection": self.requested_connection,
             "requested_database": self.requested_database,
             "route_applied": self.route_applied,
+            "content_truncated": self.content_truncated,
+            "truncation_reasons": list(self.truncation_reasons),
+            "queue_wait_ms": self.queue_wait_ms,
         }
 
+    def fit_response(self, result_format: str, max_bytes: int) -> QueryResult:
+        """Keep whole rows, accounting for the exact UTF-8 rendered envelope."""
+        if len(self.render(result_format).encode("utf-8")) <= max_bytes:
+            return self
+        reasons = tuple(dict.fromkeys((*self.truncation_reasons, "response_bytes")))
+
+        def candidate(count: int) -> QueryResult:
+            return replace(
+                self, rows=self.rows[:count], truncated=True, truncation_reasons=reasons
+            )
+
+        low, high = 0, len(self.rows)
+        while low < high:
+            middle = (low + high + 1) // 2
+            if (
+                len(candidate(middle).render(result_format).encode("utf-8"))
+                <= max_bytes
+            ):
+                low = middle
+            else:
+                high = middle - 1
+        if not low:
+            raise QueryFailure(
+                "RESULT_TOO_LARGE",
+                "The result header or first row exceeds the response budget.",
+                "Select fewer columns or use SUBSTRING for large text values; request fewer metadata fields. "
+                "Increasing max_rows will not help. No rows were delivered; retry the same offset with a narrower projection.",
+                connection=self.connection,
+                database=self.database,
+                query_id=self.query_id,
+                offset=self.offset,
+                max_response_bytes=max_bytes,
+            )
+        return candidate(low)
+
     def render(self, result_format: str) -> str:
+        if result_format == "compact":
+            metadata = {
+                key: value
+                for key, value in self.to_payload().items()
+                if key not in {"rows", "columns"}
+            }
+            return (
+                json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))
+                + "\n"
+                + self.render("csv")
+            )
         if result_format == "json":
             return json.dumps(
                 self.to_payload(),
@@ -287,7 +341,13 @@ class QueryResult:
             writer.writerow(
                 [
                     f"[truncated: next_offset={self.next_offset}, "
-                    f"rows={len(self.rows)}]"
+                    f"rows={len(self.rows)}, reasons={','.join(self.truncation_reasons) or 'row_limit'}]"
+                ]
+            )
+        if self.content_truncated:
+            writer.writerow(
+                [
+                    "[content_truncated: cell_length; select SUBSTRING ranges to read the remaining content]"
                 ]
             )
         return output.getvalue().rstrip("\n")

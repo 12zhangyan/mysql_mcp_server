@@ -46,11 +46,15 @@ from .config import (
     ensure_database_allowed,
     load_connection_registry,
 )
-from .results import QueryResult, mask_result_rows, serialize_value
+from .errors import QueryFailure, database_failure
+from .metadata import detailed_schema_sql, search_tables_sql, table_filter
+from .results import TRUNCATION_SUFFIX, QueryResult, mask_result_rows, serialize_value
 from .runtime import (
     QueryControl,
+    QueryLease,
     close_runtime_resources,
     connection_pool_manager,
+    query_admission,
     ssh_tunnel_manager,
 )
 from .sql_guard import (
@@ -365,49 +369,56 @@ def _database_listing_query(profile: ConnectionProfile) -> str:
     return query + " ORDER BY SCHEMA_NAME"
 
 
-def _catalog_query(kind: str, database: str, table: str | None = None) -> str:
+def _catalog_query(
+    kind: str,
+    database: str,
+    table: str | None = None,
+    *,
+    table_names: list[str] | None = None,
+) -> str:
     """Build a fixed, identifier-validated information_schema projection."""
     validate_identifier(database)
     if table:
         validate_identifier(table)
-    table_filter = f" AND TABLE_NAME = '{table}'" if table else ""
+    name_filter = f" AND TABLE_NAME = '{table}'" if table else ""
+    name_filter += table_filter(table_names)
     queries = {
         "tables": (
             "SELECT TABLE_NAME, TABLE_TYPE, ENGINE, TABLE_ROWS, TABLE_COMMENT "
             "FROM information_schema.TABLES "
-            f"WHERE TABLE_SCHEMA = '{database}'{table_filter} ORDER BY TABLE_NAME"
+            f"WHERE TABLE_SCHEMA = '{database}'{name_filter} ORDER BY TABLE_NAME"
         ),
         "columns": (
             "SELECT TABLE_NAME, COLUMN_NAME, ORDINAL_POSITION, COLUMN_TYPE, "
             "IS_NULLABLE, COLUMN_DEFAULT, EXTRA, COLUMN_COMMENT "
             "FROM information_schema.COLUMNS "
-            f"WHERE TABLE_SCHEMA = '{database}'{table_filter} "
+            f"WHERE TABLE_SCHEMA = '{database}'{name_filter} "
             "ORDER BY TABLE_NAME, ORDINAL_POSITION"
         ),
         "indexes": (
             "SELECT TABLE_NAME, INDEX_NAME, NON_UNIQUE, SEQ_IN_INDEX, COLUMN_NAME, "
             "COLLATION, CARDINALITY, INDEX_TYPE FROM information_schema.STATISTICS "
-            f"WHERE TABLE_SCHEMA = '{database}'{table_filter} "
+            f"WHERE TABLE_SCHEMA = '{database}'{name_filter} "
             "ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX"
         ),
         "constraints": (
             "SELECT TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE "
             "FROM information_schema.TABLE_CONSTRAINTS "
-            f"WHERE TABLE_SCHEMA = '{database}'{table_filter} "
+            f"WHERE TABLE_SCHEMA = '{database}'{name_filter} "
             "ORDER BY TABLE_NAME, CONSTRAINT_NAME"
         ),
         "foreign_keys": (
             "SELECT TABLE_NAME, COLUMN_NAME, CONSTRAINT_NAME, REFERENCED_TABLE_SCHEMA, "
             "REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME "
             "FROM information_schema.KEY_COLUMN_USAGE "
-            f"WHERE TABLE_SCHEMA = '{database}'{table_filter} "
+            f"WHERE TABLE_SCHEMA = '{database}'{name_filter} "
             "AND REFERENCED_TABLE_NAME IS NOT NULL "
             "ORDER BY TABLE_NAME, CONSTRAINT_NAME, ORDINAL_POSITION"
         ),
         "views": (
             "SELECT TABLE_NAME, CHECK_OPTION, IS_UPDATABLE, SECURITY_TYPE "
             "FROM information_schema.VIEWS "
-            f"WHERE TABLE_SCHEMA = '{database}'{table_filter} ORDER BY TABLE_NAME"
+            f"WHERE TABLE_SCHEMA = '{database}'{name_filter} ORDER BY TABLE_NAME"
         ),
     }
     try:
@@ -666,7 +677,9 @@ async def read_resource(uri: AnyUrl) -> str:
                 query_id=query_fingerprint(f"SELECT * FROM `{table}` LIMIT 100"),
                 masked_columns=masked_columns,
             )
-            return result.render(profile.result_format)
+            return result.fit_response(
+                profile.result_format, profile.max_response_bytes
+            ).render(profile.result_format)
 
         try:
             return await anyio.to_thread.run_sync(_sync_read)
@@ -723,6 +736,12 @@ async def list_tools() -> list[Tool]:
         "audit_context": audit_context_property,
     }
     result_properties = {
+        "max_response_bytes": {
+            "type": "integer",
+            "minimum": 4096,
+            "maximum": 4194304,
+            "description": "Maximum UTF-8 response text bytes; may only lower the profile budget.",
+        },
         "max_rows": {
             "type": "integer",
             "minimum": 1,
@@ -737,8 +756,8 @@ async def list_tools() -> list[Tool]:
         },
         "result_format": {
             "type": "string",
-            "enum": ["csv", "json"],
-            "description": "Override the profile result format.",
+            "enum": ["csv", "json", "compact"],
+            "description": "csv preserves legacy data; json or compact includes target, paging, masking and truncation metadata.",
         },
         "timeout_ms": {
             "type": "integer",
@@ -798,8 +817,11 @@ async def list_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "connection": connection_property,
+                    "offset": result_properties["offset"],
+                    "max_rows": result_properties["max_rows"],
                     "audit_context": audit_context_property,
                     "result_format": result_properties["result_format"],
+                    "max_response_bytes": result_properties["max_response_bytes"],
                     "timeout_ms": result_properties["timeout_ms"],
                 },
             },
@@ -813,12 +835,18 @@ async def list_tools() -> list[Tool]:
             name="list_tables",
             description=(
                 "List tables and views in a selected database, with optional "
-                "name filtering and pagination for large schemas."
+                "name filtering and pagination for large schemas. Optional search matches names and comments of tables and columns, returning match evidence."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     **target_properties,
+                    "search": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "description": "Literal keyword in table/column names or comments; returns one row per matching field.",
+                    },
                     "table_name": {
                         "type": "string",
                         "description": "Optional exact bare table name filter.",
@@ -839,6 +867,7 @@ async def list_tools() -> list[Tool]:
                     "max_rows": result_properties["max_rows"],
                     "offset": result_properties["offset"],
                     "result_format": result_properties["result_format"],
+                    "max_response_bytes": result_properties["max_response_bytes"],
                     "timeout_ms": result_properties["timeout_ms"],
                 },
             },
@@ -854,7 +883,12 @@ async def list_tools() -> list[Tool]:
                 "Execute one strictly read-only SQL statement. Only SELECT, WITH, "
                 "SHOW, DESCRIBE, DESC, EXPLAIN, and TABLE are accepted. Writes, "
                 "DDL, transaction commands, locking reads, SELECT INTO, and "
-                "multiple statements are rejected before connecting."
+                "multiple statements are rejected before connecting. "
+                "When table or column names are unknown, first use list_tables and get_schema_info; "
+                "do not guess names. Keep connection and database consistent across calls. "
+                "After TABLE_NOT_FOUND or COLUMN_NOT_FOUND, inspect metadata and correct SQL; "
+                "never repeat the unchanged query or automatically switch databases. "
+                "Use a stable unique ORDER BY for pagination; pages are separate reads, not one snapshot."
             ),
             inputSchema={
                 "type": "object",
@@ -879,7 +913,9 @@ async def list_tools() -> list[Tool]:
             description=(
                 "Compatibility alias for execute_sql. Executes one strictly "
                 "read-only SQL statement with the same explicit connection, "
-                "database, limits, masking, and audit controls."
+                "database, limits, masking, and audit controls. "
+                "Verify unknown table/column names using list_tables/get_schema_info first. "
+                "After deterministic SQL errors inspect metadata before correcting SQL; do not repeat unchanged SQL."
             ),
             inputSchema={
                 "type": "object",
@@ -916,8 +952,23 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Compatibility alias for table_name.",
                     },
+                    "detail": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Return pageable table, column, index (including PRIMARY) and declared foreign-key rows in one result; KIND identifies each row.",
+                    },
                     **target_properties,
+                    "table_names": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 20,
+                        "items": {"type": "string"},
+                        "description": "Batch of bare table names in this database; cannot combine with table_name/table.",
+                    },
+                    "max_rows": result_properties["max_rows"],
+                    "offset": result_properties["offset"],
                     "result_format": result_properties["result_format"],
+                    "max_response_bytes": result_properties["max_response_bytes"],
                     "timeout_ms": result_properties["timeout_ms"],
                 },
             },
@@ -950,6 +1001,7 @@ async def list_tools() -> list[Tool]:
                     **target_properties,
                     "offset": result_properties["offset"],
                     "result_format": result_properties["result_format"],
+                    "max_response_bytes": result_properties["max_response_bytes"],
                     "timeout_ms": result_properties["timeout_ms"],
                 },
                 "anyOf": [{"required": ["table_name"]}, {"required": ["table"]}],
@@ -989,7 +1041,17 @@ async def list_tools() -> list[Tool]:
                         "description": "Compatibility alias for table_name.",
                     },
                     **target_properties,
+                    "table_names": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 20,
+                        "items": {"type": "string"},
+                        "description": "Batch of bare table names in this database; cannot combine with table_name/table.",
+                    },
+                    "max_rows": result_properties["max_rows"],
+                    "offset": result_properties["offset"],
                     "result_format": result_properties["result_format"],
+                    "max_response_bytes": result_properties["max_response_bytes"],
                     "timeout_ms": result_properties["timeout_ms"],
                 },
                 "required": ["kind"],
@@ -1066,6 +1128,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
                         "pool_size": profile.pool_size,
                         "query_timeout_ms": profile.query_timeout_ms,
                         "max_rows": profile.max_rows,
+                        "max_response_bytes": profile.max_response_bytes,
+                        "max_concurrent_queries": profile.max_concurrent_queries,
+                        "max_queued_queries": profile.max_queued_queries,
+                        "queue_timeout_ms": profile.queue_timeout_ms,
                         "result_format": profile.result_format,
                         "credential_provider": (
                             profile.credential_provider
@@ -1138,13 +1204,29 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
                 profile = registry.profiles.get(connection) or registry.get(
                     next(iter(registry.routes[connection].values())).connection
                 )
+                aliases = sorted(registry.routes[connection])
+                page_offset = int(arguments.get("offset", 0))
+                row_limit = int(arguments.get("max_rows", profile.max_rows))
+                if (
+                    not 0 <= page_offset <= 1_000_000
+                    or not 1 <= row_limit <= profile.max_rows
+                ):
+                    raise ValueError(
+                        "offset or max_rows is outside the permitted range"
+                    )
                 result = QueryResult(
                     connection=connection,
                     database=None,
                     columns=["database_name"],
-                    rows=[[alias] for alias in sorted(registry.routes[connection])],
-                    offset=0,
-                    truncated=False,
+                    rows=[
+                        [alias]
+                        for alias in aliases[page_offset : page_offset + row_limit]
+                    ],
+                    offset=page_offset,
+                    truncated=len(aliases) > page_offset + row_limit,
+                    truncation_reasons=(
+                        ("row_limit",) if len(aliases) > page_offset + row_limit else ()
+                    ),
                     duration_ms=0,
                     query_id=hashlib.sha256(
                         f"logical-routes:{connection}".encode("utf-8")
@@ -1154,16 +1236,29 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
                 selected_format = (
                     arguments.get("result_format") or profile.result_format
                 ).lower()
-                if selected_format not in {"csv", "json"}:
-                    raise ValueError("result_format must be csv or json")
-                return [TextContent(type="text", text=result.render(selected_format))]
+                if selected_format not in {"csv", "json", "compact"}:
+                    raise ValueError("result_format must be csv, json or compact")
+                return [
+                    TextContent(
+                        type="text",
+                        text=result.fit_response(
+                            selected_format,
+                            _response_budget(
+                                profile, arguments.get("max_response_bytes")
+                            ),
+                        ).render(selected_format),
+                    )
+                ]
             profile = registry.get(connection)
             query = _database_listing_query(profile)
             return await run_query(
                 query,
                 connection=connection,
                 internal=True,
+                max_rows=arguments.get("max_rows"),
+                offset=arguments.get("offset", 0),
                 result_format=arguments.get("result_format"),
+                max_response_bytes=arguments.get("max_response_bytes"),
                 timeout_ms=arguments.get("timeout_ms"),
             )
 
@@ -1191,6 +1286,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
                 f"WHERE TABLE_SCHEMA = {schema_filter}{name_filter} "
                 "ORDER BY TABLE_NAME"
             )
+            if arguments.get("search") is not None:
+                query = search_tables_sql(
+                    schema_filter, name_filter, arguments["search"]
+                )
             return await run_query(
                 query,
                 connection=connection,
@@ -1199,6 +1298,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
                 offset=arguments.get("offset", 0),
                 internal=True,
                 result_format=arguments.get("result_format"),
+                max_response_bytes=arguments.get("max_response_bytes"),
                 timeout_ms=arguments.get("timeout_ms"),
             )
 
@@ -1213,52 +1313,58 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
                 max_rows=arguments.get("max_rows"),
                 offset=arguments.get("offset", 0),
                 result_format=arguments.get("result_format"),
+                max_response_bytes=arguments.get("max_response_bytes"),
                 timeout_ms=arguments.get("timeout_ms"),
             )
 
         if name == "get_schema_info":
             table_name = _table_argument(arguments)
-            if table_name:
-                table_database, table = parse_table_arg(table_name)
-                selected_database = table_database or database
-                target = load_connection_registry().resolve(
-                    connection, selected_database
-                )
-                profile = target.profile
-                if (
-                    target.database in SYSTEM_DATABASES
-                    and not profile.allow_system_databases
-                ):
-                    raise ValueError(
-                        f"System database '{selected_database}' is blocked for "
-                        f"connection '{profile.name}'"
-                    )
-                schema_filter = (
-                    f"'{target.database}'" if target.database else "DATABASE()"
-                )
+            names = arguments.get("table_names")
+            if table_name and names is not None:
+                raise ValueError("Use either table_name/table or table_names, not both")
+            filters = table_filter(names)
+            table_database, schema_table = (
+                parse_table_arg(table_name) if table_name else (None, None)
+            )
+            if table_database and database and table_database != database:
+                raise ValueError("database and qualified table_name must agree")
+            selected_database = table_database or database
+            target = load_connection_registry().resolve(connection, selected_database)
+            if (
+                target.database in SYSTEM_DATABASES
+                and not target.profile.allow_system_databases
+            ):
+                raise ValueError("System database access is blocked")
+            schema_filter = f"'{target.database}'" if target.database else "DATABASE()"
+            if schema_table:
+                filters += f" AND TABLE_NAME = '{schema_table}'"
+            detail = arguments.get("detail", False)
+            if not isinstance(detail, bool):
+                raise ValueError("detail must be a boolean")
+            if detail:
+                query = detailed_schema_sql(schema_filter, filters)
+            elif schema_table:
                 query = (
                     "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT, "
                     "COLUMN_COMMENT FROM information_schema.COLUMNS "
-                    f"WHERE TABLE_SCHEMA = {schema_filter} "
-                    f"AND TABLE_NAME = '{table}' ORDER BY ORDINAL_POSITION"
+                    f"WHERE TABLE_SCHEMA = {schema_filter}{filters} ORDER BY ORDINAL_POSITION"
                 )
             else:
-                target = load_connection_registry().resolve(connection, database)
-                schema_filter = (
-                    f"'{target.database}'" if target.database else "DATABASE()"
-                )
                 query = (
                     "SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, IS_NULLABLE "
                     "FROM information_schema.COLUMNS "
-                    f"WHERE TABLE_SCHEMA = {schema_filter} "
+                    f"WHERE TABLE_SCHEMA = {schema_filter}{filters} "
                     "ORDER BY TABLE_NAME, ORDINAL_POSITION"
                 )
             return await run_query(
                 query,
                 connection=connection,
-                database=selected_database if table_name else database,
+                database=selected_database,
                 internal=True,
+                max_rows=arguments.get("max_rows"),
+                offset=arguments.get("offset", 0),
                 result_format=arguments.get("result_format"),
+                max_response_bytes=arguments.get("max_response_bytes"),
                 timeout_ms=arguments.get("timeout_ms"),
             )
 
@@ -1288,6 +1394,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
                 result_offset=page_offset,
                 bounded_result=True,
                 result_format=arguments.get("result_format"),
+                max_response_bytes=arguments.get("max_response_bytes"),
                 timeout_ms=arguments.get("timeout_ms"),
             )
 
@@ -1300,19 +1407,42 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
             target = load_connection_registry().resolve(connection, database)
             if not target.database:
                 raise ValueError("database is required for inspect_catalog")
-            query = _catalog_query(kind, target.database, catalog_table)
+            if table_name and arguments.get("table_names") is not None:
+                raise ValueError("Use either table_name/table or table_names, not both")
+            query = _catalog_query(
+                kind,
+                target.database,
+                catalog_table,
+                table_names=arguments.get("table_names"),
+            )
             return await run_query(
                 query,
                 connection=connection,
                 database=database,
                 internal=True,
+                max_rows=arguments.get("max_rows"),
+                offset=arguments.get("offset", 0),
                 result_format=arguments.get("result_format"),
+                max_response_bytes=arguments.get("max_response_bytes"),
                 timeout_ms=arguments.get("timeout_ms"),
             )
 
         raise ValueError(f"Unknown tool: {name}")
     except Exception as exc:
         logger.error("Error in call_tool %r (%s)", name, type(exc).__name__)
+        if isinstance(exc, QueryFailure):
+            return ToolErrorResult(
+                content=[
+                    TextContent(
+                        type="text",
+                        text=json.dumps(
+                            exc.payload, ensure_ascii=False, separators=(",", ":")
+                        ),
+                    )
+                ],
+                structuredContent=exc.payload,
+                isError=True,
+            )
         return ToolErrorResult(
             content=[
                 TextContent(type="text", text=f"Error calling tool {name}: {str(exc)}")
@@ -1405,8 +1535,8 @@ async def get_prompt(name: str, arguments: dict | None) -> GetPromptResult:
                             f"Target: {target_instruction}\n"
                             "1. Call list_databases when no database is selected, then "
                             "call list_tables for the target database.\n"
-                            "2. Call get_schema_info with no table_name to see all table structures at once, "
-                            "or for each table of interest individually.\n"
+                            "2. Call get_schema_info for relevant table_names, optionally detail=true. "
+                            "When truncated, continue with next_offset and identical filters until complete.\n"
                             "3. Call get_table_sample on 2–3 representative tables to understand "
                             "data format and content.\n"
                             "4. Summarize: describe what each table stores, note relationships "
@@ -1507,17 +1637,32 @@ def _write_audit_event(
     audit_logger.info(serialized)
 
 
+def _response_budget(profile: ConnectionProfile, requested: int | None) -> int:
+    budget = profile.max_response_bytes if requested is None else requested
+    if (
+        isinstance(budget, bool)
+        or not isinstance(budget, int)
+        or not 4096 <= budget <= profile.max_response_bytes
+    ):
+        raise ValueError(
+            f"max_response_bytes must be between 4096 and profile limit {profile.max_response_bytes}"
+        )
+    return budget
+
+
 async def execute_query(
     query: str,
     *,
     connection: str | None = None,
     database: str | None = None,
     max_rows: int | None = None,
+    max_response_bytes: int | None = None,
     offset: int = 0,
     result_offset: int | None = None,
     timeout_ms: int | None = None,
     internal: bool = False,
     bounded_result: bool = False,
+    result_format: str | None = None,
 ) -> QueryResult:
     """Execute one validated query with policy, timeout, cancellation and paging."""
     registry = load_connection_registry()
@@ -1562,6 +1707,10 @@ async def execute_query(
         )
         validate_function_safety(query, allowed_functions=profile.allowed_functions)
 
+        selected_format = result_format or profile.result_format
+        if selected_format not in {"csv", "json", "compact"}:
+            raise ValueError("result_format must be csv, json or compact")
+        response_budget = _response_budget(profile, max_response_bytes)
         row_limit = profile.max_rows if max_rows is None else int(max_rows)
         if not 1 <= row_limit <= profile.max_rows:
             raise ValueError(
@@ -1610,9 +1759,12 @@ async def execute_query(
         raise
 
     control = QueryControl()
+    lease: QueryLease | None = None
 
-    def _sync_execute() -> QueryResult:
+    def _sync_execute_admitted(queue_wait_ms: int) -> QueryResult:
         for attempt in range(2):
+            if control.cancelled:
+                raise RuntimeError("Query was cancelled before connecting")
             connection_object = None
             discard_connection = False
             phase = "connect"
@@ -1678,6 +1830,11 @@ async def execute_query(
                         ]
                         for row in rows
                     ]
+                    content_truncated = any(
+                        isinstance(value, str) and value.endswith(TRUNCATION_SUFFIX)
+                        for row in serialized_rows
+                        for value in row
+                    )
                     return QueryResult(
                         connection=profile.name,
                         database=config.get("database"),
@@ -1689,10 +1846,20 @@ async def execute_query(
                         query_id=query_fingerprint(query),
                         masked_columns=masked_columns,
                         retry_count=attempt,
+                        content_truncated=content_truncated,
+                        truncation_reasons=tuple(
+                            reason
+                            for reason, enabled in (
+                                ("row_limit", truncated),
+                                ("cell_length", content_truncated),
+                            )
+                            if enabled
+                        ),
+                        queue_wait_ms=queue_wait_ms,
                         requested_connection=target.requested_connection,
                         requested_database=target.requested_database,
                         route_applied=target.route_applied,
-                    )
+                    ).fit_response(selected_format, response_budget)
             except Error as exc:
                 errno = getattr(exc, "errno", None)
                 if errno == -1 and attempt == 0:
@@ -1704,19 +1871,15 @@ async def execute_query(
                         type(exc).__name__,
                     )
                     continue
-                sqlstate = getattr(exc, "sqlstate", None)
-                reference = ",".join(
-                    value
-                    for value in [
-                        f"error_type={type(exc).__name__}",
-                        f"phase={phase}",
-                        f"errno={errno}" if errno is not None else "",
-                        f"sqlstate={sqlstate}" if sqlstate else "",
-                    ]
-                    if value
-                )
-                raise RuntimeError(
-                    f"MySQL read-only query failed ({reference})"
+                raise database_failure(
+                    exc,
+                    phase=phase,
+                    connection=profile.name,
+                    database=selected_database,
+                    requested_connection=target.requested_connection,
+                    requested_database=target.requested_database,
+                    route_applied=target.route_applied,
+                    query_id=query_fingerprint(query),
                 ) from exc
             finally:
                 if connection_object is not None:
@@ -1739,8 +1902,14 @@ async def execute_query(
                 control.unbind()
         raise RuntimeError("Connector retry loop exited unexpectedly")
 
+    def _sync_execute() -> QueryResult:
+        assert lease is not None
+        with lease.run() as queue_wait_ms:
+            return _sync_execute_admitted(queue_wait_ms)
+
     try:
         with anyio.fail_after(effective_timeout / 1000):
+            lease = await query_admission.acquire(profile)
             result = await anyio.to_thread.run_sync(
                 _sync_execute,
                 abandon_on_cancel=True,
@@ -1781,6 +1950,16 @@ async def execute_query(
         raise
     except Exception as exc:
         duration = round((time.monotonic() - started) * 1000)
+        if isinstance(exc, QueryFailure):
+            for key, value in {
+                "connection": profile.name,
+                "database": selected_database,
+                "requested_connection": target.requested_connection,
+                "requested_database": target.requested_database,
+                "route_applied": target.route_applied,
+                "query_id": query_fingerprint(query),
+            }.items():
+                exc.payload.setdefault(key, value)
         _write_audit_event(
             profile,
             query=query,
@@ -1794,6 +1973,10 @@ async def execute_query(
             route_applied=target.route_applied,
         )
         raise
+
+    finally:
+        if lease is not None:
+            lease.release_pending()
 
     _write_audit_event(
         profile,
@@ -1818,6 +2001,7 @@ async def run_query(
     connection: str | None = None,
     database: str | None = None,
     max_rows: int | None = None,
+    max_response_bytes: int | None = None,
     offset: int = 0,
     result_offset: int | None = None,
     result_format: str | None = None,
@@ -1826,13 +2010,15 @@ async def run_query(
     bounded_result: bool = False,
 ) -> list[TextContent]:
     requested_format = result_format.lower() if result_format else None
-    if requested_format not in {None, "csv", "json"}:
-        raise ValueError("result_format must be csv or json")
+    if requested_format not in {None, "csv", "json", "compact"}:
+        raise ValueError("result_format must be csv, json or compact")
     result = await execute_query(
         query,
         connection=connection,
         database=database,
         max_rows=max_rows,
+        max_response_bytes=max_response_bytes,
+        result_format=requested_format,
         offset=offset,
         result_offset=result_offset,
         timeout_ms=timeout_ms,

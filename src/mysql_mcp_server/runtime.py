@@ -10,13 +10,16 @@ import subprocess
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+import anyio
 from mysql.connector import connect
 from mysql.connector.pooling import MySQLConnectionPool
 
 from .config import ConnectionProfile
+from .errors import QueryFailure
 
 
 @dataclass(frozen=True)
@@ -343,6 +346,11 @@ class QueryControl:
             if self._connection is not None:
                 self._shutdown(self._connection)
 
+    @property
+    def cancelled(self) -> bool:
+        with self._lock:
+            return self._cancelled
+
     @staticmethod
     def _shutdown(connection: Any) -> None:
         try:
@@ -354,6 +362,96 @@ class QueryControl:
                 pass
 
 
+class QueryAdmission:
+    """Bound work per profile; a cancelled worker retains its slot until cleanup."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._active: dict[str, int] = {}
+        self._waiting: dict[str, int] = {}
+
+    def release(self, key: str) -> None:
+        with self._condition:
+            self._active[key] -= 1
+            if not self._active[key]:
+                del self._active[key]
+            self._condition.notify_all()
+
+    async def acquire(self, profile: ConnectionProfile) -> QueryLease:
+        """Queue before using AnyIO worker threads, so one busy profile cannot fill them."""
+        key = profile.name
+        capacity = min(
+            profile.max_concurrent_queries,
+            profile.pool_size or profile.max_concurrent_queries,
+        )
+        started = time.monotonic()
+        queued = False
+        try:
+            while True:
+                with self._condition:
+                    elapsed = time.monotonic() - started
+                    if queued and elapsed >= profile.queue_timeout_ms / 1000:
+                        raise QueryFailure(
+                            "CONNECTION_BUSY",
+                            "The connection queue wait limit was reached.",
+                            "Reduce parallel calls and retry after a short delay.",
+                            retryable=True,
+                            connection=key,
+                            phase="queue",
+                        )
+                    if self._active.get(key, 0) < capacity:
+                        self._active[key] = self._active.get(key, 0) + 1
+                        return QueryLease(self, key, round(elapsed * 1000))
+                    if not queued:
+                        if self._waiting.get(key, 0) >= profile.max_queued_queries:
+                            raise QueryFailure(
+                                "CONNECTION_BUSY",
+                                "The connection queue is full.",
+                                "Reduce parallel calls and retry after a short delay.",
+                                retryable=True,
+                                connection=key,
+                                phase="queue",
+                            )
+                        self._waiting[key] = self._waiting.get(key, 0) + 1
+                        queued = True
+                await anyio.sleep(min(0.01, profile.queue_timeout_ms / 1000))
+        finally:
+            if queued:
+                with self._condition:
+                    self._waiting[key] -= 1
+                    if not self._waiting[key]:
+                        del self._waiting[key]
+
+
+class QueryLease:
+    """Transfer an admission slot to a worker atomically with cancellation."""
+
+    def __init__(self, admission: QueryAdmission, key: str, wait_ms: int):
+        self.admission, self.key, self.wait_ms = admission, key, wait_ms
+        self._lock = threading.Lock()
+        self._state = "pending"
+
+    def release_pending(self) -> None:
+        with self._lock:
+            if self._state == "pending":
+                self._state = "released"
+                self.admission.release(self.key)
+
+    @contextmanager
+    def run(self):
+        with self._lock:
+            if self._state != "pending":
+                raise RuntimeError("Query was cancelled before worker startup")
+            self._state = "running"
+        try:
+            yield self.wait_ms
+        finally:
+            with self._lock:
+                self._state = "released"
+                self.admission.release(self.key)
+
+
+query_admission = QueryAdmission()
 ssh_tunnel_manager = SshTunnelManager()
 connection_pool_manager = ConnectionPoolManager()
 

@@ -313,8 +313,9 @@ async def test_mysql_error_details_are_redacted_from_tool_response():
             {"query": "SELECT id FROM users", "database": "app"},
         )
 
-    assert "errno=1045" in response[0].text
-    assert "sqlstate=28000" in response[0].text
+    assert json.loads(response[0].text)["errno"] == 1045
+    assert response.structuredContent["code"] == "AUTHENTICATION_FAILED"
+    assert json.loads(response[0].text)["sqlstate"] == "28000"
     assert "sensitive_user" not in response[0].text
     assert "secret.internal" not in response[0].text
 
@@ -394,9 +395,10 @@ async def test_persistent_errno_minus_one_reports_safe_phase_and_type():
         )
 
     text = response[0].text
-    assert "error_type=InterfaceError" in text
-    assert "phase=execute" in text
-    assert "errno=-1" in text
+    payload = json.loads(text)
+    assert payload["error_type"] == "InterfaceError"
+    assert payload["phase"] == "execute"
+    assert payload["errno"] == -1
     assert "Connection details" not in text
 
 

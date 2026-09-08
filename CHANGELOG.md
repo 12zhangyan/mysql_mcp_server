@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-09-08
+
+### Added
+- Search table and column names/comments, including Chinese keywords, with
+  scoped matching evidence; batch table metadata and detailed column/index/FK
+  inspection with complete pagination.
+- Limit query response text by UTF-8 bytes, preserve whole rows and continuation
+  offsets, and report row, byte-budget and cell-content truncation separately.
+- Offer a compact JSON-metadata-plus-CSV format, retaining target database,
+  route, masking and pagination context without changing the default CSV mode.
+- Bound per-connection query concurrency and queue length; include queue time
+  in the overall deadline and retain slots until cancelled workers finish.
+- Add opt-in localhost-only, read-only MySQL and MCP STDIO acceptance tests,
+  including SQL pagination rewrite comparisons and Chinese metadata search.
+
+### Changed
+- Database failures now return safe JSON text and MCP structuredContent with
+  error categories, selected target, and recovery guidance. Clients parsing
+  the old diagnostic text should use the structured fields instead.
+- Guide callers to verify unknown tables/columns and correct deterministic SQL
+  errors without repeated unchanged queries or automatic database switching.
+- Reject conflicting database and qualified table arguments in schema lookup.
+
 ## [0.8.3] - 2026-09-04
 
 ### Changed

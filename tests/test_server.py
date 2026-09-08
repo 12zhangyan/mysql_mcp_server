@@ -373,6 +373,7 @@ async def test_query_compatibility_alias_uses_read_only_runner(monkeypatch):
         connection="legacy",
         database="app",
         max_rows=None,
+        max_response_bytes=None,
         offset=0,
         result_format=None,
         timeout_ms=None,
