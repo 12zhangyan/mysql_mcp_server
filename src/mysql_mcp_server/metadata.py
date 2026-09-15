@@ -3,6 +3,13 @@
 from __future__ import annotations
 
 import re
+from typing import Any
+
+MAX_TABLE_NAMES = 100
+DUMP_SCHEMA_KINDS = ("tables", "columns")
+BARE_TABLE_NAME = re.compile(r"[A-Za-z0-9_$]+")
+TABLE_PATTERN = re.compile(r"[A-Za-z0-9_$*?-]+")
+SCOPE_EXCLUSIVE = "Use only one of table_name/table, table_names, or table_pattern"
 
 
 def table_filter(names: list[str] | None) -> str:
@@ -10,20 +17,169 @@ def table_filter(names: list[str] | None) -> str:
         return ""
     if (
         not isinstance(names, list)
-        or not 1 <= len(names) <= 20
+        or not 1 <= len(names) <= MAX_TABLE_NAMES
         or any(
-            not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_$]+", name)
+            not isinstance(name, str) or not BARE_TABLE_NAME.fullmatch(name)
             for name in names
         )
     ):
         raise ValueError(
-            "table_names must contain 1 to 20 bare table names in the selected database"
+            "table_names must contain 1 to 100 bare table names in the selected "
+            "database; names beyond that limit are rejected rather than truncated"
         )
     return (
         " AND TABLE_NAME IN ("
         + ",".join(f"'{name}'" for name in sorted(set(names)))
         + ")"
     )
+
+
+def table_pattern_like(pattern: str) -> str:
+    """Convert a restricted shell-style table glob to an escaped SQL LIKE value."""
+    if not isinstance(pattern, str) or not 1 <= len(pattern) <= 128:
+        raise ValueError(
+            "table_pattern must be a non-empty string up to 128 characters"
+        )
+    if not TABLE_PATTERN.fullmatch(pattern):
+        raise ValueError(
+            "table_pattern may contain only letters, numbers, _, $, -, *, or ?"
+        )
+    return (
+        pattern.replace("\\", "\\\\")
+        .replace("_", "\\_")
+        .replace("*", "%")
+        .replace("?", "_")
+    )
+
+
+def table_pattern_filter(pattern: str) -> str:
+    return f" AND TABLE_NAME LIKE '{table_pattern_like(pattern)}' ESCAPE '\\\\'"
+
+
+def catalog_name_filter(
+    *,
+    table: str | None = None,
+    table_names: list[str] | None = None,
+    table_pattern: str | None = None,
+) -> str:
+    """Build a mutually exclusive TABLE_NAME predicate for catalog projections."""
+    selected = sum(value is not None for value in (table, table_names, table_pattern))
+    if selected > 1:
+        raise ValueError(SCOPE_EXCLUSIVE)
+    if table is not None:
+        if not isinstance(table, str) or not BARE_TABLE_NAME.fullmatch(table):
+            raise ValueError(
+                f"Invalid identifier '{table}': only alphanumeric, underscore, and $ are allowed"
+            )
+        return f" AND TABLE_NAME = '{table}'"
+    if table_names is not None:
+        return table_filter(table_names)
+    if table_pattern is not None:
+        return table_pattern_filter(table_pattern)
+    return ""
+
+
+def parse_dump_schema_kinds(kinds: list[str] | None) -> tuple[str, ...]:
+    if kinds is None:
+        return DUMP_SCHEMA_KINDS
+    if not isinstance(kinds, list) or not kinds:
+        raise ValueError("kinds must be a non-empty array of tables and/or columns")
+    if any(not isinstance(kind, str) for kind in kinds):
+        raise ValueError("kinds must be a non-empty array of tables and/or columns")
+    normalized = tuple(dict.fromkeys(kinds))
+    unknown = [kind for kind in normalized if kind not in DUMP_SCHEMA_KINDS]
+    if unknown:
+        raise ValueError(
+            "dump_schema kinds may only be tables and columns; use inspect_catalog "
+            "for indexes, constraints, foreign_keys, and views"
+        )
+    return normalized
+
+
+def group_schema_dump(
+    columns: list[str],
+    rows: list[list[Any]],
+    *,
+    table_meta: dict[str, dict[str, Any]] | None = None,
+    include_columns: bool = True,
+) -> list[dict[str, Any]]:
+    """Group a stable catalog page by table without dropping delivered rows."""
+    index = {name: position for position, name in enumerate(columns)}
+    grouped: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+
+    def start_table(name: Any) -> dict[str, Any]:
+        entry: dict[str, Any] = {"table_name": name}
+        if table_meta and name in table_meta:
+            entry.update(table_meta[name])
+        if include_columns:
+            entry["columns"] = []
+        grouped.append(entry)
+        return entry
+
+    if "TABLE_NAME" not in index:
+        raise ValueError("schema dump rows must include TABLE_NAME")
+
+    if include_columns:
+        required = (
+            "COLUMN_NAME",
+            "COLUMN_TYPE",
+            "IS_NULLABLE",
+            "COLUMN_DEFAULT",
+            "COLUMN_COMMENT",
+            "ORDINAL_POSITION",
+        )
+        missing = [name for name in required if name not in index]
+        if missing:
+            raise ValueError(
+                "schema dump column pages must include " + ", ".join(required)
+            )
+        extra_index = index.get("EXTRA")
+        for row in rows:
+            table_name = row[index["TABLE_NAME"]]
+            if current is None or current["table_name"] != table_name:
+                current = start_table(table_name)
+            column = {
+                "name": row[index["COLUMN_NAME"]],
+                "type": row[index["COLUMN_TYPE"]],
+                "nullable": row[index["IS_NULLABLE"]],
+                "default": row[index["COLUMN_DEFAULT"]],
+                "comment": row[index["COLUMN_COMMENT"]],
+                "ordinal": row[index["ORDINAL_POSITION"]],
+            }
+            if extra_index is not None:
+                column["extra"] = row[extra_index]
+            current["columns"].append(column)
+        return grouped
+
+    for row in rows:
+        table_name = row[index["TABLE_NAME"]]
+        meta = {
+            key.lower(): row[position]
+            for key, position in index.items()
+            if key != "TABLE_NAME"
+        }
+        if table_meta and table_name in table_meta:
+            meta = {**table_meta[table_name], **meta}
+        grouped.append({"table_name": table_name, **meta})
+    return grouped
+
+
+def table_dump_meta(
+    columns: list[str], rows: list[list[Any]]
+) -> dict[str, dict[str, Any]]:
+    """Map inspect_catalog(kind=tables) rows to dump_schema table objects."""
+    index = {name: position for position, name in enumerate(columns)}
+    if "TABLE_NAME" not in index:
+        raise ValueError("table pages must include TABLE_NAME")
+    mapped: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        mapped[row[index["TABLE_NAME"]]] = {
+            field.lower(): row[position]
+            for field, position in index.items()
+            if field != "TABLE_NAME"
+        }
+    return mapped
 
 
 def search_tables_sql(schema: str, filters: str, search: str) -> str:

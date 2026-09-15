@@ -4,12 +4,8 @@ from datetime import datetime
 from decimal import Decimal
 
 from mysql_mcp_server.config import DEFAULT_MASK_COLUMNS
-from mysql_mcp_server.results import (
-    MASKED_VALUE,
-    QueryResult,
-    mask_result_rows,
-    serialize_value,
-)
+from mysql_mcp_server.results import (MASKED_VALUE, QueryResult,
+                                      mask_result_rows, serialize_value)
 
 
 def test_json_result_preserves_types_and_paging_metadata():
@@ -37,6 +33,8 @@ def test_json_result_preserves_types_and_paging_metadata():
     assert payload["rows"][0][2] == "2026-07-29T12:30:00"
     assert payload["rows"][0][3] == "base64:" + base64.b64encode(b"abc").decode()
     assert payload["next_offset"] == 11
+    assert payload["returned_rows"] == 1
+    assert payload["row_count"] == 1
 
 
 def test_csv_uses_real_escaping_and_explicit_null():

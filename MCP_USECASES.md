@@ -36,15 +36,21 @@ Reading it lists the accessible non-system databases.
 
 ## 3. Explore schemas and samples
 
-- All columns in a database:
-  `get_schema_info({"connection": "test", "database": "orders_test"})`
+- All columns in a database, following `truncated`/`next_offset` until complete:
+  `inspect_catalog({"connection": "test", "database": "orders_test", "kind": "columns", "result_format": "json"})`
+- Grouped table/column dump for large schemas:
+  `dump_schema({"connection": "test", "database": "orders_test", "max_rows": 500})`
 - One table:
   `get_schema_info({"connection": "test", "database": "orders_test", "table_name": "orders"})`
+- A batch of tables:
+  `get_schema_info({"connection": "test", "database": "orders_test", "table_names": ["orders", "order_items"]})`
 - A small sample:
   `get_table_sample({"connection": "test", "database": "orders_test", "table_name": "orders", "limit": 10})`
 
 `table_name` can also be qualified as `database.table`.
 Sampling is bounded in MySQL with `LIMIT`/`OFFSET` before rows are fetched.
+A single metadata page is not the complete catalog; continue with `next_offset`
+until `truncated` is false. Direct `information_schema` SQL stays blocked.
 
 ## 4. Run read-only analysis
 

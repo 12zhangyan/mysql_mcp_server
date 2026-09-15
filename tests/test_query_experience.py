@@ -11,19 +11,14 @@ from mysql.connector import ProgrammingError
 
 from mysql_mcp_server.config import ConnectionProfile, load_connection_registry
 from mysql_mcp_server.errors import QueryFailure
-from mysql_mcp_server.metadata import (
-    detailed_schema_sql,
-    search_tables_sql,
-    table_filter,
-)
+from mysql_mcp_server.metadata import (detailed_schema_sql, search_tables_sql,
+                                       table_filter)
 from mysql_mcp_server.results import QueryResult
 from mysql_mcp_server.runtime import QueryAdmission
 from mysql_mcp_server.server import call_tool, execute_query, list_tools
-from mysql_mcp_server.sql_guard import (
-    validate_database_access,
-    validate_function_safety,
-    validate_read_only_query,
-)
+from mysql_mcp_server.sql_guard import (validate_database_access,
+                                        validate_function_safety,
+                                        validate_read_only_query)
 
 
 def connection_with(rows, columns):
@@ -73,10 +68,19 @@ async def test_sql_failure_is_actionable_safe_and_not_retried(
 
 async def test_discovery_tools_expose_continuation_and_batch_arguments():
     tools = {tool.name: tool for tool in await list_tools()}
-    for name in ("get_schema_info", "inspect_catalog"):
-        assert {"offset", "max_rows", "table_names", "max_response_bytes"} <= tools[
-            name
-        ].inputSchema["properties"].keys()
+    for name in ("get_schema_info", "inspect_catalog", "dump_schema"):
+        properties = tools[name].inputSchema["properties"]
+        assert {
+            "offset",
+            "max_rows",
+            "table_names",
+            "table_pattern",
+        } <= properties.keys()
+        assert properties["table_names"]["maxItems"] == 100
+        assert "truncated" in tools[name].description
+        assert "next_offset" in tools[name].description
+        assert "not the complete catalog" in tools[name].description
+    assert "truncated" in tools["list_tables"].description
     assert "search" in tools["list_tables"].inputSchema["properties"]
     assert "do not guess" in tools["execute_sql"].description
 
@@ -116,10 +120,12 @@ async def test_metadata_batch_and_paging_reach_execution(tool, extra):
     "arguments",
     [
         {"table_names": []},
-        {"table_names": ["x"] * 21},
+        {"table_names": ["x"] * 101},
         {"table_names": ["other.users"]},
         {"table_names": ["x' OR 1=1 --"]},
         {"table_names": ["users"], "table_name": "users"},
+        {"table_names": ["users"], "table_pattern": "user*"},
+        {"table_name": "users", "table_pattern": "user*"},
         {"table_name": "other.users", "database": "app"},
         {"detail": "true"},
     ],

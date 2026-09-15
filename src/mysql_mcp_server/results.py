@@ -260,6 +260,7 @@ class QueryResult:
             "columns": self.columns,
             "rows": self.rows,
             "row_count": len(self.rows),
+            "returned_rows": len(self.rows),
             "offset": self.offset,
             "truncated": self.truncated,
             "next_offset": self.next_offset,

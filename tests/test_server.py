@@ -7,19 +7,11 @@ from mcp.types import CallToolResult
 from pydantic import AnyUrl
 
 from mysql_mcp_server import __version__
-from mysql_mcp_server.server import (
-    _validate_sse_exposure,
-    app,
-    call_tool,
-    get_db_config,
-    get_prompt,
-    list_prompts,
-    list_resources,
-    list_tools,
-    parse_table_arg,
-    read_resource,
-    validate_identifier,
-)
+from mysql_mcp_server.server import (_validate_sse_exposure, app, call_tool,
+                                     get_db_config, get_prompt, list_prompts,
+                                     list_resources, list_tools,
+                                     parse_table_arg, read_resource,
+                                     validate_identifier)
 
 
 def test_server_initialization():
@@ -46,7 +38,7 @@ def test_sse_bearer_token_has_minimum_length():
 async def test_list_tools():
     """Test that list_tools returns expected tools."""
     tools = await list_tools()
-    assert len(tools) == 10
+    assert len(tools) == 11
     assert any(t.name == "list_connections" for t in tools)
     assert any(t.name == "validate_connections" for t in tools)
     assert any(t.name == "check_connection" for t in tools)
@@ -57,6 +49,7 @@ async def test_list_tools():
     assert any(t.name == "get_schema_info" for t in tools)
     assert any(t.name == "get_table_sample" for t in tools)
     assert any(t.name == "inspect_catalog" for t in tools)
+    assert any(t.name == "dump_schema" for t in tools)
     assert all(t.annotations.readOnlyHint for t in tools)
     assert all(not t.annotations.destructiveHint for t in tools)
 
