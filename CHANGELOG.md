@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1] - 2026-09-15
+
+### Added
+- Paginate `inspect_catalog` and `get_schema_info` with the same `max_rows` /
+  `offset` / `truncated` / `next_offset` / `returned_rows` contract as
+  `list_tables`. Whole-database `kind=columns` uses a stable
+  `TABLE_NAME, ORDINAL_POSITION, COLUMN_NAME` order, so offset is applied instead
+  of repeating the first page.
+- Filter catalog/schema tools with `table_pattern` (`*` / `?`) or `table_names`
+  (1–100 bare names; longer lists are rejected). `table_name`, `table_names`,
+  and `table_pattern` stay mutually exclusive.
+- Add `dump_schema` to return allowlisted table/column metadata grouped by table.
+  Oversized responses stay paged; indexes/constraints/views remain on
+  `inspect_catalog`.
+
+### Changed
+- Tool descriptions for `list_tables`, `get_schema_info`, `inspect_catalog`, and
+  `dump_schema` now require callers to follow `truncated` / `next_offset` and
+  not treat a single page as a complete catalog.
+
 ## [0.9.0] - 2026-09-08
 
 ### Added

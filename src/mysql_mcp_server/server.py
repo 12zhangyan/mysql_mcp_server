@@ -15,55 +15,31 @@ import anyio
 import sqlglot
 from dotenv import load_dotenv
 from mcp.server import Server
-from mcp.types import (
-    CallToolResult,
-    GetPromptResult,
-    Prompt,
-    PromptArgument,
-    PromptMessage,
-    Resource,
-    ResourceTemplate,
-    TextContent,
-    Tool,
-    ToolAnnotations,
-)
+from mcp.types import (CallToolResult, GetPromptResult, Prompt, PromptArgument,
+                       PromptMessage, Resource, ResourceTemplate, TextContent,
+                       Tool, ToolAnnotations)
 from mysql.connector import Error, connect
 from pydantic import AnyUrl
 from sqlglot import exp
 
-from .audit import (
-    AuditWriteError,
-    audit_sink,
-    build_audit_context,
-    current_audit_context,
-    reset_audit_context,
-    set_audit_context,
-    validate_required_audit_context,
-)
-from .config import (
-    ConnectionProfile,
-    build_connector_config,
-    ensure_database_allowed,
-    load_connection_registry,
-)
+from .audit import (AuditWriteError, audit_sink, build_audit_context,
+                    current_audit_context, reset_audit_context,
+                    set_audit_context, validate_required_audit_context)
+from .config import (ConnectionProfile, build_connector_config,
+                     ensure_database_allowed, load_connection_registry)
 from .errors import QueryFailure, database_failure
-from .metadata import detailed_schema_sql, search_tables_sql, table_filter
-from .results import TRUNCATION_SUFFIX, QueryResult, mask_result_rows, serialize_value
-from .runtime import (
-    QueryControl,
-    QueryLease,
-    close_runtime_resources,
-    connection_pool_manager,
-    query_admission,
-    ssh_tunnel_manager,
-)
-from .sql_guard import (
-    query_fingerprint,
-    query_type,
-    validate_database_access,
-    validate_function_safety,
-    validate_read_only_query,
-)
+from .metadata import (MAX_TABLE_NAMES, catalog_name_filter,
+                       detailed_schema_sql, group_schema_dump,
+                       parse_dump_schema_kinds, search_tables_sql,
+                       table_dump_meta, table_pattern_filter)
+from .results import (TRUNCATION_SUFFIX, QueryResult, mask_result_rows,
+                      serialize_value)
+from .runtime import (QueryControl, QueryLease, close_runtime_resources,
+                      connection_pool_manager, query_admission,
+                      ssh_tunnel_manager)
+from .sql_guard import (query_fingerprint, query_type,
+                        validate_database_access, validate_function_safety,
+                        validate_read_only_query)
 
 # Load environment variables from .env file if it exists.
 # This allows for easy local configuration of database and SSH credentials.
@@ -155,23 +131,21 @@ def _table_argument(arguments: dict, *, required: bool = False) -> str | None:
     return value
 
 
-def _table_pattern_sql(pattern: str) -> str:
-    """Convert a restricted shell-style table glob to an escaped SQL LIKE value."""
-    if not isinstance(pattern, str) or not 1 <= len(pattern) <= 128:
-        raise ValueError(
-            "table_pattern must be a non-empty string up to 128 characters"
-        )
-    if not re.fullmatch(r"[A-Za-z0-9_$*?-]+", pattern):
-        raise ValueError(
-            "table_pattern may contain only letters, numbers, _, $, -, *, or ?"
-        )
-    escaped = (
-        pattern.replace("\\", "\\\\")
-        .replace("_", "\\_")
-        .replace("*", "%")
-        .replace("?", "_")
+TRUNCATION_GUIDANCE = (
+    "Results are capped by the connection max_rows (MYSQL_MAX_ROWS, default 500, "
+    "maximum 1000). Always inspect truncated and next_offset. Repeat with the same "
+    "filters and offset=next_offset until truncated is false; a single page is not "
+    "the complete catalog."
+)
+
+
+def _metadata_name_filter(arguments: dict, *, table: str | None = None) -> str:
+    """Apply one mutually exclusive table filter for catalog and schema tools."""
+    return catalog_name_filter(
+        table=table,
+        table_names=arguments.get("table_names"),
+        table_pattern=arguments.get("table_pattern"),
     )
-    return escaped
 
 
 def _bounded_query_sql(query: str, *, row_limit: int, page_offset: int) -> str | None:
@@ -372,16 +346,10 @@ def _database_listing_query(profile: ConnectionProfile) -> str:
 def _catalog_query(
     kind: str,
     database: str,
-    table: str | None = None,
-    *,
-    table_names: list[str] | None = None,
+    name_filter: str = "",
 ) -> str:
     """Build a fixed, identifier-validated information_schema projection."""
     validate_identifier(database)
-    if table:
-        validate_identifier(table)
-    name_filter = f" AND TABLE_NAME = '{table}'" if table else ""
-    name_filter += table_filter(table_names)
     queries = {
         "tables": (
             "SELECT TABLE_NAME, TABLE_TYPE, ENGINE, TABLE_ROWS, TABLE_COMMENT "
@@ -393,7 +361,7 @@ def _catalog_query(
             "IS_NULLABLE, COLUMN_DEFAULT, EXTRA, COLUMN_COMMENT "
             "FROM information_schema.COLUMNS "
             f"WHERE TABLE_SCHEMA = '{database}'{name_filter} "
-            "ORDER BY TABLE_NAME, ORDINAL_POSITION"
+            "ORDER BY TABLE_NAME, ORDINAL_POSITION, COLUMN_NAME"
         ),
         "indexes": (
             "SELECT TABLE_NAME, INDEX_NAME, NON_UNIQUE, SEQ_IN_INDEX, COLUMN_NAME, "
@@ -746,13 +714,20 @@ async def list_tools() -> list[Tool]:
             "type": "integer",
             "minimum": 1,
             "maximum": 1000,
-            "description": "Maximum rows returned for this page.",
+            "description": (
+                "Maximum rows returned for this page. Defaults to the connection "
+                "MYSQL_MAX_ROWS cap. Check truncated/next_offset; one page is not "
+                "a complete result."
+            ),
         },
         "offset": {
             "type": "integer",
             "minimum": 0,
             "maximum": 1_000_000,
-            "description": "Rows to skip before returning this page.",
+            "description": (
+                "Rows to skip before returning this page. Omit or 0 for the first "
+                "page; continue with next_offset until truncated is false."
+            ),
         },
         "result_format": {
             "type": "string",
@@ -767,6 +742,26 @@ async def list_tools() -> list[Tool]:
                 "Per-call timeout. It may lower but never exceed the profile limit."
             ),
         },
+    }
+    table_pattern_property = {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "description": (
+            "Optional name glob in the selected database; use * for many "
+            "characters and ? for one character. Cannot combine with "
+            "table_name/table or table_names."
+        ),
+    }
+    table_names_property = {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": MAX_TABLE_NAMES,
+        "items": {"type": "string"},
+        "description": (
+            "Batch of 1-100 bare table names in this database. Lists longer than "
+            "100 are rejected. Cannot combine with table_name/table or table_pattern."
+        ),
     }
     return [
         Tool(
@@ -835,7 +830,9 @@ async def list_tools() -> list[Tool]:
             name="list_tables",
             description=(
                 "List tables and views in a selected database, with optional "
-                "name filtering and pagination for large schemas. Optional search matches names and comments of tables and columns, returning match evidence."
+                "name filtering and pagination for large schemas. Optional search "
+                "matches names and comments of tables and columns, returning match "
+                "evidence. " + TRUNCATION_GUIDANCE
             ),
             inputSchema={
                 "type": "object",
@@ -855,15 +852,7 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Compatibility alias for table_name.",
                     },
-                    "table_pattern": {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": 128,
-                        "description": (
-                            "Optional name glob; use * for many characters and ? "
-                            "for one character."
-                        ),
-                    },
+                    "table_pattern": table_pattern_property,
                     "max_rows": result_properties["max_rows"],
                     "offset": result_properties["offset"],
                     "result_format": result_properties["result_format"],
@@ -938,8 +927,9 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="get_schema_info",
             description=(
-                "Get column metadata for one table or all tables in the selected "
-                "database. A table may be written as database.table."
+                "Get column metadata for one table, a table_names/table_pattern "
+                "batch, or all tables in the selected database. A table may be "
+                "written as database.table. " + TRUNCATION_GUIDANCE
             ),
             inputSchema={
                 "type": "object",
@@ -958,13 +948,8 @@ async def list_tools() -> list[Tool]:
                         "description": "Return pageable table, column, index (including PRIMARY) and declared foreign-key rows in one result; KIND identifies each row.",
                     },
                     **target_properties,
-                    "table_names": {
-                        "type": "array",
-                        "minItems": 1,
-                        "maxItems": 20,
-                        "items": {"type": "string"},
-                        "description": "Batch of bare table names in this database; cannot combine with table_name/table.",
-                    },
+                    "table_names": table_names_property,
+                    "table_pattern": table_pattern_property,
                     "max_rows": result_properties["max_rows"],
                     "offset": result_properties["offset"],
                     "result_format": result_properties["result_format"],
@@ -1016,7 +1001,10 @@ async def list_tools() -> list[Tool]:
             name="inspect_catalog",
             description=(
                 "Inspect an allowlisted metadata projection for the selected user "
-                "database without granting arbitrary information_schema access."
+                "database without granting arbitrary information_schema access. "
+                "kind selects tables, columns, indexes, constraints, foreign_keys, "
+                "or views. Omit table_name to page the whole database after a "
+                "stable sort. " + TRUNCATION_GUIDANCE
             ),
             inputSchema={
                 "type": "object",
@@ -1041,13 +1029,8 @@ async def list_tools() -> list[Tool]:
                         "description": "Compatibility alias for table_name.",
                     },
                     **target_properties,
-                    "table_names": {
-                        "type": "array",
-                        "minItems": 1,
-                        "maxItems": 20,
-                        "items": {"type": "string"},
-                        "description": "Batch of bare table names in this database; cannot combine with table_name/table.",
-                    },
+                    "table_names": table_names_property,
+                    "table_pattern": table_pattern_property,
                     "max_rows": result_properties["max_rows"],
                     "offset": result_properties["offset"],
                     "result_format": result_properties["result_format"],
@@ -1058,6 +1041,53 @@ async def list_tools() -> list[Tool]:
             },
             annotations=ToolAnnotations(
                 title="Inspect Controlled Catalog",
+                readOnlyHint=True,
+                destructiveHint=False,
+            ),
+        ),
+        Tool(
+            name="dump_schema",
+            description=(
+                "Return allowlisted table and column metadata grouped by table for "
+                "the selected database. Use this to pull a large schema in pages "
+                "instead of calling inspect_catalog once per table. kinds may only "
+                "be tables and/or columns; indexes and constraints stay on "
+                "inspect_catalog. " + TRUNCATION_GUIDANCE
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "kinds": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "string",
+                            "enum": ["tables", "columns"],
+                        },
+                        "description": (
+                            "Metadata sections to include. Defaults to tables and "
+                            "columns. Other catalog kinds remain on inspect_catalog."
+                        ),
+                    },
+                    "table_name": {
+                        "type": "string",
+                        "description": "Optional bare table name filter.",
+                    },
+                    "table": {
+                        "type": "string",
+                        "description": "Compatibility alias for table_name.",
+                    },
+                    **target_properties,
+                    "table_names": table_names_property,
+                    "table_pattern": table_pattern_property,
+                    "max_rows": result_properties["max_rows"],
+                    "offset": result_properties["offset"],
+                    "max_response_bytes": result_properties["max_response_bytes"],
+                    "timeout_ms": result_properties["timeout_ms"],
+                },
+            },
+            annotations=ToolAnnotations(
+                title="Dump Grouped Schema",
                 readOnlyHint=True,
                 destructiveHint=False,
             ),
@@ -1276,10 +1306,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
                 table = validate_identifier(table_name)
                 name_filter = f" AND TABLE_NAME = '{table}'"
             elif table_pattern is not None:
-                name_filter = (
-                    f" AND TABLE_NAME LIKE '{_table_pattern_sql(table_pattern)}' "
-                    "ESCAPE '\\\\'"
-                )
+                name_filter = table_pattern_filter(table_pattern)
             query = (
                 "SELECT TABLE_NAME, TABLE_TYPE, TABLE_ROWS, TABLE_COMMENT "
                 "FROM information_schema.TABLES "
@@ -1319,10 +1346,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
 
         if name == "get_schema_info":
             table_name = _table_argument(arguments)
-            names = arguments.get("table_names")
-            if table_name and names is not None:
-                raise ValueError("Use either table_name/table or table_names, not both")
-            filters = table_filter(names)
             table_database, schema_table = (
                 parse_table_arg(table_name) if table_name else (None, None)
             )
@@ -1336,8 +1359,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
             ):
                 raise ValueError("System database access is blocked")
             schema_filter = f"'{target.database}'" if target.database else "DATABASE()"
-            if schema_table:
-                filters += f" AND TABLE_NAME = '{schema_table}'"
+            filters = _metadata_name_filter(arguments, table=schema_table)
             detail = arguments.get("detail", False)
             if not isinstance(detail, bool):
                 raise ValueError("detail must be a boolean")
@@ -1347,14 +1369,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
                 query = (
                     "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT, "
                     "COLUMN_COMMENT FROM information_schema.COLUMNS "
-                    f"WHERE TABLE_SCHEMA = {schema_filter}{filters} ORDER BY ORDINAL_POSITION"
+                    f"WHERE TABLE_SCHEMA = {schema_filter}{filters} "
+                    "ORDER BY ORDINAL_POSITION, COLUMN_NAME"
                 )
             else:
                 query = (
                     "SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, IS_NULLABLE "
                     "FROM information_schema.COLUMNS "
                     f"WHERE TABLE_SCHEMA = {schema_filter}{filters} "
-                    "ORDER BY TABLE_NAME, ORDINAL_POSITION"
+                    "ORDER BY TABLE_NAME, ORDINAL_POSITION, COLUMN_NAME"
                 )
             return await run_query(
                 query,
@@ -1407,13 +1430,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
             target = load_connection_registry().resolve(connection, database)
             if not target.database:
                 raise ValueError("database is required for inspect_catalog")
-            if table_name and arguments.get("table_names") is not None:
-                raise ValueError("Use either table_name/table or table_names, not both")
             query = _catalog_query(
                 kind,
                 target.database,
-                catalog_table,
-                table_names=arguments.get("table_names"),
+                _metadata_name_filter(arguments, table=catalog_table),
             )
             return await run_query(
                 query,
@@ -1425,6 +1445,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
                 result_format=arguments.get("result_format"),
                 max_response_bytes=arguments.get("max_response_bytes"),
                 timeout_ms=arguments.get("timeout_ms"),
+            )
+
+        if name == "dump_schema":
+            return await _dump_schema(
+                arguments, connection=connection, database=database
             )
 
         raise ValueError(f"Unknown tool: {name}")
@@ -1535,8 +1560,11 @@ async def get_prompt(name: str, arguments: dict | None) -> GetPromptResult:
                             f"Target: {target_instruction}\n"
                             "1. Call list_databases when no database is selected, then "
                             "call list_tables for the target database.\n"
-                            "2. Call get_schema_info for relevant table_names, optionally detail=true. "
-                            "When truncated, continue with next_offset and identical filters until complete.\n"
+                            "2. Call inspect_catalog kind=columns or dump_schema for column "
+                            "metadata. When truncated, continue with next_offset and identical "
+                            "filters until complete; never treat one page as the full catalog. "
+                            "get_schema_info table_names (max 100) or detail=true can follow "
+                            "for selected tables.\n"
                             "3. Call get_table_sample on 2–3 representative tables to understand "
                             "data format and content.\n"
                             "4. Summarize: describe what each table stores, note relationships "
@@ -1995,6 +2023,127 @@ async def execute_query(
     return result
 
 
+async def _load_table_dump_meta(
+    names: list[str],
+    *,
+    connection: str | None,
+    database: str,
+    timeout_ms: int | None,
+    max_response_bytes: int | None,
+) -> dict[str, dict]:
+    """Fetch allowlisted table rows for names already present on a column page."""
+    meta: dict[str, dict] = {}
+    for start in range(0, len(names), MAX_TABLE_NAMES):
+        chunk = names[start : start + MAX_TABLE_NAMES]
+        result = await execute_query(
+            _catalog_query(
+                "tables",
+                database,
+                catalog_name_filter(table_names=chunk),
+            ),
+            connection=connection,
+            database=database,
+            internal=True,
+            max_rows=len(chunk),
+            offset=0,
+            result_format="json",
+            max_response_bytes=max_response_bytes,
+            timeout_ms=timeout_ms,
+        )
+        if result.truncated:
+            raise ValueError(
+                "dump_schema table metadata exceeded the page size; retry with a "
+                "smaller max_rows so this page names fewer tables"
+            )
+        meta.update(table_dump_meta(result.columns, result.rows))
+    return meta
+
+
+async def _dump_schema(
+    arguments: dict,
+    *,
+    connection: str | None,
+    database: str | None,
+) -> list[TextContent]:
+    """Page allowlisted table/column catalog rows and group them by table."""
+    kinds = parse_dump_schema_kinds(arguments.get("kinds"))
+    table_name = _table_argument(arguments)
+    catalog_table = validate_identifier(table_name) if table_name else None
+    target = load_connection_registry().resolve(connection, database)
+    if not target.database:
+        raise ValueError("database is required for dump_schema")
+    name_filter = _metadata_name_filter(arguments, table=catalog_table)
+    include_columns = "columns" in kinds
+    include_tables = "tables" in kinds
+    primary_kind = "columns" if include_columns else "tables"
+    result = await execute_query(
+        _catalog_query(primary_kind, target.database, name_filter),
+        connection=connection,
+        database=database,
+        internal=True,
+        max_rows=arguments.get("max_rows"),
+        offset=arguments.get("offset", 0),
+        result_format="json",
+        max_response_bytes=arguments.get("max_response_bytes"),
+        timeout_ms=arguments.get("timeout_ms"),
+    )
+    table_meta: dict[str, dict] = {}
+    if include_columns and include_tables and result.rows:
+        table_index = result.columns.index("TABLE_NAME")
+        names = list(dict.fromkeys(row[table_index] for row in result.rows))
+        table_meta = await _load_table_dump_meta(
+            names,
+            connection=connection,
+            database=target.database,
+            timeout_ms=arguments.get("timeout_ms"),
+            max_response_bytes=arguments.get("max_response_bytes"),
+        )
+
+    profile = load_connection_registry().get(result.connection)
+    budget = _response_budget(profile, arguments.get("max_response_bytes"))
+    rows = result.rows
+    truncated = result.truncated
+    text = ""
+    while True:
+        payload = {
+            key: value
+            for key, value in result.to_payload().items()
+            if key not in {"rows", "columns"}
+        }
+        payload.update(
+            {
+                "kinds": list(kinds),
+                "tables": group_schema_dump(
+                    result.columns,
+                    rows,
+                    table_meta=table_meta or None,
+                    include_columns=include_columns,
+                ),
+                "returned_rows": len(rows),
+                "row_count": len(rows),
+                "truncated": truncated,
+                "next_offset": result.offset + len(rows) if truncated else None,
+            }
+        )
+        text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        if len(text.encode("utf-8")) <= budget:
+            break
+        if not rows:
+            raise QueryFailure(
+                "RESULT_TOO_LARGE",
+                "The grouped schema header exceeds the response budget.",
+                "Request fewer kinds or a narrower table_pattern; retry the same offset.",
+                connection=result.connection,
+                database=result.database,
+                query_id=result.query_id,
+                offset=result.offset,
+                max_response_bytes=budget,
+            )
+        rows = rows[:-1]
+        truncated = True
+    return [TextContent(type="text", text=text)]
+
+
 async def run_query(
     query: str,
     *,
@@ -2299,7 +2448,8 @@ async def _run_streamable_http_server():
     """Run the MCP server over the standard Streamable HTTP transport."""
     try:
         import uvicorn
-        from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+        from mcp.server.streamable_http_manager import \
+            StreamableHTTPSessionManager
         from mcp.server.transport_security import TransportSecuritySettings
         from starlette.applications import Starlette
         from starlette.responses import Response
