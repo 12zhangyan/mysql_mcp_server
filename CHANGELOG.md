@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Add `explain_sql` for estimated SELECT/CTE/UNION execution plans through the
+  existing read-only, database-scope, audit, masking and budget controls. Plan
+  pagination preserves the original query's LIMIT/OFFSET; ANALYZE is rejected.
+- Classify server/client timeouts, lock waits, deadlocks, connection failures,
+  disconnects and connection-limit errors with safe recovery guidance and
+  explicit retryability, without adding automatic query replay.
+- Exercise plan discovery and structured error delivery over a real MCP STDIO
+  session with a mocked database adapter.
+
+### Fixed
+- Pass an explicit schema to SQLGlot lineage tracing for 30.22 compatibility,
+  preserving sensitive-column masking through CTE aliases and UNION queries.
+- Sanitize parser failures as SQL_PARSE_ERROR with numeric coordinates and a
+  query fingerprint; never return SQLGlot exception text or SQL literals.
+- Classify Connector/Python ReadTimeoutError/WriteTimeoutError as QUERY_TIMEOUT,
+  discard the active connection and skip automatic replay. Limit the legacy
+  errno=-1 retry to InterfaceError during execute/fetch.
+- Preserve complete explain_sql plan cells. Oversized rows direct callers to
+  budgeted JSON plan chunks with continuation offsets and a plan fingerprint;
+  changed plans cannot be silently combined between pages.
+- Reject optimizer hints that override session variables, statement timeouts or
+  resource groups. Ordinary optimizer hints are no longer mistaken for UDFs.
+- Return local deadline errors as structured QUERY_TIMEOUT results, and audit
+  server-side statement timeouts as timeout outcomes.
+
 ## [0.9.1] - 2026-09-15
 
 ### Added

@@ -584,6 +584,13 @@ async def test_query_timeout_closes_socket_and_returns_explicit_error():
 
     assert query_started.is_set()
     assert "exceeded 500 ms" in response[0].text
+    assert response.isError
+    assert response.structuredContent["code"] == "QUERY_TIMEOUT"
+    assert response.structuredContent["phase"] == "deadline"
+    assert response.structuredContent["timeout_ms"] == 500
+    assert response.structuredContent["database"] == "app"
+    assert response.structuredContent["retryable"] is False
+    assert json.loads(response[0].text) == response.structuredContent
     connection.shutdown.assert_called_once_with()
 
 

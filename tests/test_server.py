@@ -38,13 +38,14 @@ def test_sse_bearer_token_has_minimum_length():
 async def test_list_tools():
     """Test that list_tools returns expected tools."""
     tools = await list_tools()
-    assert len(tools) == 11
+    assert len(tools) == 12
     assert any(t.name == "list_connections" for t in tools)
     assert any(t.name == "validate_connections" for t in tools)
     assert any(t.name == "check_connection" for t in tools)
     assert any(t.name == "list_databases" for t in tools)
     assert any(t.name == "list_tables" for t in tools)
     assert any(t.name == "execute_sql" for t in tools)
+    assert any(t.name == "explain_sql" for t in tools)
     assert any(t.name == "query" for t in tools)
     assert any(t.name == "get_schema_info" for t in tools)
     assert any(t.name == "get_table_sample" for t in tools)
@@ -363,6 +364,7 @@ async def test_query_compatibility_alias_uses_read_only_runner(monkeypatch):
 
     runner.assert_awaited_once_with(
         "SELECT id FROM users",
+        explain=False,
         connection="legacy",
         database="app",
         max_rows=None,
