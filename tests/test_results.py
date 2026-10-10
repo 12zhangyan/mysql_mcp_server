@@ -3,6 +3,8 @@ import json
 from datetime import datetime
 from decimal import Decimal
 
+import pytest
+
 from mysql_mcp_server.config import DEFAULT_MASK_COLUMNS
 from mysql_mcp_server.results import (MASKED_VALUE, QueryResult,
                                       mask_result_rows, serialize_value)
@@ -59,9 +61,24 @@ def test_large_cell_is_truncated_deterministically():
     assert serialize_value("abcdefgh", 4) == "abcd…[truncated]"
 
 
-def test_sensitive_results_are_masked_across_aliases_and_ctes():
+@pytest.mark.parametrize(
+    "query",
+    [
+        "WITH source AS (SELECT password AS value FROM users) "
+        "SELECT value AS safe FROM source",
+        "WITH source AS (SELECT password AS value, status FROM users) "
+        "SELECT value AS safe, status FROM source",
+        "WITH source AS (SELECT password AS value, status FROM users), "
+        "wrapped AS (SELECT value AS harmless, status FROM source) "
+        "SELECT harmless AS safe, status FROM wrapped",
+        "WITH source AS (SELECT password AS value, status FROM users) "
+        "SELECT value AS safe, status FROM source "
+        "UNION ALL SELECT value AS safe, status FROM source",
+    ],
+)
+def test_sensitive_results_are_masked_across_aliases_and_ctes(query):
     rows, masked = mask_result_rows(
-        "WITH source AS (SELECT password AS value FROM users) SELECT value AS safe FROM source",
+        query,
         ["safe", "status"],
         [["secret", "active"]],
         ("password",),

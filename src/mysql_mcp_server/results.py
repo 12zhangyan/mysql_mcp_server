@@ -77,7 +77,7 @@ def _result_source_candidates(query: str, columns: list[str]) -> list[set[str] |
         for column_name in columns:
             query_candidates: set[str] = set()
             try:
-                node = lineage(column_name, statement, dialect="mysql")
+                node = lineage(column_name, statement, schema={}, dialect="mysql")
                 for lineage_node in node.walk():
                     query_candidates.update(_name_candidates(str(lineage_node.name)))
             except Exception:
@@ -92,7 +92,7 @@ def _result_source_candidates(query: str, columns: list[str]) -> list[set[str] |
         for column_name in columns:
             mismatched_candidates: set[str] = set()
             try:
-                node = lineage(column_name, statement, dialect="mysql")
+                node = lineage(column_name, statement, schema={}, dialect="mysql")
                 for lineage_node in node.walk():
                     mismatched_candidates.update(
                         _name_candidates(str(lineage_node.name))
@@ -124,7 +124,7 @@ def _result_source_candidates(query: str, columns: list[str]) -> list[set[str] |
             for candidate in _column_candidates(column)
         }
         try:
-            node = lineage(alias, traced_statement, dialect="mysql")
+            node = lineage(alias, traced_statement, schema={}, dialect="mysql")
             for lineage_node in node.walk():
                 candidates.update(_name_candidates(str(lineage_node.name)))
         except Exception:

@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   session with a mocked database adapter.
 
 ### Fixed
+- Pass an explicit schema to SQLGlot lineage tracing for 30.22 compatibility,
+  preserving sensitive-column masking through CTE aliases and UNION queries.
 - Sanitize parser failures as SQL_PARSE_ERROR with numeric coordinates and a
   query fingerprint; never return SQLGlot exception text or SQL literals.
 - Classify Connector/Python ReadTimeoutError/WriteTimeoutError as QUERY_TIMEOUT,
