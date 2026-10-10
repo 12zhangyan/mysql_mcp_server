@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import csv
+import hashlib
 import io
 import json
 from dataclasses import dataclass, field, replace
@@ -22,7 +23,7 @@ TRUNCATION_SUFFIX = "…[truncated]"
 MASKED_VALUE = "[REDACTED]"
 
 
-def serialize_value(value: Any, max_length: int) -> Any:
+def serialize_value(value: Any, max_length: int | None) -> Any:
     if value is None or isinstance(value, (bool, int, float)):
         return value
     if isinstance(value, Decimal):
@@ -37,7 +38,7 @@ def serialize_value(value: Any, max_length: int) -> Any:
     else:
         value = str(value)
 
-    if len(value) > max_length:
+    if max_length is not None and len(value) > max_length:
         return value[:max_length] + TRUNCATION_SUFFIX
     return value
 
@@ -248,6 +249,7 @@ class QueryResult:
     content_truncated: bool = False
     truncation_reasons: tuple[str, ...] = ()
     queue_wait_ms: int = 0
+    plan: dict[str, Any] | None = None
 
     @property
     def next_offset(self) -> int | None:
@@ -274,7 +276,64 @@ class QueryResult:
             "content_truncated": self.content_truncated,
             "truncation_reasons": list(self.truncation_reasons),
             "queue_wait_ms": self.queue_wait_ms,
+            **({"plan": self.plan} if self.plan is not None else {}),
         }
+
+    def plan_chunks(
+        self, *, max_rows: int, chunk_size: int, expected_plan_id: str | None
+    ) -> QueryResult:
+        """Page a masked JSON plan as lossless, stable-sized character chunks."""
+        if (
+            len(self.rows) != 1
+            or len(self.columns) != 1
+            or len(self.rows[0]) != 1
+            or not isinstance(self.rows[0][0], str)
+            or self.truncated
+        ):
+            raise QueryFailure(
+                "PLAN_FORMAT_UNSUPPORTED",
+                "The database did not return a single JSON execution plan.",
+                "Check server support for EXPLAIN FORMAT=JSON, or retry explain_sql "
+                "with plan_output=rows; do not treat this as a complete plan.",
+            )
+        text = self.rows[0][0]
+        fingerprint = hashlib.sha256()
+        fingerprint.update(
+            json.dumps(
+                [self.connection, self.database, self.query_id, chunk_size],
+                ensure_ascii=False,
+            ).encode("utf-8")
+        )
+        fingerprint.update(text.encode("utf-8"))
+        plan_id = fingerprint.hexdigest()
+        if expected_plan_id is not None and expected_plan_id != plan_id:
+            raise QueryFailure(
+                "PLAN_CHANGED",
+                "The execution plan or its chunking context changed between pages.",
+                "Discard previously collected chunks and restart at offset=0 "
+                "without expected_plan_id; never combine different plan versions.",
+            )
+        total = max(1, (len(text) + chunk_size - 1) // chunk_size)
+        end = min(total, self.offset + max_rows)
+        truncated = end < total
+        return replace(
+            self,
+            columns=["part", "text"],
+            rows=[
+                [index, text[index * chunk_size : (index + 1) * chunk_size]]
+                for index in range(self.offset, end)
+            ],
+            truncated=truncated,
+            truncation_reasons=("row_limit",) if truncated else (),
+            content_truncated=False,
+            masked_columns=["text"] if self.masked_columns else [],
+            plan={
+                "id": plan_id,
+                "characters": len(text),
+                "total_chunks": total,
+                "chunk_size": chunk_size,
+            },
+        )
 
     def fit_response(self, result_format: str, max_bytes: int) -> QueryResult:
         """Keep whole rows, accounting for the exact UTF-8 rendered envelope."""

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from mysql.connector.errors import InterfaceError, ReadTimeoutError, WriteTimeoutError
 
 class QueryFailure(RuntimeError):
     def __init__(
@@ -30,9 +31,79 @@ class QueryFailure(RuntimeError):
         super().__init__(f"{message} ({reference})" if reference else message)
 
 
+def retryable_connector_read(exc: Exception, *, phase: str) -> bool:
+    """Retain the narrow legacy InterfaceError retry, never replay socket timeouts."""
+    return (
+        isinstance(exc, InterfaceError)
+        and getattr(exc, "errno", None) == -1
+        and phase in {"execute", "fetch"}
+    )
+
+
 def database_failure(exc, *, phase: str, **context: Any) -> QueryFailure:
     errno = getattr(exc, "errno", None)
+    if isinstance(exc, (ReadTimeoutError, WriteTimeoutError)):
+        return QueryFailure(
+            "QUERY_TIMEOUT",
+            "The database socket operation exceeded its read or write time limit.",
+            "Check database and network health; reduce the query scope or inspect "
+            "its plan with explain_sql before retrying. The query was not replayed "
+            "automatically and no partial result was delivered.",
+            error_type=type(exc).__name__,
+            phase=phase,
+            errno=errno,
+            sqlstate=getattr(exc, "sqlstate", None),
+            **context,
+        )
+    canonical_errno = (
+        {
+            1109: 1146,
+            1969: 3024,
+            1203: 1040,
+            2002: 2003,
+            2005: 2003,
+            2006: 2013,
+            2055: 2013,
+        }.get(errno, errno)
+        if isinstance(errno, int)
+        else None
+    )
     code, message, action = {
+        3024: (
+            "QUERY_TIMEOUT",
+            "The database stopped the query after its execution time limit.",
+            "Reduce the query scope or inspect its plan with explain_sql. Do not repeat an expensive query unchanged or raise profile limits automatically.",
+        ),
+        1205: (
+            "LOCK_WAIT_TIMEOUT",
+            "The query exceeded the database lock wait limit.",
+            "Ask the database owner to inspect blocking transactions or schema changes. Retry with backoff only after contention subsides; do not kill sessions automatically.",
+        ),
+        1213: (
+            "DEADLOCK",
+            "The database stopped the transaction after detecting a deadlock.",
+            "Retry the read-only query with bounded backoff. If the deadlock recurs, ask the database owner to inspect concurrent transactions.",
+        ),
+        1040: (
+            "CONNECTION_BUSY",
+            "The database connection limit has been reached.",
+            "Reduce concurrency and retry with bounded backoff on the same connection; ask the database owner to check capacity if this persists.",
+        ),
+        2003: (
+            "CONNECTION_FAILED",
+            "A connection to the selected database could not be established.",
+            "Check the configured target, network and database availability. Retry only after connectivity is restored; do not switch environments automatically.",
+        ),
+        2013: (
+            "CONNECTION_LOST",
+            "The connection was lost before the complete result was received.",
+            "Check database and network health, then retry the same page with bounded backoff. An incomplete response is not a successful result; do not switch environments automatically.",
+        ),
+        1317: (
+            "QUERY_INTERRUPTED",
+            "The database interrupted the query.",
+            "Confirm why the query was cancelled before running it again; do not automatically repeat an interrupted query.",
+        ),
         1146: (
             "TABLE_NOT_FOUND",
             "A referenced table does not exist in the selected database.",
@@ -69,7 +140,7 @@ def database_failure(exc, *, phase: str, **context: Any) -> QueryFailure:
             "Ask the connection owner to verify read permissions; do not switch identities automatically.",
         ),
     }.get(
-        1146 if errno == 1109 else errno if isinstance(errno, int) else 0,
+        canonical_errno if isinstance(canonical_errno, int) else 0,
         (
             "DATABASE_QUERY_FAILED",
             "MySQL read-only query failed",
@@ -80,6 +151,7 @@ def database_failure(exc, *, phase: str, **context: Any) -> QueryFailure:
         code,
         message,
         action,
+        retryable=errno in {1040, 1203, 1205, 1213, 2002, 2003, 2006, 2013, 2055},
         error_type=type(exc).__name__,
         phase=phase,
         errno=errno,

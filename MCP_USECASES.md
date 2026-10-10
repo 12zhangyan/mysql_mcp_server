@@ -52,7 +52,27 @@ Sampling is bounded in MySQL with `LIMIT`/`OFFSET` before rows are fetched.
 A single metadata page is not the complete catalog; continue with `next_offset`
 until `truncated` is false. Direct `information_schema` SQL stays blocked.
 
-## 4. Run read-only analysis
+## 4. Inspect a plan before expensive analysis
+
+Call `explain_sql({"connection":"test","database":"orders_test","query":"SELECT id FROM orders WHERE status = 'open' ORDER BY id LIMIT 20","result_format":"json"})`.
+Pass the original SELECT/WITH query without an EXPLAIN prefix. The tool retains
+its LIMIT/OFFSET and uses ordinary EXPLAIN, never EXPLAIN ANALYZE. Plan estimates
+are not measured runtime. Tool max_rows/offset page the plan, not the underlying
+query. Database scope, function checks, audit, masking and budgets still apply.
+
+Long plan cells are returned whole. If the first row exceeds the response budget,
+retry with `plan_output="chunks"` and `offset=0` (json is the default in this mode).
+Save `plan.id` and continue with `offset=next_offset` and `expected_plan_id=plan.id`.
+Concatenate the `text` fields in `part` order until `truncated=false`. Chunks use
+EXPLAIN FORMAT=JSON and are masked before splitting. PLAN_CHANGED means discard
+previous chunks and restart; each page regenerates the plan instead of caching it.
+
+A QUERY_TIMEOUT calls for reducing query scope or inspecting its plan, not
+blindly repeating it. LOCK_WAIT_TIMEOUT/DEADLOCK and CONNECTION_BUSY call for
+bounded backoff after contention subsides. CONNECTION_FAILED/CONNECTION_LOST
+require connectivity checks before retrying the same target and page.
+
+## 5. Run read-only analysis
 
 `execute_sql` accepts one `SELECT`, `WITH`, `SHOW`, `DESCRIBE`, `DESC`, `EXPLAIN`,
 or `TABLE` statement.

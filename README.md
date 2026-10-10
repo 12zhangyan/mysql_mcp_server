@@ -339,7 +339,7 @@ Claude Desktop、Codex 等宿主通常从自己的目录启动 MCP 服务，未�
 - 必填参数：`query`
 - 可选参数：`connection`、`database`、`max_rows`、`offset`、`timeout_ms`、`max_response_bytes`、`result_format`、`audit_context`
 - 允许：`SELECT`、`WITH`、受数据库范围约束的 `SHOW`（包括 `SHOW CREATE TABLE/VIEW`）、`DESCRIBE`、`DESC`、`EXPLAIN`、`TABLE`
-- 始终拦截：DML、DDL、`USE`、事务控制、锁、`SELECT ... INTO`、会话变量赋值、MySQL 可执行注释和多语句
+- 始终拦截：DML、DDL、`USE`、事务控制、锁、`SELECT ... INTO`、会话变量赋值、MySQL 可执行注释和多语句；禁止 `SET_VAR`、`MAX_EXECUTION_TIME`、`RESOURCE_GROUP` 优化器提示覆盖连接策略，需要缩短超时时使用 `timeout_ms`
 - 函数策略：默认拦截无法识别的存储函数/UDF；只有 `allowed_functions` 中经过审核的确定性函数可放行
 - 纵深防御：连接前先校验；随后在 `START TRANSACTION READ ONLY` 中执行并回滚
 - 分页：对适用的 `SELECT`/CTE/UNION 下推 `LIMIT max_rows+1 OFFSET offset`，完整消费该有界结果后再回滚；JSON 结果返回 `truncated` 和 `next_offset`
@@ -347,8 +347,24 @@ Claude Desktop、Codex 等宿主通常从自己的目录启动 MCP 服务，未�
 - 超时/取消：统一限制完整操作、Connector socket 和 MySQL/MariaDB 语句时间；取消请求会关闭活动连接，无需 `KILL` 权限
 - 格式：`json` 保留数据类型和元信息；`csv` 保持原有格式，使用标准引号规则，并明确表示 `NULL`；`compact` 第一行是 JSON 元信息，后面是 CSV 数据，保留目标库、路由、脱敏字段和分页信息。需要区分 SQL NULL 与字符串 `NULL` 时使用 JSON。
 - 审计归因：`audit_context` 支持 `actor`、`purpose`、`ticket_id`，配置可要求调用前必须提供指定字段
-- 临时故障恢复：Connector/Python 客户端侧 `errno=-1` 会重试一次；表不存在、字段不存在、语法和权限错误不会自动重试。
+- 临时故障恢复：仅执行/取数阶段的 Connector/Python `InterfaceError(errno=-1)` 保留一次兼容重试。`ReadTimeoutError` / `WriteTimeoutError` 不重放，统一返回 `QUERY_TIMEOUT` 并丢弃活动连接；其他未知 `errno=-1`、表不存在、字段不存在、语法和权限错误不会自动重试。
 - 首次查询或结构不确定时先用 `list_tables` / `get_schema_info` 确认真实名称；每次传入一致的 `connection`、`database`。收到确定性 SQL 错误后核对元数据再改 SQL，不自动换库或改表名执行。
+
+### `explain_sql`
+
+对原始 `SELECT` / `WITH`（含 UNION）生成普通 `EXPLAIN` 执行计划，便于先检查索引、连接顺序和预估扫描行数。
+
+- 必填 `query`，传入原 SQL；不要添加 `EXPLAIN` 前缀。拒绝写语句、多语句和 `EXPLAIN ANALYZE`。
+- 可选参数与 `execute_sql` 一致，复用数据库白名单、函数策略、只读事务、审计、脱敏、超时和响应预算。
+- 保留原 SQL 中的 `LIMIT/OFFSET`；工具参数 `max_rows/offset` 只分页执行计划，避免为诊断修改原查询。
+- 默认 `plan_output=rows` 返回数据库的计划结果，格式取决于服务器设置。保留完整计划单元格，不再受普通数据的 `max_cell_length` 截断；首行超响应预算时明确返回 `RESULT_TOO_LARGE` 并提示切换分片，不交付残缺计划。
+- `plan_output=chunks` 显式请求 `EXPLAIN FORMAT=JSON`；先按原规则脱敏，再把计划文本拆成固定长度的 `part/text` 行。此时 `offset/max_rows` 针对分片，响应仍受 UTF-8 字节预算限制。默认使用 `json`，也可选 `compact`；不接受缺少计划元信息的 `csv`。
+- 第一页保留 `plan.id`。续页传 `offset=next_offset` 和 `expected_plan_id=plan.id`，按 `part` 顺序拼接 `text`，直到 `truncated=false`。分片长度、总字符数和总片数在 `plan` 中。每页重新生成计划；计划、目标或分片上下文变化时返回 `PLAN_CHANGED`，需丢弃旧片段并从 0 重取，避免混合版本。
+- 计划是估算信息，不代表实际执行耗时；工具不会自动建索引、更新统计信息或运行 ANALYZE。分片模式需要服务器支持 `EXPLAIN FORMAT=JSON`，不会自动切换到 ANALYZE 或其他数据库。
+
+```json
+{"query":"SELECT id FROM orders WHERE status = 'open' ORDER BY id LIMIT 20","connection":"dev","database":"app_dev","result_format":"json"}
+```
 
 ### `query`
 
@@ -413,12 +429,19 @@ Claude Desktop、Codex 等宿主通常从自己的目录启动 MCP 服务，未�
 
 数据库错误通过 MCP `isError=true` 返回，文本为 JSON，同时提供 `structuredContent`。字段包含 `code`、`message`、`retryable`、`next_action`、安全的错误码/阶段、实际连接/库、请求的连接/库、`route_applied` 和 `query_id`。不透传驱动原始错误、SQL 文本、密码或主机连接信息。
 
+- `SQL_PARSE_ERROR`：连接前解析失败；只返回固定消息、可用的数字行列位置和查询指纹，不回显 SQL、字面量、解析器上下文或 ANSI 高亮。
 - `TABLE_NOT_FOUND`：1146/1109，先核对目标库并发现真实表名。
 - `COLUMN_NOT_FOUND`：1054，检查字段和别名。
 - `SQL_SYNTAX_ERROR`：1064，核对 MySQL 语法。
 - `DATABASE_NOT_FOUND`、`AUTHENTICATION_FAILED`、`ACCESS_DENIED`：核对配置和只读权限。
-- `CONNECTION_BUSY`：可稍后重试；不会自动切换环境。
-- `RESULT_TOO_LARGE`：缩小字段投影后从原 offset 重查。
+- `QUERY_TIMEOUT`：MySQL 3024、MariaDB 1969、驱动读写超时或本地完整调用截止时间；先缩小查询范围或用 `explain_sql` 检查计划，不直接重复昂贵查询。本地截止时间使用 `phase=deadline` 并携带 `timeout_ms`。
+- `LOCK_WAIT_TIMEOUT` / `DEADLOCK`：1205 / 1213，检查并发事务或 DDL，在阻塞缓解后有限退避重试。
+- `CONNECTION_FAILED` / `CONNECTION_LOST`：连接建立失败或结果接收中断；先核对网络和目标连接，中断结果不得当作完整结果。
+- `QUERY_INTERRUPTED`：1317，先确认取消原因，不自动重新执行。
+- `CONNECTION_BUSY`：本地队列拥塞，或 MySQL 1040/1203 连接数超限；降低并发后有限退避重试，不会自动切换环境。
+- `retryable=true` 表示恢复后可由调用方有限重试，不会触发本服务新增自动重放；未知主机 2005、查询超时及主动中断均为 `false`。
+- `RESULT_TOO_LARGE`：普通查询缩小字段投影后从原 offset 重查；执行计划改用 `plan_output=chunks` 从 0 获取。
+- `PLAN_CHANGED`：计划续页指纹不一致，丢弃已收集分片并从 0 重取；`PLAN_FORMAT_UNSUPPORTED` 表示服务器没有返回预期的单行 JSON 计划。
 
 示例调用：
 

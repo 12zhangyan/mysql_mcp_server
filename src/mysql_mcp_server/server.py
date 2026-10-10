@@ -19,6 +19,7 @@ from mcp.types import (CallToolResult, GetPromptResult, Prompt, PromptArgument,
                        PromptMessage, Resource, ResourceTemplate, TextContent,
                        Tool, ToolAnnotations)
 from mysql.connector import Error, connect
+from mysql.connector.errors import ReadTimeoutError, WriteTimeoutError
 from pydantic import AnyUrl
 from sqlglot import exp
 
@@ -27,7 +28,7 @@ from .audit import (AuditWriteError, audit_sink, build_audit_context,
                     set_audit_context, validate_required_audit_context)
 from .config import (ConnectionProfile, build_connector_config,
                      ensure_database_allowed, load_connection_registry)
-from .errors import QueryFailure, database_failure
+from .errors import QueryFailure, database_failure, retryable_connector_read
 from .metadata import (MAX_TABLE_NAMES, catalog_name_filter,
                        detailed_schema_sql, group_schema_dump,
                        parse_dump_schema_kinds, search_tables_sql,
@@ -37,9 +38,14 @@ from .results import (TRUNCATION_SUFFIX, QueryResult, mask_result_rows,
 from .runtime import (QueryControl, QueryLease, close_runtime_resources,
                       connection_pool_manager, query_admission,
                       ssh_tunnel_manager)
-from .sql_guard import (query_fingerprint, query_type,
-                        validate_database_access, validate_function_safety,
-                        validate_read_only_query)
+from .sql_guard import (
+    build_explain_query,
+    query_fingerprint,
+    query_type,
+    validate_database_access,
+    validate_function_safety,
+    validate_read_only_query,
+)
 
 # Load environment variables from .env file if it exists.
 # This allows for easy local configuration of database and SSH credentials.
@@ -898,6 +904,52 @@ async def list_tools() -> list[Tool]:
             ),
         ),
         Tool(
+            name="explain_sql",
+            description=(
+                "Inspect the estimated execution plan for a SELECT/WITH query "
+                "before running an expensive query. Pass the original SQL without "
+                "EXPLAIN; ANALYZE, writes and multiple statements are rejected. "
+                "Preserves the query's original LIMIT/OFFSET; max_rows/offset page "
+                "the plan only. Uses the same database allowlist, function policy, "
+                "timeouts, masking and audit as execute_sql. Estimates are not "
+                "measured execution time. Long plan cells are kept complete; if "
+                "the response is too large, use plan_output=chunks and follow "
+                "next_offset with expected_plan_id from plan.id. " + TRUNCATION_GUIDANCE
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "One SELECT or WITH query, without EXPLAIN.",
+                    },
+                    "plan_output": {
+                        "type": "string",
+                        "enum": ["rows", "chunks"],
+                        "default": "rows",
+                        "description": "rows keeps complete plan cells. chunks requests "
+                        "EXPLAIN FORMAT=JSON and pages its masked text as part/text rows; "
+                        "concatenate text in part order. offset/max_rows count chunks. "
+                        "Uses json by default; json/compact are required to carry plan.id.",
+                    },
+                    "expected_plan_id": {
+                        "type": "string",
+                        "pattern": "^[a-f0-9]{64}$",
+                        "description": "For chunks, required when offset>0. Copy plan.id "
+                        "from the first page; PLAN_CHANGED means restart at offset=0.",
+                    },
+                    **target_properties,
+                    **result_properties,
+                },
+                "required": ["query"],
+            },
+            annotations=ToolAnnotations(
+                title="Explain Read-Only SQL",
+                readOnlyHint=True,
+                destructiveHint=False,
+            ),
+        ),
+        Tool(
             name="query",
             description=(
                 "Compatibility alias for execute_sql. Executes one strictly "
@@ -1329,12 +1381,21 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
                 timeout_ms=arguments.get("timeout_ms"),
             )
 
-        if name in {"execute_sql", "query"}:
+        if name in {"execute_sql", "query", "explain_sql"}:
             query_argument = arguments.get("query")
             if not isinstance(query_argument, str):
                 raise ValueError("Query is required")
             return await run_query(
                 query_argument,
+                explain=name == "explain_sql",
+                **(
+                    {
+                        "plan_output": arguments.get("plan_output", "rows"),
+                        "expected_plan_id": arguments.get("expected_plan_id"),
+                    }
+                    if name == "explain_sql"
+                    else {}
+                ),
                 connection=connection,
                 database=database,
                 max_rows=arguments.get("max_rows"),
@@ -1691,6 +1752,9 @@ async def execute_query(
     internal: bool = False,
     bounded_result: bool = False,
     result_format: str | None = None,
+    explain: bool = False,
+    plan_output: str = "rows",
+    expected_plan_id: str | None = None,
 ) -> QueryResult:
     """Execute one validated query with policy, timeout, cancellation and paging."""
     registry = load_connection_registry()
@@ -1720,7 +1784,23 @@ async def execute_query(
         if not ready:
             raise ValueError(readiness)
         validate_required_audit_context(profile, current_audit_context())
-        query = validate_read_only_query(query)
+        if plan_output not in {"rows", "chunks"} or (
+            not explain and plan_output != "rows"
+        ):
+            raise ValueError("plan_output must be rows, or chunks for explain_sql")
+        if expected_plan_id is not None and (
+            plan_output != "chunks"
+            or not isinstance(expected_plan_id, str)
+            or re.fullmatch(r"[a-f0-9]{64}", expected_plan_id) is None
+        ):
+            raise ValueError(
+                "expected_plan_id requires chunks and a 64-character lowercase hex ID"
+            )
+        query = (
+            build_explain_query(query, json_plan=plan_output == "chunks")
+            if explain
+            else validate_read_only_query(query)
+        )
         if selected_database in SYSTEM_DATABASES and not profile.allow_system_databases:
             raise ValueError(
                 f"System database '{selected_database}' is blocked for connection "
@@ -1735,7 +1815,13 @@ async def execute_query(
         )
         validate_function_safety(query, allowed_functions=profile.allowed_functions)
 
-        selected_format = result_format or profile.result_format
+        selected_format = result_format or (
+            "json" if plan_output == "chunks" else profile.result_format
+        )
+        if plan_output == "chunks" and selected_format not in {"json", "compact"}:
+            raise ValueError(
+                "plan_output=chunks requires result_format=json or compact"
+            )
         if selected_format not in {"csv", "json", "compact"}:
             raise ValueError("result_format must be csv, json or compact")
         response_budget = _response_budget(profile, max_response_bytes)
@@ -1747,6 +1833,10 @@ async def execute_query(
         page_offset = int(offset)
         if not 0 <= page_offset <= 1_000_000:
             raise ValueError("offset must be between 0 and 1000000")
+        if plan_output == "chunks" and page_offset > 0 and expected_plan_id is None:
+            raise ValueError(
+                "expected_plan_id is required when paging plan chunks after offset=0"
+            )
         reported_offset = page_offset if result_offset is None else int(result_offset)
         if not 0 <= reported_offset <= 1_000_000:
             raise ValueError("result offset must be between 0 and 1000000")
@@ -1771,6 +1861,16 @@ async def execute_query(
             route_applied=target.route_applied,
         )
     except Exception as exc:
+        if isinstance(exc, QueryFailure):
+            for key, value in {
+                "connection": profile.name,
+                "database": selected_database,
+                "requested_connection": target.requested_connection,
+                "requested_database": target.requested_database,
+                "route_applied": target.route_applied,
+                "query_id": query_fingerprint(query),
+            }.items():
+                exc.payload.setdefault(key, value)
         _write_audit_event(
             profile,
             query=query,
@@ -1824,7 +1924,11 @@ async def execute_query(
                         )
 
                     phase = "fetch"
-                    remaining = page_offset if executed_query == query else 0
+                    remaining = (
+                        page_offset
+                        if executed_query == query and plan_output != "chunks"
+                        else 0
+                    )
                     while remaining:
                         skipped = cursor.fetchmany(size=min(remaining, 1000))
                         if not skipped:
@@ -1834,17 +1938,20 @@ async def execute_query(
                     columns = [
                         str(description[0]) for description in cursor.description
                     ]
-                    if bounded_result:
+                    if plan_output == "chunks":
+                        raw_rows = list(cursor.fetchmany(size=2))
+                    elif bounded_result:
                         raw_rows = list(cursor.fetchall())
                     elif executed_query != query:
                         raw_rows = list(cursor.fetchall())
                     else:
                         raw_rows = list(cursor.fetchmany(size=row_limit + 1))
-                    truncated = len(raw_rows) > row_limit
+                    fetch_limit = 1 if plan_output == "chunks" else row_limit
+                    truncated = len(raw_rows) > fetch_limit
                     discard_connection = (
                         truncated and not bounded_result and executed_query == query
                     )
-                    raw_rows = raw_rows[:row_limit]
+                    raw_rows = raw_rows[:fetch_limit]
                     rows, masked_columns = mask_result_rows(
                         query,
                         columns,
@@ -1853,17 +1960,19 @@ async def execute_query(
                     )
                     serialized_rows = [
                         [
-                            serialize_value(value, profile.max_cell_length)
+                            serialize_value(
+                                value, None if explain else profile.max_cell_length
+                            )
                             for value in row
                         ]
                         for row in rows
                     ]
-                    content_truncated = any(
+                    content_truncated = not explain and any(
                         isinstance(value, str) and value.endswith(TRUNCATION_SUFFIX)
                         for row in serialized_rows
                         for value in row
                     )
-                    return QueryResult(
+                    result = QueryResult(
                         connection=profile.name,
                         database=config.get("database"),
                         columns=columns,
@@ -1887,10 +1996,31 @@ async def execute_query(
                         requested_connection=target.requested_connection,
                         requested_database=target.requested_database,
                         route_applied=target.route_applied,
-                    ).fit_response(selected_format, response_budget)
+                    )
+                    if plan_output == "chunks":
+                        result = result.plan_chunks(
+                            max_rows=row_limit,
+                            chunk_size=min(256, profile.max_cell_length),
+                            expected_plan_id=expected_plan_id,
+                        )
+                    try:
+                        return result.fit_response(selected_format, response_budget)
+                    except QueryFailure as exc:
+                        if (
+                            explain
+                            and plan_output == "rows"
+                            and exc.payload["code"] == "RESULT_TOO_LARGE"
+                        ):
+                            exc.payload["next_action"] = (
+                                "Retry explain_sql with plan_output=chunks, offset=0 and "
+                                "result_format=json. Follow next_offset with expected_plan_id "
+                                "from plan.id to retrieve the complete plan. No partial plan was delivered."
+                            )
+                        raise
             except Error as exc:
-                errno = getattr(exc, "errno", None)
-                if errno == -1 and attempt == 0:
+                if isinstance(exc, (ReadTimeoutError, WriteTimeoutError)):
+                    discard_connection = True
+                if attempt == 0 and retryable_connector_read(exc, phase=phase):
                     logger.warning(
                         "Retrying transient Connector/Python read failure "
                         "(connection=%s, phase=%s, error_type=%s)",
@@ -1916,7 +2046,7 @@ async def execute_query(
                             connection_object.shutdown()
                         except Exception:
                             logger.debug(
-                                "Socket shutdown failed for truncated result cleanup"
+                                "Socket shutdown failed during result or timeout cleanup"
                             )
                     else:
                         try:
@@ -1957,8 +2087,21 @@ async def execute_query(
             requested_database=target.requested_database,
             route_applied=target.route_applied,
         )
-        raise TimeoutError(
-            f"Read-only query exceeded {effective_timeout} ms and was cancelled"
+        raise QueryFailure(
+            "QUERY_TIMEOUT",
+            f"Read-only query exceeded {effective_timeout} ms and was cancelled",
+            "Reduce the query scope or inspect its plan with explain_sql; "
+            "if the connection is busy, reduce concurrency before retrying. "
+            "Do not repeat an expensive query unchanged or raise profile limits automatically.",
+            error_type="TimeoutError",
+            phase="deadline",
+            timeout_ms=effective_timeout,
+            connection=profile.name,
+            database=selected_database,
+            requested_connection=target.requested_connection,
+            requested_database=target.requested_database,
+            route_applied=target.route_applied,
+            query_id=query_fingerprint(query),
         ) from exc
     except anyio.get_cancelled_exc_class():
         control.cancel()
@@ -1991,7 +2134,12 @@ async def execute_query(
         _write_audit_event(
             profile,
             query=query,
-            status="error",
+            status=(
+                "timeout"
+                if isinstance(exc, QueryFailure)
+                and exc.payload["code"] == "QUERY_TIMEOUT"
+                else "error"
+            ),
             duration_ms=duration,
             database=selected_database,
             internal=internal,
@@ -2147,6 +2295,9 @@ async def _dump_schema(
 async def run_query(
     query: str,
     *,
+    explain: bool = False,
+    plan_output: str = "rows",
+    expected_plan_id: str | None = None,
     connection: str | None = None,
     database: str | None = None,
     max_rows: int | None = None,
@@ -2159,10 +2310,15 @@ async def run_query(
     bounded_result: bool = False,
 ) -> list[TextContent]:
     requested_format = result_format.lower() if result_format else None
+    if requested_format is None and plan_output == "chunks":
+        requested_format = "json"
     if requested_format not in {None, "csv", "json", "compact"}:
         raise ValueError("result_format must be csv, json or compact")
     result = await execute_query(
         query,
+        explain=explain,
+        plan_output=plan_output,
+        expected_plan_id=expected_plan_id,
         connection=connection,
         database=database,
         max_rows=max_rows,

@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import re
+from typing import Any, cast
 
 import sqlglot
 from sqlglot import exp
-from sqlglot.errors import ParseError
+from sqlglot.errors import ParseError, TokenError
+
+from .errors import QueryFailure
 
 ALLOWED_FIRST_KEYWORDS = {
     "SELECT",
@@ -175,6 +178,16 @@ def _sanitize_sql(sql: str) -> tuple[str, list[int]]:
             end = sql.find("*/", index + 2)
             if end < 0:
                 raise ReadOnlyViolation("Unterminated block comment")
+            if sql.startswith("/*+", start) and re.search(
+                r"\b(?:SET_VAR|MAX_EXECUTION_TIME|RESOURCE_GROUP)\s*\(",
+                sql[start + 3 : end],
+                re.IGNORECASE,
+            ):
+                raise ReadOnlyViolation(
+                    "Optimizer hints that change session variables, execution "
+                    "timeouts or resource groups are not allowed; use timeout_ms "
+                    "within the connection profile limit"
+                )
             index = end + 2
             blank(start, index)
             continue
@@ -274,6 +287,44 @@ def validate_read_only_query(sql: str) -> str:
     return normalized_query
 
 
+def _parse_mysql_query(sql: str) -> exp.Expression:
+    """Expose parser coordinates, never its SQL-bearing diagnostic text."""
+    try:
+        return cast(exp.Expression, sqlglot.parse_one(sql, read="mysql"))
+    except (ParseError, TokenError) as exc:
+        position: dict[str, Any] = {}
+        if isinstance(exc, ParseError) and exc.errors:
+            for field, name in (("line", "line"), ("col", "column")):
+                value = exc.errors[0].get(field)
+                if type(value) is int and value > 0:
+                    position[name] = value
+        raise QueryFailure(
+            "SQL_PARSE_ERROR",
+            "The query could not be parsed safely as MySQL SQL.",
+            "Check MySQL syntax at the reported position before correcting the query; "
+            "do not repeat unchanged SQL. No database connection was opened.",
+            phase="validation",
+            error_type=type(exc).__name__,
+            query_id=query_fingerprint(sql),
+            **position,
+        ) from None
+
+
+def build_explain_query(sql: str, *, json_plan: bool = False) -> str:
+    """Plan a SELECT/CTE/UNION without accepting EXPLAIN options from callers."""
+    query = validate_read_only_query(sql)
+    if query_type(query) not in {"SELECT", "WITH"}:
+        raise ReadOnlyViolation(
+            "explain_sql requires a SELECT or WITH query without an EXPLAIN prefix"
+        )
+    statement = _parse_mysql_query(query)
+    if not isinstance(statement, exp.Query):
+        raise ReadOnlyViolation("explain_sql requires a SELECT or WITH query")
+    # Keep the original query, including its LIMIT/OFFSET and optimizer hints.
+    # execute_query validates database/function policy on this complete statement.
+    return ("EXPLAIN FORMAT=JSON " if json_plan else "EXPLAIN ") + query
+
+
 def query_fingerprint(sql: str) -> str:
     """Create a stable audit identifier without logging SQL or literal values."""
     try:
@@ -314,12 +365,7 @@ def validate_database_access(
     Unqualified tables use selected_database. CTE aliases have no database and
     therefore do not create false positives like regex-based `alias.column` checks.
     """
-    try:
-        statement = sqlglot.parse_one(sql, read="mysql")
-    except ParseError as exc:
-        raise ReadOnlyViolation(
-            f"Query could not be parsed safely as MySQL SQL: {exc}"
-        ) from exc
+    statement = _parse_mysql_query(sql)
 
     accessed: set[str] = set()
     if selected_database:
@@ -388,18 +434,15 @@ def validate_function_safety(
     database or external side effects. This check keeps a write-capable account
     outside the read-only correctness boundary.
     """
-    try:
-        statement = sqlglot.parse_one(sql, read="mysql")
-    except ParseError as exc:
-        raise ReadOnlyViolation(
-            f"Query could not be parsed safely as MySQL SQL: {exc}"
-        ) from exc
+    statement = _parse_mysql_query(sql)
 
     configured = {name.upper() for name in allowed_functions}
+    # sqlglot also models optimizer hints such as NO_MERGE as Anonymous nodes;
+    # they are not callable functions. Policy-changing hints are rejected earlier.
     anonymous = {
         function.name.upper()
         for function in statement.find_all(exp.Anonymous)
-        if function.name
+        if function.name and function.find_ancestor(exp.Hint) is None
     }
     unsafe = sorted(anonymous - SAFE_ANONYMOUS_FUNCTIONS - configured)
     if unsafe:
