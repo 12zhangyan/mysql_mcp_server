@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-10-14
+
 ### Changed
 - Disable result masking by default. Only fields explicitly configured with per-connection
   `mask_columns` or legacy `MYSQL_MASK_COLUMNS` are masked; omitted and empty rules
