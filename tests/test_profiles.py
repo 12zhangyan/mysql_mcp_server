@@ -68,7 +68,7 @@ database = "app_dev"
     assert config["database"] == "audit"
     assert config["ssl_disabled"] is False
     assert profile.ssl_mode == "REQUIRED"
-    assert "password" in profile.mask_columns
+    assert profile.mask_columns == ()
 
 
 def test_verified_tls_requires_ca_file(tmp_path: Path, monkeypatch):
@@ -478,3 +478,47 @@ bad = { connection = "missing", database = "app" }
     registry = load_connection_registry(force_reload=True)
     assert registry.get("good").database == "app"
     assert "unknown or invalid connection" in registry.errors["@route.shared.bad"]
+
+
+@pytest.mark.parametrize("named", [False, True])
+@pytest.mark.parametrize("policy", [None, "", " Password, token_* "])
+def test_result_masking_is_opt_in_for_named_and_legacy_profiles(
+    tmp_path, monkeypatch, named, policy
+):
+    from mysql_mcp_server.results import MASKED_VALUE, mask_result_rows
+
+    monkeypatch.delenv("MYSQL_MASK_COLUMNS", raising=False)
+    monkeypatch.delenv("MYSQL_PROFILES_FILE", raising=False)
+    if named:
+        rules = [] if not policy else [item.strip() for item in policy.split(",")]
+        profile_file = tmp_path / "masking.toml"
+        profile_file.write_text(
+            "[connections.local]\n"
+            'host="127.0.0.1"\n'
+            'user="reader"\n'
+            'password_env="MYSQL_PASSWORD"\n'
+            + (f"mask_columns={rules!r}\n" if policy is not None else ""),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("MYSQL_PROFILES_FILE", str(profile_file))
+        # A named connection's policy is not supplemented by legacy env rules.
+        monkeypatch.setenv("MYSQL_MASK_COLUMNS", "*")
+    elif policy is not None:
+        monkeypatch.setenv("MYSQL_MASK_COLUMNS", policy)
+
+    profile = load_connection_registry(force_reload=True).get()
+    assert profile.mask_columns == (("password", "token_*") if policy else ())
+    rows, masked = mask_result_rows(
+        "SELECT password AS harmless, token_count, email FROM settings",
+        ["harmless", "token_count", "email"],
+        [["synthetic-password", 5, "user@example.test"]],
+        profile.mask_columns,
+    )
+    assert rows == [
+        [
+            MASKED_VALUE if policy else "synthetic-password",
+            MASKED_VALUE if policy else 5,
+            "user@example.test",
+        ]
+    ]
+    assert masked == (["harmless", "token_count"] if policy else [])

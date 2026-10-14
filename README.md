@@ -24,7 +24,7 @@
 - 整库表/列元数据可分页；`inspect_catalog` / `get_schema_info` / `dump_schema` 返回 `truncated` 与 `next_offset`，禁止把单页当成全集
 - 查询分页下推到 MySQL，避免客户端截断结果引发 Connector/Python `errno=-1`
 - 内置结果行数和单元格长度限制，最大返回 1000 行
-- 按源字段精确脱敏，支持别名、CTE 以及 JSON 内敏感键
+- 结果默认不脱敏；按连接配置需要隐藏的字段，支持别名、CTE 和 JSON 内键
 - 支持 SSL/TLS、SSH 隧道、Streamable HTTP 和旧版 SSE 传输
 - 密码可保存在环境变量、操作系统凭据库或受控的密钥命令中
 - 保留旧版单连接 `MYSQL_*` 环境变量和 `query` 工具别名
@@ -82,6 +82,26 @@ Python 包仍适用于源码部署，但本分支的主要分发方式是上述 
 
 ## 配置
 
+### 结果脱敏配置
+
+**默认不脱敏。** 代码不再内置敏感字段名单；省略配置或配置为空时，所有结果字段（包括密码、Token、联系方式及 JSON 内键）均按查询结果返回，`masked_columns` 为空。
+
+命名连接通过 `mask_columns` 指定要隐藏的字段。配置属于各自连接，支持大小写不敏感的字段名和通配符：
+
+```toml
+[connections.dev]
+# 其他连接参数见下方完整示例。
+mask_columns = [] # 默认全部放开；省略此项效果相同。
+# 如需脱敏，将上面一行改为自己的字段列表，例如：
+# mask_columns = ["password", "access_token", "users.phone"]
+```
+
+旧单连接模式通过 `MYSQL_MASK_COLUMNS` 配置，以逗号分隔；未设置或设为空字符串均不脱敏。例如 `MYSQL_MASK_COLUMNS=password,access_token` 只按这两个规则处理。使用命名连接文件时，以各连接自己的 `mask_columns` 为准。
+
+显式配置会追踪别名、表达式和 CTE 的字段来源，并对 JSON 内匹配的键递归处理。不带点的模式只匹配字段名，例如 `password`；带点的模式按限定路径匹配，例如 `users.phone`。`COUNT` / `COUNT(DISTINCT ...)` 统计值可以正常读取，同一查询中匹配规则的原始值和拼接值仍会隐藏。
+
+脱敏只替换返回值，不改变 MySQL 的 `WHERE` / `JOIN` 条件或删除结果行。`[REDACTED]` 表示值被隐藏，JSON/compact 的 `masked_columns` 可定位受影响列。已有的非空配置仍会生效；需要全部放开时，把它改成空列表（单连接模式清空环境变量），或删除该配置项。
+
 ### 推荐：命名连接
 
 将 [`mysql-connections.example.toml`](mysql-connections.example.toml) 复制为已被 Git 忽略的 `mysql-connections.toml`，然后集中声明各环境：
@@ -101,7 +121,8 @@ query_timeout_ms = 30000
 max_rows = 500
 max_cell_length = 20000
 result_format = "json"
-mask_columns = ["password", "*password*", "*passwd*", "*pwd*", "*secret*", "token", "*token", "*_token", "token_*", "*tokenvalue*", "*accesstoken*", "*refreshtoken*", "*idtoken*", "*appsec*", "*api_key*", "*private_key*", "*ssn*", "*id_card*", "*phone*", "*mobile*", "*email*"]
+# 默认不脱敏；需要时在列表中填写字段名或模式。
+mask_columns = []
 pool_size = 3
 audit_enabled = true
 
@@ -572,8 +593,7 @@ npm test
 - **受控元数据**：用户 SQL 默认不能直接查询 `information_schema`；使用 `list_tables`、`get_schema_info`、`inspect_catalog` 获取限定范围的元数据
 - **凭据隔离**：密码可来自环境变量、操作系统凭据库或无 shell 的受控命令；发现接口、日志和错误均不返回凭据值或引用
 - **资源限制**：整次调用、socket 和服务端语句均有超时；最多返回 1000 行，超长单元格会截断
-- **精确脱敏**：依据表达式源字段脱敏，别名不能绕过规则，也不会连带遮罩无关列；JSON 中 `clientSecret`、`AppSec` 等敏感键递归脱敏
-- **安全默认规则**：覆盖常见 password/PWD、mobile/phone、secret、凭据 token、API key、private key 命名；不会用宽泛的 `*token*` 误伤通道代码或 token 有效时长
+- **可配置脱敏**：默认全部放开；通过 `mask_columns` / `MYSQL_MASK_COLUMNS` 指定字段后才脱敏，追踪别名和表达式来源，并递归处理 JSON 内匹配的键
 - **企业审计**：UTC JSONL 事件包含事件 ID、MCP 请求 ID、操作、调用方归因、策略决定、目标库、无字面量查询指纹、耗时、结果大小和结果状态；不记录 SQL 原文和结果数据
 - **两阶段审计**：失败关闭模式下，建立连接前先 fsync 写入 `started` 事件，随后记录终态事件
 - **默认加密**：数据库 TLS 默认 `REQUIRED`；生产配置建议使用 `VERIFY_CA` 或 `VERIFY_IDENTITY`

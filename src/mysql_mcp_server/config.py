@@ -19,29 +19,8 @@ CREDENTIAL_REFERENCE_PATTERN = re.compile(r"^[A-Za-z0-9_.:/-]+$")
 RESULT_FORMATS = {"csv", "json", "compact"}
 SSL_MODES = {"DISABLED", "REQUIRED", "VERIFY_CA", "VERIFY_IDENTITY"}
 CREDENTIAL_PROVIDERS = {"keyring", "command"}
-DEFAULT_MASK_COLUMNS = (
-    "password",
-    "*password*",
-    "*passwd*",
-    "*pwd*",
-    "*secret*",
-    "token",
-    "*token",
-    "*_token",
-    "token_*",
-    "*tokenvalue*",
-    "*accesstoken*",
-    "*refreshtoken*",
-    "*idtoken*",
-    "*appsec*",
-    "*api_key*",
-    "*private_key*",
-    "*ssn*",
-    "*id_card*",
-    "*phone*",
-    "*mobile*",
-    "*email*",
-)
+# Result masking is opt-in: only explicitly configured fields are redacted.
+DEFAULT_MASK_COLUMNS: tuple[str, ...] = ()
 
 
 def _env_bool(name: str, default: bool = False) -> bool:

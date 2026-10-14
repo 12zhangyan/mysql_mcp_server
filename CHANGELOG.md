@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Disable result masking by default. Only fields explicitly configured with per-connection
+  `mask_columns` or legacy `MYSQL_MASK_COLUMNS` are masked; omitted and empty rules
+  leave all returned fields and JSON keys visible. No built-in field list is applied.
+- Preserve existing explicit masking rules. Unqualified patterns match only field
+  names, avoiding accidental masking caused by table/database names.
+- With masking configured, preserve `COUNT` and `COUNT(DISTINCT ...)` statistics
+  while masking matching raw values and expressions that combine them.
+- Reuse one qualified SQL scope when tracing result columns for masking, avoiding
+  repeated query preparation and AST copies for wide SELECT/CTE/UNION results.
+- Add an opt-in localhost benchmark with synthetic rows and an explicit
+  `--mask-sensitive-field` option to verify the configured masking path.
+
 ### Added
 - Add `explain_sql` for estimated SELECT/CTE/UNION execution plans through the
   existing read-only, database-scope, audit, masking and budget controls. Plan
@@ -18,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   session with a mocked database adapter.
 
 ### Fixed
+- Rebuild cached connection pools when pool_size changes, so live capacity matches
+  the configured admission limit after either growing or shrinking a pool.
 - Pass an explicit schema to SQLGlot lineage tracing for 30.22 compatibility,
   preserving sensitive-column masking through CTE aliases and UNION queries.
 - Sanitize parser failures as SQL_PARSE_ERROR with numeric coordinates and a

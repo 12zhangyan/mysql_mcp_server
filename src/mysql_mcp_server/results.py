@@ -16,6 +16,8 @@ from typing import Any
 import sqlglot
 from sqlglot import exp
 from sqlglot.lineage import lineage
+from sqlglot.optimizer.qualify import qualify
+from sqlglot.optimizer.scope import build_scope
 
 from .errors import QueryFailure
 
@@ -57,6 +59,47 @@ def _name_candidates(name: str) -> set[str]:
     return {".".join(parts[index:]) for index in range(len(parts))}
 
 
+def _lineage_source_candidates(
+    statement: exp.Query, columns: list[str]
+) -> list[set[str] | None]:
+    """Prepare one query scope, then trace each output without copying the query."""
+    try:
+        qualified = qualify(
+            statement.copy(),
+            dialect="mysql",
+            schema={},
+            validate_qualify_columns=False,
+            identify=False,
+        )
+        scope = build_scope(qualified)
+    except Exception:
+        return [None] * len(columns)
+    if scope is None:
+        return [None] * len(columns)
+
+    resolved: list[set[str] | None] = []
+    for column in columns:
+        try:
+            node = lineage(
+                column,
+                qualified,
+                schema={},
+                dialect="mysql",
+                scope=scope,
+                copy=False,
+                trim_selects=False,
+            )
+            candidates = {
+                candidate
+                for lineage_node in node.walk()
+                for candidate in _name_candidates(str(lineage_node.name))
+            }
+            resolved.append(candidates or None)
+        except Exception:
+            resolved.append(None)
+    return resolved
+
+
 def _result_source_candidates(query: str, columns: list[str]) -> list[set[str] | None]:
     """Resolve each SELECT output to its source columns, including CTE aliases.
 
@@ -67,41 +110,25 @@ def _result_source_candidates(query: str, columns: list[str]) -> list[set[str] |
     if not isinstance(statement, exp.Query):
         return [None] * len(columns)
 
+    # COUNT reveals cardinality, not its input values. Remove its source
+    # references only in this masking AST; the executed SQL is unchanged.
+    for aggregate in list(statement.find_all(exp.Count)):
+        aggregate.replace(exp.Literal.number(0))
+
     if not isinstance(statement, exp.Select):
-        query_resolved: list[set[str] | None] = []
         query_columns = {
             candidate
             for column in statement.find_all(exp.Column)
             for candidate in _column_candidates(column)
         }
-        for column_name in columns:
-            query_candidates: set[str] = set()
-            try:
-                node = lineage(column_name, statement, schema={}, dialect="mysql")
-                for lineage_node in node.walk():
-                    query_candidates.update(_name_candidates(str(lineage_node.name)))
-            except Exception:
-                query_resolved.append(query_columns or None)
-                continue
-            query_resolved.append(query_candidates or None)
-        return query_resolved
+        return [
+            candidates if candidates is not None else query_columns or None
+            for candidates in _lineage_source_candidates(statement, columns)
+        ]
 
     projections = list(statement.expressions)
     if len(projections) != len(columns):
-        mismatched_resolved: list[set[str] | None] = []
-        for column_name in columns:
-            mismatched_candidates: set[str] = set()
-            try:
-                node = lineage(column_name, statement, schema={}, dialect="mysql")
-                for lineage_node in node.walk():
-                    mismatched_candidates.update(
-                        _name_candidates(str(lineage_node.name))
-                    )
-            except Exception:
-                mismatched_resolved.append(None)
-                continue
-            mismatched_resolved.append(mismatched_candidates or None)
-        return mismatched_resolved
+        return _lineage_source_candidates(statement, columns)
     if any(projection.find(exp.Star) is not None for projection in projections):
         return [None] * len(columns)
 
@@ -117,23 +144,20 @@ def _result_source_candidates(query: str, columns: list[str]) -> list[set[str] |
     )
 
     resolved: list[set[str] | None] = []
-    for projection, alias in zip(projections, aliases):
+    traced_candidates = _lineage_source_candidates(traced_statement, aliases)
+    for projection, traced in zip(projections, traced_candidates):
         candidates = {
             candidate
             for column in projection.find_all(exp.Column)
             for candidate in _column_candidates(column)
         }
-        try:
-            node = lineage(alias, traced_statement, schema={}, dialect="mysql")
-            for lineage_node in node.walk():
-                candidates.update(_name_candidates(str(lineage_node.name)))
-        except Exception:
-            # Direct projection columns still give a safe result for ordinary
-            # SELECTs. When lineage cannot resolve an indirect source, fall back
-            # to the connector output name rather than silently trusting it.
-            if not candidates:
-                resolved.append(None)
-                continue
+        if traced is not None:
+            candidates.update(traced)
+        elif not candidates:
+            # Keep the output-name fallback when an indirect source cannot be
+            # resolved, and preserve direct source columns on analysis failure.
+            resolved.append(None)
+            continue
         resolved.append(candidates)
     return resolved
 
@@ -192,11 +216,19 @@ def mask_result_rows(
     if not normalized_patterns or not rows:
         return rows, []
 
+    column_patterns = tuple(p for p in normalized_patterns if "." not in p)
+    qualified_patterns = tuple(p for p in normalized_patterns if "." in p)
+
     def matches(candidates: set[str]) -> bool:
+        # Ordinary column patterns must not match a database, table or alias.
+        # Explicit table.column / database.table.column patterns retain scope.
+        names = {candidate.rsplit(".", 1)[-1] for candidate in candidates}
         return any(
+            fnmatchcase(name, pattern) for name in names for pattern in column_patterns
+        ) or any(
             fnmatchcase(candidate, pattern)
             for candidate in candidates
-            for pattern in normalized_patterns
+            for pattern in qualified_patterns
         )
 
     try:

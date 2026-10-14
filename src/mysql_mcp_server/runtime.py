@@ -253,6 +253,7 @@ class ConnectionPoolManager:
         }
         value = (
             profile.name,
+            profile.pool_size,
             endpoint.host,
             endpoint.port,
             endpoint.generation,

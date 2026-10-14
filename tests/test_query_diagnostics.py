@@ -550,10 +550,17 @@ async def test_oversized_plan_returns_chunk_recovery_instead_of_partial_text():
 
 
 @pytest.mark.parametrize("result_format", [None, "json", "compact"])
-async def test_plan_chunks_reassemble_with_utf8_budget_and_masking(result_format):
+@pytest.mark.parametrize("configured", [False, True])
+async def test_plan_chunks_reassemble_with_utf8_budget_and_configured_masking(
+    monkeypatch, result_format, configured
+):
     import csv
     import io
 
+    if configured:
+        monkeypatch.setenv("MYSQL_MASK_COLUMNS", "password")
+    else:
+        monkeypatch.delenv("MYSQL_MASK_COLUMNS", raising=False)
     private_marker = "secret_plan_test_marker"
     plan = {
         "query_block": {"description": '中文😀\n"' * 2000, "password": private_marker}
@@ -577,7 +584,8 @@ async def test_plan_chunks_reassemble_with_utf8_budget_and_masking(result_format
             response = await call_tool("explain_sql", arguments)
             text = response[0].text
             assert len(text.encode("utf-8")) <= 4096
-            assert private_marker not in text
+            if configured:
+                assert private_marker not in text
             if result_format == "compact":
                 header, body = text.split("\n", 1)
                 payload = json.loads(header)
@@ -587,7 +595,7 @@ async def test_plan_chunks_reassemble_with_utf8_budget_and_masking(result_format
                 payload = json.loads(text)
                 rows = payload["rows"]
             assert not payload["content_truncated"]
-            assert payload["masked_columns"] == ["text"]
+            assert payload["masked_columns"] == (["text"] if configured else [])
             assert rows and len(rows) <= 7
             for part, chunk in rows:
                 assert int(part) == len(chunks)
@@ -605,7 +613,9 @@ async def test_plan_chunks_reassemble_with_utf8_budget_and_masking(result_format
             pytest.fail("plan pagination did not terminate")
     recovered = json.loads("".join(chunks))
     assert recovered["query_block"]["description"] == plan["query_block"]["description"]
-    assert recovered["query_block"]["password"] == "[REDACTED]"
+    assert recovered["query_block"]["password"] == (
+        "[REDACTED]" if configured else private_marker
+    )
     assert len(chunks) == payload["plan"]["total_chunks"]
     assert len("".join(chunks)) == payload["plan"]["characters"]
     cursor.fetchall.assert_not_called()

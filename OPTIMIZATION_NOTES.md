@@ -54,3 +54,60 @@
 SQLGlot 30.22.0 将 lineage() 的 schema 改为必填参数。三处字段来源追踪调用显式传入空 schema，保留对已有版本的兼容性，避免异常回退导致 CTE 别名字段漏脱敏。回归覆盖投影数量不匹配、普通 CTE、嵌套 CTE 和 UNION，并确认普通列未被误隐藏。
 
 SQLGlot 30.14.0 与 30.22.0 下的完整 Python 测试分别为 357 passed、16 skipped；跳过项为显式启用的 localhost 验收。mypy 检查 12 个源码文件通过。以上最终源码已重新完成前述 12 项 test16.hl_eam 只读验收。
+
+
+## 本地多列查询与连接池优化（2026-10-14）
+
+已复现并修复两项问题：
+
+- 字段脱敏追踪原来为每个输出列重复准备整条 SQL，并复制用于图示的 AST。现在每次请求只准备一次字段分析作用域，逐列追踪时复用该作用域；保留原有 CTE/UNION、重复列名、JSON 脱敏和分析失败回退规则。不跨请求缓存 SQL 或结果，不增加依赖。
+- 连接池缓存键原来没有包含 pool_size。实库中将池容量从 1 调为 2 后，第二个借用仍抛 PoolError；现在容量变化会重建池。增长、缩小、替换后复用以及旧配置清理不误删新池均有回归覆盖。
+
+测量环境为 localhost MySQL 8.4.0、Python 3.14.5、SQLGlot 30.14.0，使用当时的非空脱敏规则和直接连接（pool_size=0）。这些计时来自脱敏开启的路径；当前默认关闭脱敏，复跑该路径需显式配置字段。每个宽度执行 3 次，取中位数；优化前后顺序运行同一个基准，预先完成连接预热，并逐次检查敏感列已隐藏、普通列保持原值。基线加载修改前的字段追踪实现，其余查询路径与优化后相同。
+
+下表计时从调用 execute_query 开始，覆盖安全校验、数据库访问、脱敏和响应预算处理；不包含 MCP STDIO 传输。查询均为单行合成 CTE，不读取业务数据行。
+
+| 返回列数 | 优化前查询处理耗时 | 优化后查询处理耗时 | 加速比 |
+| --- | --- | --- | --- |
+| 25 | 70.763 ms | 16.804 ms | 4.2 倍 |
+| 100 | 1000.256 ms | 42.056 ms | 23.8 倍 |
+| 200 | 3760.664 ms | 114.345 ms | 32.9 倍 |
+
+200 列的纯脱敏追踪中位耗时由 3698.066 ms 降为 67.113 ms。以上只证明本机合成多列查询的改善，不能推断生产负载下的吞吐量或响应时间。
+
+验证结果：
+
+- 默认环境完整 Python 回归：367 passed、20 skipped；跳过的 20 项是需显式开启的本地实库验收。
+- 本地 MySQL 只读验收：20 passed，包含多列 CTE/UNION、真实 MCP STDIO 脱敏、连接池扩缩容和原有分页/元数据/错误恢复用例。
+- SQLGlot 30.22.0 完整回归加本地验收：387 passed；SQLGlot 26.0.0 相关脱敏与连接池回归：32 passed。版本验证分别使用隔离的依赖目录，没有修改项目依赖范围。
+- npm test：6 passed；mypy：12 个源码文件通过；修改过的 6 个 Python 文件通过 Black 检查，compileall 和 git diff --check 通过。
+- 实库连接确认 transaction_read_only=1、autocommit=0；没有执行 DML/DDL 或权限变更。测试凭据仅通过子进程环境传入，未写入脚本、报告或项目配置。
+
+复跑基准：先在临时进程环境提供 MYSQL_USER、MYSQL_PASSWORD 并设置 MYSQL_MCP_LOCAL_TESTS=1，然后运行：
+
+`python scripts/benchmark_local_readonly.py --iterations 3 --columns 25 100 200 --mask-sensitive-field`
+
+不带 `--mask-sensitive-field` 时按默认不脱敏模式运行；报告中的 `mask_columns` 记录本次实际启用的规则。
+
+脚本强制使用 127.0.0.1:3306，清除继承的连接 profile、SSH、凭据提供器和其他 MySQL 设置，仅执行合成只读查询并输出版本与耗时。实库专用的 MYSQL_SSL_MODE=DISABLED、MYSQL_AUDIT_ENABLED=false 等环境变量应局限在实库 fixture 或基准子进程中；不要把它们带入依赖默认安全策略的完整单元测试环境。
+
+当前本地原始记录保存在 .pytest_cache/optimization-20261014/controlled-before.json、controlled-after.json、local-optimized.json 和 sqlglot30-clean.json；这些是可清理的本地验证记录，不随发布包分发。
+
+## 脱敏由配置控制，默认全部放开（2026-10-14）
+
+旧内置规则曾把业务字段和统计值误隐藏。现在移除内置敏感字段名单，默认 `mask_columns=()`：命名连接省略 `mask_columns` 或设为 `[]`、旧单连接模式省略或清空 `MYSQL_MASK_COLUMNS`，均返回原始字段值。JSON 内键同样默认不脱敏。
+
+需要隐藏的字段全部由配置决定，支持字段名、通配符和限定路径。已有非空配置继续生效，不自动合并任何内置名单；命名连接不会叠加旧单连接环境变量里的规则。README、TOML、环境变量及企业部署示例均已同步。
+
+显式启用脱敏后，不带点的模式仅匹配字段名，避免表名牵连普通列；`COUNT` 和 `COUNT(DISTINCT ...)` 返回统计值，匹配规则的原始值和拼接值仍会隐藏。别名、CTE/UNION 和 JSON 的来源追踪继续生效。默认规则为空时跳过字段追踪和 JSON 脱敏，保留原始结果。
+
+本轮最终验证：
+
+- `python -m pytest tests -q`：410 passed、28 skipped；跳过项为需要显式开启的本地实库验收。
+- `python -m pytest tests/test_local_readonly.py -q`：本地 MySQL 8.4.0 上 28 passed，包含默认放开/显式脱敏两种真实 STDIO 场景、多列 CTE/UNION、原始字段和嵌套 JSON。
+- 执行计划分块回归分别验证默认保留和显式脱敏，命名连接及环境变量分别验证省略、空列表和自定义规则。
+- `npm test`：6 passed；`mypy src`：12 个源码文件通过；9 个变动 Python 文件通过 Black 检查，compileall 和 `git diff --check` 通过。
+- 本地基准脚本分别以默认模式和 `--mask-sensitive-field` 运行 25 列、1 次的功能检查，两者均成功。MySQL 确认 `transaction_read_only=1`、`autocommit=0`；该单次计时不作为性能对比结论。
+- 仅使用合成 SELECT/CTE 数据及已有元数据，没有 DML/DDL。连接凭据只通过临时子进程环境传入，未写入配置、日志、脚本或报告。
+
+本轮原始验证记录位于 `.pytest_cache/masking-default-open-20261014/`，不随发布包分发。本次完成源码与配置示例修改，尚未发布新包或替换已安装的 MCP。
