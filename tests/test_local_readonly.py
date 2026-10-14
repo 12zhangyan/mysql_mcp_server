@@ -21,6 +21,12 @@ pytestmark = pytest.mark.skipif(
 )
 
 SOURCE = "WITH data AS (SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6) "
+MASKING_SOURCE = (
+    "WITH mobile_devices AS (SELECT 7 AS id, 'active' AS status, "
+    "5 AS token_count, '2026-10-14' AS PasswordUpdatedAt, 1 AS EmailEnabled, "
+    "'synthetic-sensitive-value' AS password UNION ALL "
+    "SELECT 8, 'inactive', 2, '2026-10-13', 0, 'synthetic-sensitive-value') "
+)
 QUERIES = [
     SOURCE + "SELECT n FROM data ORDER BY n",
     SOURCE + "SELECT n FROM data ORDER BY n DESC LIMIT 4 OFFSET 1",
@@ -51,6 +57,7 @@ def local_db(monkeypatch):
     monkeypatch.setenv("MYSQL_AUDIT_ENABLED", "false")
     monkeypatch.setenv("MYSQL_SQL_MODE", "TRADITIONAL")
     monkeypatch.delenv("MYSQL_DATABASE", raising=False)
+    monkeypatch.delenv("MYSQL_MASK_COLUMNS", raising=False)
     monkeypatch.delenv("MYSQL_SSH_HOST", raising=False)
     monkeypatch.setenv("MYSQL_SSH_ENABLE", "false")
     try:
@@ -254,7 +261,8 @@ async def test_real_queries_resume_after_waiting_on_one_connection(
     assert not query_admission._active and not query_admission._waiting
 
 
-async def test_mcp_stdio_exposes_new_contract_and_safe_errors(local_db):
+@pytest.mark.parametrize("configured", [False, True])
+async def test_mcp_stdio_exposes_new_contract_and_safe_errors(local_db, configured):
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
 
@@ -271,6 +279,8 @@ async def test_mcp_stdio_exposes_new_contract_and_safe_errors(local_db):
             "MYSQL_SSL_MODE": "DISABLED",
         }
     )
+    if configured:
+        environment["MYSQL_MASK_COLUMNS"] = "password"
     parameters = StdioServerParameters(
         command=sys.executable, args=["-m", "mysql_mcp_server"], env=environment
     )
@@ -285,6 +295,35 @@ async def test_mcp_stdio_exposes_new_contract_and_safe_errors(local_db):
             )
             assert not success.isError
             assert json.loads(success.content[0].text.splitlines()[0])["row_count"] == 1
+            wide_query = (
+                "WITH source AS (SELECT 'synthetic-sensitive-value' AS password, "
+                + ", ".join(f"{index} AS value_{index}" for index in range(80))
+                + ") SELECT password AS harmless, "
+                + ", ".join(f"value_{index}" for index in range(80))
+                + " FROM source"
+            )
+            wide = await client.call_tool(
+                "execute_sql", {"query": wide_query, "result_format": "json"}
+            )
+            assert not wide.isError
+            wide_payload = json.loads(wide.content[0].text)
+            expected_value = "[REDACTED]" if configured else "synthetic-sensitive-value"
+            assert wide_payload["rows"] == [[expected_value, *range(80)]]
+            assert wide_payload["masked_columns"] == (
+                ["harmless"] if configured else []
+            )
+            statistics = await client.call_tool(
+                "execute_sql",
+                {
+                    "query": MASKING_SOURCE
+                    + "SELECT COUNT(password) AS n FROM mobile_devices",
+                    "result_format": "json",
+                },
+            )
+            assert not statistics.isError
+            statistics_payload = json.loads(statistics.content[0].text)
+            assert statistics_payload["rows"] == [[2]]
+            assert statistics_payload["masked_columns"] == []
             failure = await client.call_tool(
                 "execute_sql", {"query": "SELECT missing_column"}
             )
@@ -293,3 +332,126 @@ async def test_mcp_stdio_exposes_new_contract_and_safe_errors(local_db):
                 and failure.structuredContent["code"] == "COLUMN_NOT_FOUND"
             )
             assert json.loads(failure.content[0].text) == failure.structuredContent
+
+
+@pytest.mark.parametrize("union", [False, True])
+@pytest.mark.parametrize("configured", [False, True])
+async def test_real_wide_cte_uses_only_configured_masking(
+    local_db, monkeypatch, union, configured
+):
+    if configured:
+        monkeypatch.setenv("MYSQL_MASK_COLUMNS", "password")
+    public = [f"value_{index}" for index in range(80)]
+    query = (
+        "WITH source AS (SELECT 'synthetic-sensitive-value' AS password, "
+        + ", ".join(f"{index} AS {name}" for index, name in enumerate(public))
+        + ") SELECT password AS harmless, "
+        + ", ".join(public)
+        + " FROM source"
+    )
+    if union:
+        query += " UNION ALL SELECT password, " + ", ".join(public) + " FROM source"
+    response = await call_tool("execute_sql", {"query": query, "result_format": "json"})
+
+    assert not getattr(response, "isError", False)
+    payload = json.loads(response[0].text)
+    expected_value = "[REDACTED]" if configured else "synthetic-sensitive-value"
+    assert payload["rows"] == [[expected_value, *range(80)]] * (2 if union else 1)
+    assert payload["masked_columns"] == (["harmless"] if configured else [])
+
+
+@pytest.mark.parametrize("initial_size,new_size", [(1, 2), (2, 1)])
+def test_real_pool_resize_enforces_new_capacity(local_db, initial_size, new_size):
+    from dataclasses import replace
+
+    from mysql_mcp_server.config import load_connection_registry, build_connector_config
+    from mysql_mcp_server.runtime import ConnectionPoolManager, TunnelEndpoint
+
+    manager = ConnectionPoolManager()
+    profile = replace(load_connection_registry().get(), pool_size=initial_size)
+    endpoint = TunnelEndpoint("127.0.0.1", 3306)
+    config = build_connector_config(profile)
+    borrowed = []
+    try:
+        first = manager.get_connection(profile, endpoint, config)
+        first.close()
+        resized = replace(profile, pool_size=new_size)
+        for _ in range(new_size):
+            connection = manager.get_connection(resized, endpoint, config)
+            borrowed.append(connection)
+            with connection.cursor() as cursor:
+                cursor.execute("SET SESSION TRANSACTION READ ONLY")
+                cursor.execute("START TRANSACTION READ ONLY")
+                cursor.execute("SELECT @@transaction_read_only, 1")
+                assert cursor.fetchone() == (1, 1)
+        with pytest.raises(mysql.connector.errors.PoolError):
+            manager.get_connection(resized, endpoint, config)
+    finally:
+        for connection in borrowed:
+            connection.rollback()
+            connection.close()
+        manager.clear()
+
+
+@pytest.mark.parametrize(
+    "projection,expected,masked_columns",
+    [
+        (
+            "SELECT id, status, token_count, PasswordUpdatedAt, EmailEnabled, "
+            "password AS harmless FROM mobile_devices ORDER BY id",
+            [
+                [7, "active", 5, "2026-10-14", 1, "[REDACTED]"],
+                [8, "inactive", 2, "2026-10-13", 0, "[REDACTED]"],
+            ],
+            ["harmless"],
+        ),
+        ("SELECT COUNT(password) AS configured_count FROM mobile_devices", [[2]], []),
+        (
+            "SELECT COUNT(DISTINCT password) AS unique_count FROM mobile_devices",
+            [[1]],
+            [],
+        ),
+        (
+            "SELECT password AS harmless, COUNT(*) AS n FROM mobile_devices GROUP BY password",
+            [["[REDACTED]", 2]],
+            ["harmless"],
+        ),
+    ],
+)
+async def test_real_business_metadata_and_counts_remain_visible(
+    local_db, monkeypatch, projection, expected, masked_columns
+):
+    monkeypatch.setenv("MYSQL_MASK_COLUMNS", "password")
+    response = await call_tool(
+        "execute_sql", {"query": MASKING_SOURCE + projection, "result_format": "json"}
+    )
+
+    assert not getattr(response, "isError", False)
+    payload = json.loads(response[0].text)
+    assert payload["rows"] == expected
+    assert payload["masked_columns"] == masked_columns
+
+
+async def test_real_default_preserves_fields_and_nested_json(local_db):
+    response = await call_tool(
+        "execute_sql",
+        {
+            "query": "SELECT 'synthetic-password' AS password, "
+            "'synthetic-token' AS access_token, 'user@example.test' AS email, "
+            '\'{"password":"synthetic-json-value",'
+            '"nested":[{"token":"synthetic-token"}]}\' AS config',
+            "result_format": "json",
+        },
+    )
+    assert not getattr(response, "isError", False)
+    payload = json.loads(response[0].text)
+    assert payload["rows"][0][:3] == [
+        "synthetic-password",
+        "synthetic-token",
+        "user@example.test",
+    ]
+    assert json.loads(payload["rows"][0][3]) == {
+        "password": "synthetic-json-value",
+        "nested": [{"token": "synthetic-token"}],
+    }
+    assert payload["masked_columns"] == []

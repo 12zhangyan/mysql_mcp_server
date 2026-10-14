@@ -153,10 +153,16 @@ The MCP server includes built-in protection against SQL injection for administra
 - Audit logs never contain SQL text, result data, credentials, hosts, usernames,
   or SSH key paths. They contain a literal-free fingerprint plus the policy and
   execution metadata needed for investigation.
-- Result cells whose output or source columns match `mask_columns` are replaced
-  with `[REDACTED]`. Source-column detection traverses aliases, expressions and
-  CTEs; review the patterns for your schema because name-based masking cannot
-  replace database views or column-level permissions.
+- Result masking is opt-in: `mask_columns` defaults to an empty list, and legacy
+  `MYSQL_MASK_COLUMNS` defaults to empty. There is no built-in sensitive-field list;
+  omitted or empty rules return all field values without redaction, including JSON
+  keys. When rules are configured, matching source columns (or output names when
+  unresolved) and JSON keys are replaced with `[REDACTED]`. Unqualified patterns
+  match only field names; qualified patterns retain table/database scope. Aliases,
+  expressions and CTEs retain tracing. COUNT statistics do not inherit masking
+  from their inputs, while matching raw values and combined expressions remain
+  masked. Configure rules against your schema; name-based masking cannot replace
+  database views or column-level permissions.
 
 These controls enforce the MCP read-only contract even when the supplied MySQL
 account has write privileges. A `SELECT`-only account is still recommended as

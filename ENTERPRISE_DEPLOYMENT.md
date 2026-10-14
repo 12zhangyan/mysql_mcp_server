@@ -59,7 +59,10 @@ allowed_databases = ["application_database"]
 # Unrecognized stored functions/UDFs are blocked. This list should normally
 # remain empty. Add only reviewed deterministic functions with no side effects.
 allowed_functions = []
-mask_columns = ["password", "*password*", "*passwd*", "*pwd*", "*secret*", "token", "*token", "*_token", "token_*", "*tokenvalue*", "*accesstoken*", "*refreshtoken*", "*idtoken*", "*appsec*", "*api_key*", "*private_key*", "*ssn*", "*id_card*", "*phone*", "*mobile*", "*email*"]
+# No result masking by default; omitting this setting has the same effect.
+mask_columns = []
+# To opt in, replace the empty list with your schema-specific rules, for example:
+# mask_columns = ["password", "access_token", "users.phone"]
 
 ssl_mode = "VERIFY_IDENTITY"
 ssl_ca = "/etc/mysql-mcp/company-ca.pem"
@@ -155,10 +158,15 @@ In fail-closed mode, the server first persists and fsyncs a `started` event
 before opening the database connection, then writes a terminal outcome. Alert
 on unmatched started events and preserve them during incident review.
 
-Result masking is a final egress control, not an authorization boundary. Output
-names matching `mask_columns` are redacted, and any sensitive source column
-found through an alias, expression, subquery, or CTE causes conservative
-redaction. Validate patterns with representative queries and prefer restricted
+Result masking is a final egress control, not an authorization boundary. Source
+columns matching `mask_columns` are redacted through aliases, expressions,
+subqueries and CTEs; unresolved outputs fall back to their result names. Bare
+patterns match only field names, and qualified patterns retain their scope.
+COUNT statistics remain available without exposing their input values. Masking
+is disabled by default: omitted or empty `mask_columns` returns all field values
+without redaction. Configure the fields to mask per connection; there is no
+built-in sensitive-field list. Existing explicit rules are not rewritten during
+upgrades. Validate patterns with representative queries and prefer restricted
 views or column grants for fields that must never be exposed.
 
 When HMAC signing is enabled, verify a line by removing `signature`, serializing

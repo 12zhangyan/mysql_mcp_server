@@ -1,6 +1,8 @@
 from dataclasses import replace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from mysql_mcp_server.config import ConnectionProfile, SshConfig
 from mysql_mcp_server.runtime import (
     ConnectionPoolManager,
@@ -322,3 +324,45 @@ def test_runtime_cleanup_closes_pools_before_ssh_tunnels():
         close_runtime_resources()
 
     assert calls == ["pools", "tunnels"]
+
+
+@pytest.mark.parametrize("initial_size,new_size", [(1, 3), (3, 1)])
+def test_pool_resize_rebuilds_capacity_and_reuses_replacement(initial_size, new_size):
+    pools = []
+
+    class FakePool:
+        def __init__(self, **kwargs):
+            self.size = kwargs["pool_size"]
+            self.connection = object()
+            self.closed = False
+            pools.append(self)
+
+        def get_connection(self):
+            return self.connection
+
+        def close(self):
+            self.closed = True
+
+    manager = ConnectionPoolManager(pool_factory=FakePool)
+    profile = ConnectionProfile(
+        name="test", host="db", port=3306, user="reader", pool_size=initial_size
+    )
+    endpoint = TunnelEndpoint("db", 3306)
+    config = {"host": "db", "user": "reader"}
+    first = manager.get_connection(profile, endpoint, config)
+    resized = replace(profile, pool_size=new_size)
+    second = manager.get_connection(resized, endpoint, config)
+    reused = manager.get_connection(resized, endpoint, config)
+
+    assert first is not second
+    assert second is reused
+    assert [pool.size for pool in pools] == [initial_size, new_size]
+    assert pools[0].closed and not pools[1].closed
+    assert len(manager._pools) == 1
+    # Cleanup for an in-flight request from the old configuration must not
+    # discard the replacement pool.
+    manager.discard(profile, endpoint, config)
+    assert not pools[1].closed
+    assert manager.get_connection(resized, endpoint, config) is second
+    manager.clear()
+    assert pools[1].closed
