@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-10-19
+
 ### Changed
 - Parse each validated query once and share the AST between database-access checks,
   function-safety checks and paging pushdown; build the pushed-down SQL once instead of

@@ -2,7 +2,7 @@ window.BOARD_DETAILS = window.BOARD_DETAILS || {};
 window.BOARD_DETAILS["d-a40235645fb01d62"] = {
   "delivery": {
     "plan": {
-      "status": "Implemented",
+      "status": "Done",
       "summary": "每次查询都有可省掉的开销：重复读取凭据（使用 command 时每次查询启动一个子进程）、会话设置往返 3 次、排队靠 10ms 轮询、审计每条写入多次访问文件系统。同时 server.py 有 2700 多行，新增工具要改 3 处。",
       "background": "上一轮已把 SQL 解析合并为一次。这一轮处理代码中已确认的其余冗余和扩展障碍。",
       "goals": [
@@ -34,7 +34,7 @@ window.BOARD_DETAILS["d-a40235645fb01d62"] = {
         "本机 MySQL 8.4.0 实库：走合并路径，读回 transaction_read_only=1 和设定的超时；开启实库后 476 个测试全部通过"
       ],
       "openQuestions": [],
-      "next": "评审并提交。"
+      "next": "无后续动作；新版本发布时随 CHANGELOG 的 Unreleased 一并带出。"
     }
   }
 };

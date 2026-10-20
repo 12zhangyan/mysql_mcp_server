@@ -11,4 +11,4 @@
 
 | | 标题 | 类型 | 状态 | 日期 | 源文档 | 单页 | OpenAPI |
 |---|---|---|---|---|---|---|---|
-| 📄 | 查询热路径与可扩展性优化 | 开发文档 | 进行中 | 2026-10-19 | [md](../docs/2026-10-19/runtime-and-extensibility-optimization.md) | [页](../project-html/pages/mysql_mcp_server-runtime-server-查询热路径与可扩展性优化.html) | - |
+| 📄 | 查询热路径与可扩展性优化 | 开发文档 | 已完成 | 2026-10-19 | [md](../docs/2026-10-19/runtime-and-extensibility-optimization.md) | [页](../project-html/pages/mysql_mcp_server-runtime-server-查询热路径与可扩展性优化.html) | - |
