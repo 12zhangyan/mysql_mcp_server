@@ -129,3 +129,25 @@ def test_required_context_and_control_characters_are_enforced(tmp_path):
             request_id="request-1",
             operation="execute_sql",
         )
+
+
+def test_audit_sink_recreates_log_directory_removed_between_writes(tmp_path):
+    import shutil
+    from dataclasses import replace
+
+    from mysql_mcp_server.audit import JsonlAuditSink
+    from mysql_mcp_server.config import ConnectionProfile
+
+    log_file = tmp_path / "logs" / "nested" / "audit.jsonl"
+    profile = replace(
+        ConnectionProfile(name="audit", host="h", port=3306, user="u"),
+        audit_log_file=str(log_file),
+    )
+    sink = JsonlAuditSink()
+    sink.write(profile, {"event": "first"})
+    shutil.rmtree(tmp_path / "logs")
+
+    sink.write(profile, {"event": "second"})
+
+    lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert [json.loads(line)["event"] for line in lines] == ["second"]

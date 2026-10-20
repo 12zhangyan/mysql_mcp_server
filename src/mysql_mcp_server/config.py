@@ -11,7 +11,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .credential_store import get_keyring_password, run_credential_command
+from .credential_store import (credential_cache, get_keyring_password,
+                               run_credential_command)
 
 PROFILE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_$]+$")
@@ -100,6 +101,7 @@ class ConnectionProfile:
     credential_service: str = "readonly-db-mcp"
     credential_command: tuple[str, ...] = ()
     credential_timeout_seconds: float = 5.0
+    credential_cache_seconds: float = 0.0
     database: str | None = None
     allowed_databases: tuple[str, ...] = ()
     allowed_functions: tuple[str, ...] = ()
@@ -146,31 +148,65 @@ class ConnectionProfile:
         if self.password is not None:
             return self.password
         if self.credential_provider == "keyring":
-            return get_keyring_password(self.credential_service, self.credential_ref)
+            return credential_cache.get_or_load(
+                self._credential_cache_key(),
+                self.credential_cache_seconds,
+                lambda: get_keyring_password(
+                    self.credential_service, self.credential_ref
+                ),
+            )
         if self.credential_provider == "command":
-            return run_credential_command(
-                self.credential_command,
-                self.credential_timeout_seconds,
+            return credential_cache.get_or_load(
+                self._credential_cache_key(),
+                self.credential_cache_seconds,
+                lambda: run_credential_command(
+                    self.credential_command,
+                    self.credential_timeout_seconds,
+                ),
             )
         raise ValueError(
             f"Connection '{self.name}' does not have a credential provider"
         )
 
-    def runtime_status(self) -> tuple[bool, str]:
+    def _credential_cache_key(self) -> tuple[Any, ...]:
+        return (
+            self.credential_provider,
+            self.credential_service,
+            self.credential_ref,
+            self.credential_command,
+        )
+
+    def invalidate_cached_credential(self) -> None:
+        """Forget a cached secret, e.g. after the server rejected it."""
+        if self.credential_provider in CREDENTIAL_PROVIDERS:
+            credential_cache.invalidate(self._credential_cache_key())
+
+    def runtime_readiness(self) -> tuple[bool, str, str | None]:
+        """Return readiness and, when the check had to fetch it, the password.
+
+        Query paths reuse the returned password so one request performs at most
+        one credential lookup. Command providers stay unresolved here.
+        """
+        password: str | None = None
         if self.credential_provider != "command":
             try:
-                self.resolve_password()
+                password = self.resolve_password()
             except ValueError as exc:
-                return False, str(exc)
+                return False, str(exc), None
         if self.audit_hmac_key_env and os.getenv(self.audit_hmac_key_env) is None:
             return (
                 False,
                 f"Connection '{self.name}' requires audit signing environment "
                 f"variable '{self.audit_hmac_key_env}'",
+                None,
             )
         if self.credential_provider == "command":
-            return True, "configured; credential command is checked when used"
-        return True, "ready"
+            return True, "configured; credential command is checked when used", None
+        return True, "ready", password
+
+    def runtime_status(self) -> tuple[bool, str]:
+        ready, status, _password = self.runtime_readiness()
+        return ready, status
 
 
 @dataclass(frozen=True)
@@ -393,6 +429,18 @@ def _profile_from_toml(name: str, values: dict[str, Any]) -> ConnectionProfile:
         credential_command,
         credential_timeout_seconds,
     ) = _credential_fields(name, values)
+    credential_cache_seconds = _bounded_float(
+        values.get("credential_cache_seconds"),
+        name=f"Connection '{name}'.credential_cache_seconds",
+        default=0.0,
+        minimum=0.0,
+        maximum=300.0,
+    )
+    if credential_cache_seconds and credential_provider is None:
+        raise ValueError(
+            f"Connection '{name}'.credential_cache_seconds is only valid for the "
+            "keyring or command provider"
+        )
 
     database = str(values["database"]) if values.get("database") else None
     if database:
@@ -500,6 +548,7 @@ def _profile_from_toml(name: str, values: dict[str, Any]) -> ConnectionProfile:
         credential_service=credential_service,
         credential_command=credential_command,
         credential_timeout_seconds=credential_timeout_seconds,
+        credential_cache_seconds=credential_cache_seconds,
         database=database,
         allowed_databases=allowed_databases,
         allowed_functions=allowed_functions,
@@ -953,6 +1002,8 @@ def _load_file_registry(path: Path) -> ConnectionRegistry:
 
 def load_connection_registry(*, force_reload: bool = False) -> ConnectionRegistry:
     """Hot-reload named profiles, or fall back to legacy MYSQL_* variables."""
+    if force_reload:
+        credential_cache.clear()
     configured_path = os.getenv("MYSQL_PROFILES_FILE") or os.getenv(
         "MYSQL_CONNECTIONS_FILE"
     )
@@ -1015,8 +1066,12 @@ def build_connector_config(
     host: str | None = None,
     port: int | None = None,
     query_timeout_ms: int | None = None,
+    password: str | None = None,
 ) -> dict[str, Any]:
-    """Build mysql-connector arguments without exposing profile-only metadata."""
+    """Build mysql-connector arguments without exposing profile-only metadata.
+
+    Pass ``password`` when the caller already resolved it for this request.
+    """
     selected_database = ensure_database_allowed(profile, database)
     timeout_ms = query_timeout_ms or profile.query_timeout_ms
     socket_timeout = max(1, math.ceil(timeout_ms / 1000))
@@ -1024,7 +1079,7 @@ def build_connector_config(
         "host": host or profile.host,
         "port": port or profile.port,
         "user": profile.user,
-        "password": profile.resolve_password(),
+        "password": profile.resolve_password() if password is None else password,
         "charset": profile.charset,
         "collation": profile.collation,
         "autocommit": False,

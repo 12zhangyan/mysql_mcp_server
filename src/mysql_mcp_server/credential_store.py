@@ -6,13 +6,54 @@ import os
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Sequence
+import threading
+import time
+from collections.abc import Callable, Hashable, Sequence
 
 MAX_CREDENTIAL_BYTES = 16_384
 
 
 class CredentialProviderError(ValueError):
     """Raised when a configured secret provider cannot return a credential."""
+
+
+class CredentialCache:
+    """Opt-in, process-local TTL cache for slow secret providers.
+
+    Values never leave process memory and are dropped on expiry, explicit
+    invalidation (authentication failure, forced profile reload) or shutdown.
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._entries: dict[Hashable, tuple[float, str]] = {}
+
+    def get_or_load(
+        self, key: Hashable, ttl_seconds: float, loader: Callable[[], str]
+    ) -> str:
+        if ttl_seconds <= 0:
+            return loader()
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is not None and entry[0] > self._clock():
+                return entry[1]
+        # Load outside the lock so one slow provider cannot block other profiles.
+        value = loader()
+        with self._lock:
+            self._entries[key] = (self._clock() + ttl_seconds, value)
+        return value
+
+    def invalidate(self, key: Hashable) -> None:
+        with self._lock:
+            self._entries.pop(key, None)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+
+
+credential_cache = CredentialCache()
 
 
 def _keyring_module():

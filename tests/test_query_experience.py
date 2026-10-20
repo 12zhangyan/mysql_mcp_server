@@ -408,3 +408,53 @@ def test_invalid_resource_limits_are_rejected(name, value, monkeypatch):
     monkeypatch.setenv(name, value)
     with pytest.raises(ValueError):
         load_connection_registry(force_reload=True)
+
+
+async def test_worker_thread_release_wakes_queued_caller_without_polling(monkeypatch):
+    from mysql_mcp_server import runtime
+
+    # A long fallback proves the wake-up comes from release(), not a timer.
+    monkeypatch.setattr(runtime, "_ADMISSION_WAKE_FALLBACK_SECONDS", 5.0)
+    admission = QueryAdmission()
+    profile = admission_profile(queue_timeout_ms=10_000)
+    lease = await admission.acquire(profile)
+    waiter = asyncio.create_task(admission.acquire(profile))
+    await asyncio.sleep(0.01)
+    assert admission._waiters[profile.name]
+
+    started = asyncio.get_running_loop().time()
+    await asyncio.to_thread(lease.release_pending)
+    second = await asyncio.wait_for(waiter, timeout=1.0)
+    assert asyncio.get_running_loop().time() - started < 1.0
+    second.release_pending()
+    assert not admission._active and not admission._waiting
+    assert not admission._waiters
+
+
+async def test_cancelled_and_timed_out_waiters_leave_no_wake_handles():
+    admission = QueryAdmission()
+    profile = admission_profile(queue_timeout_ms=30, max_queued_queries=4)
+    lease = await admission.acquire(profile)
+    try:
+        cancelled = asyncio.create_task(admission.acquire(profile))
+        await asyncio.sleep(0.005)
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+        with pytest.raises(QueryFailure):
+            await admission.acquire(profile)
+    finally:
+        lease.release_pending()
+    assert not admission._waiting and not admission._waiters
+
+
+def test_release_ignores_waiters_from_a_closed_event_loop():
+    admission = QueryAdmission()
+    closed_loop = asyncio.new_event_loop()
+    closed_loop.close()
+    admission._active["one"] = 1
+    admission._waiters["one"] = {(closed_loop, asyncio.Event())}
+
+    admission.release("one")
+
+    assert "one" not in admission._active

@@ -90,6 +90,7 @@ startup_timeout = 5
 # user = "readonly_user"
 # credential_provider = "keyring"
 # credential_ref = "secure-dev"
+# credential_cache_seconds = 30   # optional, 0-300; default 0 re-reads per request
 # database = "app_dev"
 # allowed_databases = ["app_dev"]
 # Then store the password interactively (it is never printed):

@@ -124,6 +124,32 @@ class JsonlAuditSink:
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
+        # Syscall trimming only: resolved paths and directories already created.
+        # A vanished directory is recreated on the next open (see _append).
+        self._resolved_paths: dict[str, Path] = {}
+        self._ready_dirs: set[Path] = set()
+
+    def _resolve(self, configured: str) -> Path:
+        path = self._resolved_paths.get(configured)
+        if path is None:
+            path = Path(configured).expanduser().resolve()
+            self._resolved_paths[configured] = path
+        return path
+
+    def _ensure_parent(self, path: Path) -> None:
+        if path.parent not in self._ready_dirs:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self._ready_dirs.add(path.parent)
+
+    def _open_for_append(self, path: Path, **kwargs: Any):
+        self._ensure_parent(path)
+        try:
+            return path.open("a", **kwargs)
+        except FileNotFoundError:
+            # The directory was removed after it was first created.
+            self._ready_dirs.discard(path.parent)
+            self._ensure_parent(path)
+            return path.open("a", **kwargs)
 
     @staticmethod
     def _canonical_json(event: dict[str, Any]) -> str:
@@ -200,11 +226,10 @@ class JsonlAuditSink:
             return
         if not profile.audit_log_file:
             raise AuditWriteError("Fail-closed audit requires a durable log file")
-        path = Path(profile.audit_log_file).expanduser().resolve()
         try:
             with self._lock:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                with path.open("a", encoding="utf-8"):
+                path = self._resolve(profile.audit_log_file)
+                with self._open_for_append(path, encoding="utf-8"):
                     pass
         except OSError as exc:
             raise AuditWriteError(
@@ -219,17 +244,22 @@ class JsonlAuditSink:
         if not profile.audit_log_file:
             return event, serialized
 
-        path = Path(profile.audit_log_file).expanduser().resolve()
         encoded_size = len(serialized.encode("utf-8")) + 1
         try:
             with self._lock:
-                path.parent.mkdir(parents=True, exist_ok=True)
+                path = self._resolve(profile.audit_log_file)
+                try:
+                    current_size: int | None = path.stat().st_size
+                except FileNotFoundError:
+                    current_size = None
                 if (
-                    path.exists()
-                    and path.stat().st_size + encoded_size > profile.audit_log_max_bytes
+                    current_size is not None
+                    and current_size + encoded_size > profile.audit_log_max_bytes
                 ):
                     self._rotate(path, profile.audit_log_backup_count)
-                with path.open("a", encoding="utf-8", newline="\n") as stream:
+                with self._open_for_append(
+                    path, encoding="utf-8", newline="\n"
+                ) as stream:
                     stream.write(serialized + "\n")
                     stream.flush()
                     if profile.audit_fsync:
