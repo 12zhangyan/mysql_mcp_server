@@ -125,8 +125,9 @@ function virtualenvPython(virtualenv, platform = process.platform) {
 }
 
 function runChecked(command, args, label) {
+  // stdout carries the MCP protocol, so bootstrap output must go to stderr.
   const result = spawnSync(command, args, {
-    stdio: "inherit",
+    stdio: ["ignore", 2, 2],
     windowsHide: true,
   });
   if (result.error) {

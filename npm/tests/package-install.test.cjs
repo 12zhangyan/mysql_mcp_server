@@ -80,7 +80,7 @@ test(
       assert.equal(version.stdout.trim(), manifest.version);
 
       const runtimeCache = path.join(temporary, "runtime-cache");
-      checked(process.execPath, [launcher], {
+      const firstRun = checked(process.execPath, [launcher], {
         input: "",
         timeout: 240_000,
         env: {
@@ -88,6 +88,8 @@ test(
           MYSQL_MCP_NPM_CACHE_DIR: runtimeCache,
         },
       });
+      assert.equal(firstRun.stdout, "", "bootstrap output leaked into MCP stdout");
+      assert.match(firstRun.stderr, /Successfully installed/);
 
       const runtimePython = virtualenvPython(
         path.join(runtimeCache, manifest.version, "venv"),
