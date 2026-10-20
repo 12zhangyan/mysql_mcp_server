@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.4] - 2026-10-19
+
+### Fixed
+- The npm launcher no longer writes Python environment bootstrap output (venv creation
+  and pip installs) to stdout on first run. That output now goes to stderr, so the MCP
+  protocol stream stays clean for strict clients on the first start after install or
+  upgrade. Bootstrap subprocesses no longer inherit the client's stdin.
+
 ## [0.9.3] - 2026-10-19
 
 ### Changed
