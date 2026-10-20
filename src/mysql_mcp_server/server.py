@@ -9,7 +9,8 @@ import re
 import time
 import uuid
 from contextlib import contextmanager
-from typing import Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable, Optional, Tuple
 
 import anyio
 import sqlglot
@@ -17,7 +18,7 @@ from dotenv import load_dotenv
 from mcp.server import Server
 from mcp.types import (CallToolResult, GetPromptResult, Prompt, PromptArgument,
                        PromptMessage, Resource, ResourceTemplate, TextContent,
-                       Tool, ToolAnnotations)
+                       Tool)
 from mysql.connector import Error, connect
 from mysql.connector.errors import ReadTimeoutError, WriteTimeoutError
 from pydantic import AnyUrl
@@ -38,8 +39,10 @@ from .results import (TRUNCATION_SUFFIX, QueryResult, mask_result_rows,
 from .runtime import (QueryControl, QueryLease, close_runtime_resources,
                       connection_pool_manager, query_admission,
                       ssh_tunnel_manager)
+from .tool_specs import tool_definitions
 from .sql_guard import (
     build_explain_query,
+    parse_mysql_query,
     query_fingerprint,
     query_type,
     validate_database_access,
@@ -137,12 +140,6 @@ def _table_argument(arguments: dict, *, required: bool = False) -> str | None:
     return value
 
 
-TRUNCATION_GUIDANCE = (
-    "Results are capped by the connection max_rows (MYSQL_MAX_ROWS, default 500, "
-    "maximum 1000). Always inspect truncated and next_offset. Repeat with the same "
-    "filters and offset=next_offset until truncated is false; a single page is not "
-    "the complete catalog."
-)
 
 
 def _metadata_name_filter(arguments: dict, *, table: str | None = None) -> str:
@@ -154,10 +151,21 @@ def _metadata_name_filter(arguments: dict, *, table: str | None = None) -> str:
     )
 
 
-def _bounded_query_sql(query: str, *, row_limit: int, page_offset: int) -> str | None:
-    """Push MCP paging into an outer query when it can be preserved exactly."""
+def _bounded_query_sql(
+    query: str,
+    *,
+    row_limit: int,
+    page_offset: int,
+    parsed: exp.Expression | None = None,
+) -> str | None:
+    """Push MCP paging into an outer query when it can be preserved exactly.
+
+    ``parsed`` is an already parsed AST of ``query``; it is copied, not mutated.
+    """
     try:
-        statement = sqlglot.parse_one(query, read="mysql")
+        statement = (
+            sqlglot.parse_one(query, read="mysql") if parsed is None else parsed.copy()
+        )
     except Exception:
         return None
     if not isinstance(statement, exp.Query):
@@ -188,10 +196,11 @@ def _bounded_query_sql(query: str, *, row_limit: int, page_offset: int) -> str |
             return None
         fetch_limit = min(row_limit + 1, max(original_limit - page_offset, 0))
 
-    statement = statement.limit(fetch_limit, copy=False)
+    # Literal nodes avoid sqlglot re-parsing "LIMIT n" / "OFFSET n" fragments.
+    statement = statement.limit(exp.Literal.number(fetch_limit), copy=False)
     effective_offset = original_offset + page_offset
     if effective_offset:
-        statement = statement.offset(effective_offset, copy=False)
+        statement = statement.offset(exp.Literal.number(effective_offset), copy=False)
     else:
         statement.set("offset", None)
     return statement.sql(dialect="mysql")
@@ -257,11 +266,51 @@ def _apply_server_query_timeout(cursor, timeout_ms: int) -> str:
             return "connector"
 
 
+# transaction_read_only exists from MySQL 5.7.20; MariaDB names it differently.
+_COMBINED_SESSION_MIN_VERSION = (5, 7, 20)
+_SESSION_SYNTAX_ERRNOS = {1064, 1193}
+
+
+def _supports_combined_session_setup(connection_object) -> bool:
+    """Decide from the handshake version string; this costs no round trip."""
+    server_info = getattr(connection_object, "server_info", None)
+    if not isinstance(server_info, str) or "mariadb" in server_info.lower():
+        return False
+    match = re.match(r"(\d+)\.(\d+)\.(\d+)", server_info)
+    if match is None:
+        return False
+    return tuple(int(part) for part in match.groups()) >= _COMBINED_SESSION_MIN_VERSION
+
+
+def _prepare_read_only_session(connection_object, cursor, timeout_ms: int) -> None:
+    """Apply the statement timeout and read-only session before any user SQL.
+
+    MySQL accepts both session settings in one atomic SET, saving a round trip.
+    Other servers, and MySQL-compatible servers rejecting that statement, use
+    the original per-statement sequence with its MariaDB timeout fallback.
+    """
+    if _supports_combined_session_setup(connection_object):
+        try:
+            cursor.execute(
+                f"SET SESSION MAX_EXECUTION_TIME = {timeout_ms}, "
+                "SESSION transaction_read_only = ON"
+            )
+        except Error as exc:
+            if getattr(exc, "errno", None) not in _SESSION_SYNTAX_ERRNOS:
+                raise
+        else:
+            cursor.execute("START TRANSACTION READ ONLY")
+            return
+    _apply_server_query_timeout(cursor, timeout_ms)
+    _start_read_only_transaction(cursor)
+
+
 def _open_connection(
     profile: ConnectionProfile,
     *,
     database: str | None,
     query_timeout_ms: int,
+    password: str | None = None,
 ):
     endpoint = ssh_tunnel_manager.endpoint(profile)
     config = build_connector_config(
@@ -270,6 +319,7 @@ def _open_connection(
         host=endpoint.host,
         port=endpoint.port,
         query_timeout_ms=query_timeout_ms,
+        password=password,
     )
     connection = connection_pool_manager.get_connection(
         profile,
@@ -416,7 +466,7 @@ def _sync_resource_query(
     connection_object = None
     discard_connection = False
     try:
-        ready, readiness = profile.runtime_status()
+        ready, readiness, password = profile.runtime_readiness()
         if not ready:
             raise ValueError(readiness)
         validate_required_audit_context(profile, current_audit_context())
@@ -427,14 +477,18 @@ def _sync_resource_query(
                 f"System database '{selected_database}' is blocked for connection "
                 f"'{profile.name}'"
             )
+        statement = parse_mysql_query(query)
         validate_database_access(
             query,
             selected_database=selected_database,
             allowed_databases=profile.allowed_databases,
             allow_system_databases=profile.allow_system_databases,
             internal=True,
+            statement=statement,
         )
-        validate_function_safety(query, allowed_functions=profile.allowed_functions)
+        validate_function_safety(
+            query, allowed_functions=profile.allowed_functions, statement=statement
+        )
         audit_sink.preflight(profile)
         _write_audit_event(
             profile,
@@ -445,17 +499,23 @@ def _sync_resource_query(
             internal=True,
         )
         policy_allowed = True
-        connection_object, _ = _open_connection(
-            profile,
-            database=selected_database,
-            query_timeout_ms=profile.query_timeout_ms,
-        )
+        try:
+            connection_object, _ = _open_connection(
+                profile,
+                database=selected_database,
+                query_timeout_ms=profile.query_timeout_ms,
+                password=password,
+            )
+        except Error as exc:
+            _forget_rejected_credential(profile, exc)
+            raise
         with connection_object.cursor() as cursor:
-            _apply_server_query_timeout(cursor, profile.query_timeout_ms)
-            _start_read_only_transaction(cursor)
+            _prepare_read_only_session(
+                connection_object, cursor, profile.query_timeout_ms
+            )
             row_limit = min(max_rows, profile.max_rows)
             executed_query = _bounded_query_sql(
-                query, row_limit=row_limit, page_offset=0
+                query, row_limit=row_limit, page_offset=0, parsed=statement
             )
             cursor.execute(executed_query or query)
             columns = [str(item[0]) for item in cursor.description]
@@ -668,483 +728,7 @@ async def read_resource(uri: AnyUrl) -> str:
 @app.list_tools()
 async def list_tools() -> list[Tool]:
     """Define discovery and strictly read-only database tools."""
-    connection_property = {
-        "type": "string",
-        "description": (
-            "Named connection from MYSQL_PROFILES_FILE. "
-            "Omit to use the configured default."
-        ),
-    }
-    database_property = {
-        "type": "string",
-        "description": "Database/schema for this call. Omit to use the profile default.",
-    }
-    audit_context_property = {
-        "type": "object",
-        "description": (
-            "Optional enterprise audit attribution. Profiles may require selected "
-            "fields before any query is executed."
-        ),
-        "additionalProperties": False,
-        "properties": {
-            "actor": {
-                "type": "string",
-                "maxLength": 128,
-                "description": "Human or service identity responsible for the request.",
-            },
-            "purpose": {
-                "type": "string",
-                "maxLength": 256,
-                "description": "Business purpose for the database access.",
-            },
-            "ticket_id": {
-                "type": "string",
-                "maxLength": 128,
-                "description": "Change, incident, case, or work-item identifier.",
-            },
-        },
-    }
-    target_properties = {
-        "connection": connection_property,
-        "database": database_property,
-        "audit_context": audit_context_property,
-    }
-    result_properties = {
-        "max_response_bytes": {
-            "type": "integer",
-            "minimum": 4096,
-            "maximum": 4194304,
-            "description": "Maximum UTF-8 response text bytes; may only lower the profile budget.",
-        },
-        "max_rows": {
-            "type": "integer",
-            "minimum": 1,
-            "maximum": 1000,
-            "description": (
-                "Maximum rows returned for this page. Defaults to the connection "
-                "MYSQL_MAX_ROWS cap. Check truncated/next_offset; one page is not "
-                "a complete result."
-            ),
-        },
-        "offset": {
-            "type": "integer",
-            "minimum": 0,
-            "maximum": 1_000_000,
-            "description": (
-                "Rows to skip before returning this page. Omit or 0 for the first "
-                "page; continue with next_offset until truncated is false."
-            ),
-        },
-        "result_format": {
-            "type": "string",
-            "enum": ["csv", "json", "compact"],
-            "description": "csv preserves legacy data; json or compact includes target, paging, masking and truncation metadata.",
-        },
-        "timeout_ms": {
-            "type": "integer",
-            "minimum": 100,
-            "maximum": 300_000,
-            "description": (
-                "Per-call timeout. It may lower but never exceed the profile limit."
-            ),
-        },
-    }
-    table_pattern_property = {
-        "type": "string",
-        "minLength": 1,
-        "maxLength": 128,
-        "description": (
-            "Optional name glob in the selected database; use * for many "
-            "characters and ? for one character. Cannot combine with "
-            "table_name/table or table_names."
-        ),
-    }
-    table_names_property = {
-        "type": "array",
-        "minItems": 1,
-        "maxItems": MAX_TABLE_NAMES,
-        "items": {"type": "string"},
-        "description": (
-            "Batch of 1-100 bare table names in this database. Lists longer than "
-            "100 are rejected. Cannot combine with table_name/table or table_pattern."
-        ),
-    }
-    return [
-        Tool(
-            name="list_connections",
-            description=(
-                "List configured MySQL connection profiles without exposing passwords. "
-                "Call this first when multiple environments are configured."
-            ),
-            inputSchema={"type": "object", "properties": {}},
-            annotations=ToolAnnotations(
-                title="List Connections",
-                readOnlyHint=True,
-                destructiveHint=False,
-            ),
-        ),
-        Tool(
-            name="validate_connections",
-            description=(
-                "Reload and validate all profile configuration and password "
-                "environment references without connecting to MySQL."
-            ),
-            inputSchema={"type": "object", "properties": {}},
-            annotations=ToolAnnotations(
-                title="Validate Connections",
-                readOnlyHint=True,
-                destructiveHint=False,
-            ),
-        ),
-        Tool(
-            name="check_connection",
-            description=(
-                "Run read-only health checks and SHOW GRANTS on one connection."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": target_properties,
-            },
-            annotations=ToolAnnotations(
-                title="Check Connection",
-                readOnlyHint=True,
-                destructiveHint=False,
-            ),
-        ),
-        Tool(
-            name="list_databases",
-            description="List accessible non-system databases on a connection.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "connection": connection_property,
-                    "offset": result_properties["offset"],
-                    "max_rows": result_properties["max_rows"],
-                    "audit_context": audit_context_property,
-                    "result_format": result_properties["result_format"],
-                    "max_response_bytes": result_properties["max_response_bytes"],
-                    "timeout_ms": result_properties["timeout_ms"],
-                },
-            },
-            annotations=ToolAnnotations(
-                title="List Databases",
-                readOnlyHint=True,
-                destructiveHint=False,
-            ),
-        ),
-        Tool(
-            name="list_tables",
-            description=(
-                "List tables and views in a selected database, with optional "
-                "name filtering and pagination for large schemas. Optional search "
-                "matches names and comments of tables and columns, returning match "
-                "evidence. " + TRUNCATION_GUIDANCE
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    **target_properties,
-                    "search": {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": 128,
-                        "description": "Literal keyword in table/column names or comments; returns one row per matching field.",
-                    },
-                    "table_name": {
-                        "type": "string",
-                        "description": "Optional exact bare table name filter.",
-                    },
-                    "table": {
-                        "type": "string",
-                        "description": "Compatibility alias for table_name.",
-                    },
-                    "table_pattern": table_pattern_property,
-                    "max_rows": result_properties["max_rows"],
-                    "offset": result_properties["offset"],
-                    "result_format": result_properties["result_format"],
-                    "max_response_bytes": result_properties["max_response_bytes"],
-                    "timeout_ms": result_properties["timeout_ms"],
-                },
-            },
-            annotations=ToolAnnotations(
-                title="List Tables",
-                readOnlyHint=True,
-                destructiveHint=False,
-            ),
-        ),
-        Tool(
-            name="execute_sql",
-            description=(
-                "Execute one strictly read-only SQL statement. Only SELECT, WITH, "
-                "SHOW, DESCRIBE, DESC, EXPLAIN, and TABLE are accepted. Writes, "
-                "DDL, transaction commands, locking reads, SELECT INTO, and "
-                "multiple statements are rejected before connecting. "
-                "When table or column names are unknown, first use list_tables and get_schema_info; "
-                "do not guess names. Keep connection and database consistent across calls. "
-                "After TABLE_NOT_FOUND or COLUMN_NOT_FOUND, inspect metadata and correct SQL; "
-                "never repeat the unchanged query or automatically switch databases. "
-                "Use a stable unique ORDER BY for pagination; pages are separate reads, not one snapshot."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "One read-only SQL statement.",
-                    },
-                    **target_properties,
-                    **result_properties,
-                },
-                "required": ["query"],
-            },
-            annotations=ToolAnnotations(
-                title="Execute Read-Only SQL",
-                readOnlyHint=True,
-                destructiveHint=False,
-            ),
-        ),
-        Tool(
-            name="explain_sql",
-            description=(
-                "Inspect the estimated execution plan for a SELECT/WITH query "
-                "before running an expensive query. Pass the original SQL without "
-                "EXPLAIN; ANALYZE, writes and multiple statements are rejected. "
-                "Preserves the query's original LIMIT/OFFSET; max_rows/offset page "
-                "the plan only. Uses the same database allowlist, function policy, "
-                "timeouts, masking and audit as execute_sql. Estimates are not "
-                "measured execution time. Long plan cells are kept complete; if "
-                "the response is too large, use plan_output=chunks and follow "
-                "next_offset with expected_plan_id from plan.id. " + TRUNCATION_GUIDANCE
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "One SELECT or WITH query, without EXPLAIN.",
-                    },
-                    "plan_output": {
-                        "type": "string",
-                        "enum": ["rows", "chunks"],
-                        "default": "rows",
-                        "description": "rows keeps complete plan cells. chunks requests "
-                        "EXPLAIN FORMAT=JSON and pages its masked text as part/text rows; "
-                        "concatenate text in part order. offset/max_rows count chunks. "
-                        "Uses json by default; json/compact are required to carry plan.id.",
-                    },
-                    "expected_plan_id": {
-                        "type": "string",
-                        "pattern": "^[a-f0-9]{64}$",
-                        "description": "For chunks, required when offset>0. Copy plan.id "
-                        "from the first page; PLAN_CHANGED means restart at offset=0.",
-                    },
-                    **target_properties,
-                    **result_properties,
-                },
-                "required": ["query"],
-            },
-            annotations=ToolAnnotations(
-                title="Explain Read-Only SQL",
-                readOnlyHint=True,
-                destructiveHint=False,
-            ),
-        ),
-        Tool(
-            name="query",
-            description=(
-                "Compatibility alias for execute_sql. Executes one strictly "
-                "read-only SQL statement with the same explicit connection, "
-                "database, limits, masking, and audit controls. "
-                "Verify unknown table/column names using list_tables/get_schema_info first. "
-                "After deterministic SQL errors inspect metadata before correcting SQL; do not repeat unchanged SQL."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "One read-only SQL statement.",
-                    },
-                    **target_properties,
-                    **result_properties,
-                },
-                "required": ["query"],
-            },
-            annotations=ToolAnnotations(
-                title="Query (Read-Only Compatibility Alias)",
-                readOnlyHint=True,
-                destructiveHint=False,
-            ),
-        ),
-        Tool(
-            name="get_schema_info",
-            description=(
-                "Get column metadata for one table, a table_names/table_pattern "
-                "batch, or all tables in the selected database. A table may be "
-                "written as database.table. " + TRUNCATION_GUIDANCE
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "table_name": {
-                        "type": "string",
-                        "description": "Optional bare table name or database.table.",
-                    },
-                    "table": {
-                        "type": "string",
-                        "description": "Compatibility alias for table_name.",
-                    },
-                    "detail": {
-                        "type": "boolean",
-                        "default": False,
-                        "description": "Return pageable table, column, index (including PRIMARY) and declared foreign-key rows in one result; KIND identifies each row.",
-                    },
-                    **target_properties,
-                    "table_names": table_names_property,
-                    "table_pattern": table_pattern_property,
-                    "max_rows": result_properties["max_rows"],
-                    "offset": result_properties["offset"],
-                    "result_format": result_properties["result_format"],
-                    "max_response_bytes": result_properties["max_response_bytes"],
-                    "timeout_ms": result_properties["timeout_ms"],
-                },
-            },
-            annotations=ToolAnnotations(
-                title="Get Schema Info",
-                readOnlyHint=True,
-                destructiveHint=False,
-            ),
-        ),
-        Tool(
-            name="get_table_sample",
-            description="Fetch a small sample from a table without modifying data.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "table_name": {
-                        "type": "string",
-                        "description": "Bare table name or database.table.",
-                    },
-                    "table": {
-                        "type": "string",
-                        "description": "Compatibility alias for table_name.",
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 100,
-                        "description": "Number of rows to return (default 5, max 100).",
-                    },
-                    **target_properties,
-                    "offset": result_properties["offset"],
-                    "result_format": result_properties["result_format"],
-                    "max_response_bytes": result_properties["max_response_bytes"],
-                    "timeout_ms": result_properties["timeout_ms"],
-                },
-                "anyOf": [{"required": ["table_name"]}, {"required": ["table"]}],
-            },
-            annotations=ToolAnnotations(
-                title="Get Table Sample",
-                readOnlyHint=True,
-                destructiveHint=False,
-            ),
-        ),
-        Tool(
-            name="inspect_catalog",
-            description=(
-                "Inspect an allowlisted metadata projection for the selected user "
-                "database without granting arbitrary information_schema access. "
-                "kind selects tables, columns, indexes, constraints, foreign_keys, "
-                "or views. Omit table_name to page the whole database after a "
-                "stable sort. " + TRUNCATION_GUIDANCE
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "kind": {
-                        "type": "string",
-                        "enum": [
-                            "tables",
-                            "columns",
-                            "indexes",
-                            "constraints",
-                            "foreign_keys",
-                            "views",
-                        ],
-                    },
-                    "table_name": {
-                        "type": "string",
-                        "description": "Optional bare table name filter.",
-                    },
-                    "table": {
-                        "type": "string",
-                        "description": "Compatibility alias for table_name.",
-                    },
-                    **target_properties,
-                    "table_names": table_names_property,
-                    "table_pattern": table_pattern_property,
-                    "max_rows": result_properties["max_rows"],
-                    "offset": result_properties["offset"],
-                    "result_format": result_properties["result_format"],
-                    "max_response_bytes": result_properties["max_response_bytes"],
-                    "timeout_ms": result_properties["timeout_ms"],
-                },
-                "required": ["kind"],
-            },
-            annotations=ToolAnnotations(
-                title="Inspect Controlled Catalog",
-                readOnlyHint=True,
-                destructiveHint=False,
-            ),
-        ),
-        Tool(
-            name="dump_schema",
-            description=(
-                "Return allowlisted table and column metadata grouped by table for "
-                "the selected database. Use this to pull a large schema in pages "
-                "instead of calling inspect_catalog once per table. kinds may only "
-                "be tables and/or columns; indexes and constraints stay on "
-                "inspect_catalog. " + TRUNCATION_GUIDANCE
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "kinds": {
-                        "type": "array",
-                        "minItems": 1,
-                        "items": {
-                            "type": "string",
-                            "enum": ["tables", "columns"],
-                        },
-                        "description": (
-                            "Metadata sections to include. Defaults to tables and "
-                            "columns. Other catalog kinds remain on inspect_catalog."
-                        ),
-                    },
-                    "table_name": {
-                        "type": "string",
-                        "description": "Optional bare table name filter.",
-                    },
-                    "table": {
-                        "type": "string",
-                        "description": "Compatibility alias for table_name.",
-                    },
-                    **target_properties,
-                    "table_names": table_names_property,
-                    "table_pattern": table_pattern_property,
-                    "max_rows": result_properties["max_rows"],
-                    "offset": result_properties["offset"],
-                    "max_response_bytes": result_properties["max_response_bytes"],
-                    "timeout_ms": result_properties["timeout_ms"],
-                },
-            },
-            annotations=ToolAnnotations(
-                title="Dump Grouped Schema",
-                readOnlyHint=True,
-                destructiveHint=False,
-            ),
-        ),
-    ]
+    return tool_definitions()
 
 
 def _request_identity() -> tuple[str, str | None, str | None]:
@@ -1159,6 +743,387 @@ def _request_identity() -> tuple[str, str | None, str | None]:
         str(request_context.request_id),
         client_info.name if client_info else None,
         client_info.version if client_info else None,
+    )
+
+
+ToolResponse = list[TextContent] | CallToolResult
+ToolHandler = Callable[
+    [str, dict, str | None, str | None], Awaitable[ToolResponse]
+]
+# Handlers keyed by tool name; definitions live in tool_specs.tool_definitions().
+_TOOL_HANDLERS: dict[str, ToolHandler] = {}
+
+
+def _tool(*names: str) -> Callable[[ToolHandler], ToolHandler]:
+    """Register one handler for the named tools (aliases share a handler)."""
+
+    def register(handler: ToolHandler) -> ToolHandler:
+        for tool_name in names:
+            if tool_name in _TOOL_HANDLERS:
+                raise RuntimeError(f"Duplicate tool handler: {tool_name}")
+            _TOOL_HANDLERS[tool_name] = handler
+        return handler
+
+    return register
+
+
+@_tool("list_connections", "validate_connections")
+async def _tool_list_connections(
+    name: str, arguments: dict, connection: str | None, database: str | None
+) -> ToolResponse:
+    registry = load_connection_registry(
+        force_reload=name == "validate_connections"
+    )
+    profiles = []
+    for profile in registry.profiles.values():
+        ready, status = profile.runtime_status()
+        profiles.append(
+            {
+                "name": profile.name,
+                "default": profile.name == registry.default,
+                "database": profile.database,
+                "allowed_databases": list(profile.allowed_databases),
+                "allowed_functions": list(profile.allowed_functions),
+                "description": profile.description,
+                "ready": ready,
+                "status": status,
+                "ssh": profile.ssh.enabled,
+                "pool_size": profile.pool_size,
+                "query_timeout_ms": profile.query_timeout_ms,
+                "max_rows": profile.max_rows,
+                "max_response_bytes": profile.max_response_bytes,
+                "max_concurrent_queries": profile.max_concurrent_queries,
+                "max_queued_queries": profile.max_queued_queries,
+                "queue_timeout_ms": profile.queue_timeout_ms,
+                "result_format": profile.result_format,
+                "credential_provider": (
+                    profile.credential_provider
+                    or ("environment" if profile.password_env else "inline")
+                ),
+                "audit": {
+                    "enabled": profile.audit_enabled,
+                    "durable": bool(profile.audit_log_file),
+                    "signed": bool(profile.audit_hmac_key_env),
+                    "required_context": list(profile.audit_required_context),
+                    "fail_closed": profile.audit_fail_closed,
+                },
+            }
+        )
+    database_routes: dict[str, list[str]] = {}
+    for profile in registry.profiles.values():
+        declared_databases = profile.allowed_databases or (
+            (profile.database,) if profile.database else ()
+        )
+        for declared_database in declared_databases:
+            database_routes.setdefault(declared_database, []).append(
+                profile.name
+            )
+    payload = {
+        "valid": not registry.errors
+        and all(item["ready"] for item in profiles),
+        "default": registry.default,
+        "source": (
+            "environment"
+            if registry.source == "environment"
+            else "profiles_file"
+        ),
+        "profiles": profiles,
+        "database_routes": {
+            database_name: sorted(connection_names)
+            for database_name, connection_names in sorted(
+                database_routes.items()
+            )
+        },
+        "logical_routes": {
+            logical_name: {
+                alias: {
+                    "connection": target.connection,
+                    "database": target.database,
+                }
+                for alias, target in sorted(mappings.items())
+            }
+            for logical_name, mappings in sorted(registry.routes.items())
+        },
+        "selection_guidance": (
+            "Pass connection and database explicitly. Configured logical "
+            "routes resolve only exact aliases; the server never switches "
+            "environments implicitly."
+        ),
+        "errors": registry.errors,
+    }
+    return [
+        TextContent(
+            type="text",
+            text=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        )
+    ]
+
+
+@_tool("check_connection")
+async def _tool_check_connection(
+    name: str, arguments: dict, connection: str | None, database: str | None
+) -> ToolResponse:
+    return await check_connection(connection=connection, database=database)
+
+
+@_tool("list_databases")
+async def _tool_list_databases(
+    name: str, arguments: dict, connection: str | None, database: str | None
+) -> ToolResponse:
+    registry = load_connection_registry()
+    if connection and connection in registry.routes:
+        profile = registry.profiles.get(connection) or registry.get(
+            next(iter(registry.routes[connection].values())).connection
+        )
+        aliases = sorted(registry.routes[connection])
+        page_offset = int(arguments.get("offset", 0))
+        row_limit = int(arguments.get("max_rows", profile.max_rows))
+        if (
+            not 0 <= page_offset <= 1_000_000
+            or not 1 <= row_limit <= profile.max_rows
+        ):
+            raise ValueError(
+                "offset or max_rows is outside the permitted range"
+            )
+        result = QueryResult(
+            connection=connection,
+            database=None,
+            columns=["database_name"],
+            rows=[
+                [alias]
+                for alias in aliases[page_offset : page_offset + row_limit]
+            ],
+            offset=page_offset,
+            truncated=len(aliases) > page_offset + row_limit,
+            truncation_reasons=(
+                ("row_limit",) if len(aliases) > page_offset + row_limit else ()
+            ),
+            duration_ms=0,
+            query_id=hashlib.sha256(
+                f"logical-routes:{connection}".encode("utf-8")
+            ).hexdigest()[:16],
+            requested_connection=connection,
+        )
+        selected_format = (
+            arguments.get("result_format") or profile.result_format
+        ).lower()
+        if selected_format not in {"csv", "json", "compact"}:
+            raise ValueError("result_format must be csv, json or compact")
+        return [
+            TextContent(
+                type="text",
+                text=result.fit_response(
+                    selected_format,
+                    _response_budget(
+                        profile, arguments.get("max_response_bytes")
+                    ),
+                ).render(selected_format),
+            )
+        ]
+    profile = registry.get(connection)
+    query = _database_listing_query(profile)
+    return await run_query(
+        query,
+        connection=connection,
+        internal=True,
+        max_rows=arguments.get("max_rows"),
+        offset=arguments.get("offset", 0),
+        result_format=arguments.get("result_format"),
+        max_response_bytes=arguments.get("max_response_bytes"),
+        timeout_ms=arguments.get("timeout_ms"),
+    )
+
+
+@_tool("list_tables")
+async def _tool_list_tables(
+    name: str, arguments: dict, connection: str | None, database: str | None
+) -> ToolResponse:
+    target = load_connection_registry().resolve(connection, database)
+    schema_filter = f"'{target.database}'" if target.database else "DATABASE()"
+    table_name = _table_argument(arguments)
+    table_pattern = arguments.get("table_pattern")
+    if table_name and table_pattern is not None:
+        raise ValueError(
+            "Use either table_name/table or table_pattern, not both"
+        )
+    name_filter = ""
+    if table_name:
+        table = validate_identifier(table_name)
+        name_filter = f" AND TABLE_NAME = '{table}'"
+    elif table_pattern is not None:
+        name_filter = table_pattern_filter(table_pattern)
+    query = (
+        "SELECT TABLE_NAME, TABLE_TYPE, TABLE_ROWS, TABLE_COMMENT "
+        "FROM information_schema.TABLES "
+        f"WHERE TABLE_SCHEMA = {schema_filter}{name_filter} "
+        "ORDER BY TABLE_NAME"
+    )
+    if arguments.get("search") is not None:
+        query = search_tables_sql(
+            schema_filter, name_filter, arguments["search"]
+        )
+    return await run_query(
+        query,
+        connection=connection,
+        database=database,
+        max_rows=arguments.get("max_rows"),
+        offset=arguments.get("offset", 0),
+        internal=True,
+        result_format=arguments.get("result_format"),
+        max_response_bytes=arguments.get("max_response_bytes"),
+        timeout_ms=arguments.get("timeout_ms"),
+    )
+
+
+@_tool("execute_sql", "explain_sql", "query")
+async def _tool_run_sql(
+    name: str, arguments: dict, connection: str | None, database: str | None
+) -> ToolResponse:
+    query_argument = arguments.get("query")
+    if not isinstance(query_argument, str):
+        raise ValueError("Query is required")
+    return await run_query(
+        query_argument,
+        explain=name == "explain_sql",
+        **(
+            {
+                "plan_output": arguments.get("plan_output", "rows"),
+                "expected_plan_id": arguments.get("expected_plan_id"),
+            }
+            if name == "explain_sql"
+            else {}
+        ),
+        connection=connection,
+        database=database,
+        max_rows=arguments.get("max_rows"),
+        offset=arguments.get("offset", 0),
+        result_format=arguments.get("result_format"),
+        max_response_bytes=arguments.get("max_response_bytes"),
+        timeout_ms=arguments.get("timeout_ms"),
+    )
+
+
+@_tool("get_schema_info")
+async def _tool_get_schema_info(
+    name: str, arguments: dict, connection: str | None, database: str | None
+) -> ToolResponse:
+    table_name = _table_argument(arguments)
+    table_database, schema_table = (
+        parse_table_arg(table_name) if table_name else (None, None)
+    )
+    if table_database and database and table_database != database:
+        raise ValueError("database and qualified table_name must agree")
+    selected_database = table_database or database
+    target = load_connection_registry().resolve(connection, selected_database)
+    if (
+        target.database in SYSTEM_DATABASES
+        and not target.profile.allow_system_databases
+    ):
+        raise ValueError("System database access is blocked")
+    schema_filter = f"'{target.database}'" if target.database else "DATABASE()"
+    filters = _metadata_name_filter(arguments, table=schema_table)
+    detail = arguments.get("detail", False)
+    if not isinstance(detail, bool):
+        raise ValueError("detail must be a boolean")
+    if detail:
+        query = detailed_schema_sql(schema_filter, filters)
+    elif schema_table:
+        query = (
+            "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT, "
+            "COLUMN_COMMENT FROM information_schema.COLUMNS "
+            f"WHERE TABLE_SCHEMA = {schema_filter}{filters} "
+            "ORDER BY ORDINAL_POSITION, COLUMN_NAME"
+        )
+    else:
+        query = (
+            "SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, IS_NULLABLE "
+            "FROM information_schema.COLUMNS "
+            f"WHERE TABLE_SCHEMA = {schema_filter}{filters} "
+            "ORDER BY TABLE_NAME, ORDINAL_POSITION, COLUMN_NAME"
+        )
+    return await run_query(
+        query,
+        connection=connection,
+        database=selected_database,
+        internal=True,
+        max_rows=arguments.get("max_rows"),
+        offset=arguments.get("offset", 0),
+        result_format=arguments.get("result_format"),
+        max_response_bytes=arguments.get("max_response_bytes"),
+        timeout_ms=arguments.get("timeout_ms"),
+    )
+
+
+@_tool("get_table_sample")
+async def _tool_get_table_sample(
+    name: str, arguments: dict, connection: str | None, database: str | None
+) -> ToolResponse:
+    table_name = _table_argument(arguments, required=True)
+    assert table_name is not None
+    table_database, table = parse_table_arg(table_name)
+    limit = int(arguments.get("limit", 5))
+    if not 1 <= limit <= 100:
+        raise ValueError("limit must be between 1 and 100")
+    page_offset = int(arguments.get("offset", 0))
+    if not 0 <= page_offset <= 1_000_000:
+        raise ValueError("offset must be between 0 and 1000000")
+    selected_database = table_database or database
+    target = load_connection_registry().resolve(connection, selected_database)
+    table_ref = (
+        f"`{target.database}`.`{table}`" if target.database else f"`{table}`"
+    )
+    query = (
+        f"SELECT * FROM {table_ref} " f"LIMIT {limit + 1} OFFSET {page_offset}"
+    )
+    return await run_query(
+        query,
+        connection=connection,
+        database=selected_database,
+        max_rows=limit,
+        result_offset=page_offset,
+        bounded_result=True,
+        result_format=arguments.get("result_format"),
+        max_response_bytes=arguments.get("max_response_bytes"),
+        timeout_ms=arguments.get("timeout_ms"),
+    )
+
+
+@_tool("inspect_catalog")
+async def _tool_inspect_catalog(
+    name: str, arguments: dict, connection: str | None, database: str | None
+) -> ToolResponse:
+    kind = arguments.get("kind")
+    if not isinstance(kind, str):
+        raise ValueError("kind is required")
+    table_name = _table_argument(arguments)
+    catalog_table = validate_identifier(table_name) if table_name else None
+    target = load_connection_registry().resolve(connection, database)
+    if not target.database:
+        raise ValueError("database is required for inspect_catalog")
+    query = _catalog_query(
+        kind,
+        target.database,
+        _metadata_name_filter(arguments, table=catalog_table),
+    )
+    return await run_query(
+        query,
+        connection=connection,
+        database=database,
+        internal=True,
+        max_rows=arguments.get("max_rows"),
+        offset=arguments.get("offset", 0),
+        result_format=arguments.get("result_format"),
+        max_response_bytes=arguments.get("max_response_bytes"),
+        timeout_ms=arguments.get("timeout_ms"),
+    )
+
+
+@_tool("dump_schema")
+async def _tool_dump_schema(
+    name: str, arguments: dict, connection: str | None, database: str | None
+) -> ToolResponse:
+    return await _dump_schema(
+        arguments, connection=connection, database=database
     )
 
 
@@ -1189,331 +1154,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
         if database:
             validate_identifier(database)
 
-        if name in {"list_connections", "validate_connections"}:
-            registry = load_connection_registry(
-                force_reload=name == "validate_connections"
-            )
-            profiles = []
-            for profile in registry.profiles.values():
-                ready, status = profile.runtime_status()
-                profiles.append(
-                    {
-                        "name": profile.name,
-                        "default": profile.name == registry.default,
-                        "database": profile.database,
-                        "allowed_databases": list(profile.allowed_databases),
-                        "allowed_functions": list(profile.allowed_functions),
-                        "description": profile.description,
-                        "ready": ready,
-                        "status": status,
-                        "ssh": profile.ssh.enabled,
-                        "pool_size": profile.pool_size,
-                        "query_timeout_ms": profile.query_timeout_ms,
-                        "max_rows": profile.max_rows,
-                        "max_response_bytes": profile.max_response_bytes,
-                        "max_concurrent_queries": profile.max_concurrent_queries,
-                        "max_queued_queries": profile.max_queued_queries,
-                        "queue_timeout_ms": profile.queue_timeout_ms,
-                        "result_format": profile.result_format,
-                        "credential_provider": (
-                            profile.credential_provider
-                            or ("environment" if profile.password_env else "inline")
-                        ),
-                        "audit": {
-                            "enabled": profile.audit_enabled,
-                            "durable": bool(profile.audit_log_file),
-                            "signed": bool(profile.audit_hmac_key_env),
-                            "required_context": list(profile.audit_required_context),
-                            "fail_closed": profile.audit_fail_closed,
-                        },
-                    }
-                )
-            database_routes: dict[str, list[str]] = {}
-            for profile in registry.profiles.values():
-                declared_databases = profile.allowed_databases or (
-                    (profile.database,) if profile.database else ()
-                )
-                for declared_database in declared_databases:
-                    database_routes.setdefault(declared_database, []).append(
-                        profile.name
-                    )
-            payload = {
-                "valid": not registry.errors
-                and all(item["ready"] for item in profiles),
-                "default": registry.default,
-                "source": (
-                    "environment"
-                    if registry.source == "environment"
-                    else "profiles_file"
-                ),
-                "profiles": profiles,
-                "database_routes": {
-                    database_name: sorted(connection_names)
-                    for database_name, connection_names in sorted(
-                        database_routes.items()
-                    )
-                },
-                "logical_routes": {
-                    logical_name: {
-                        alias: {
-                            "connection": target.connection,
-                            "database": target.database,
-                        }
-                        for alias, target in sorted(mappings.items())
-                    }
-                    for logical_name, mappings in sorted(registry.routes.items())
-                },
-                "selection_guidance": (
-                    "Pass connection and database explicitly. Configured logical "
-                    "routes resolve only exact aliases; the server never switches "
-                    "environments implicitly."
-                ),
-                "errors": registry.errors,
-            }
-            return [
-                TextContent(
-                    type="text",
-                    text=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-                )
-            ]
-
-        if name == "check_connection":
-            return await check_connection(connection=connection, database=database)
-
-        if name == "list_databases":
-            registry = load_connection_registry()
-            if connection and connection in registry.routes:
-                profile = registry.profiles.get(connection) or registry.get(
-                    next(iter(registry.routes[connection].values())).connection
-                )
-                aliases = sorted(registry.routes[connection])
-                page_offset = int(arguments.get("offset", 0))
-                row_limit = int(arguments.get("max_rows", profile.max_rows))
-                if (
-                    not 0 <= page_offset <= 1_000_000
-                    or not 1 <= row_limit <= profile.max_rows
-                ):
-                    raise ValueError(
-                        "offset or max_rows is outside the permitted range"
-                    )
-                result = QueryResult(
-                    connection=connection,
-                    database=None,
-                    columns=["database_name"],
-                    rows=[
-                        [alias]
-                        for alias in aliases[page_offset : page_offset + row_limit]
-                    ],
-                    offset=page_offset,
-                    truncated=len(aliases) > page_offset + row_limit,
-                    truncation_reasons=(
-                        ("row_limit",) if len(aliases) > page_offset + row_limit else ()
-                    ),
-                    duration_ms=0,
-                    query_id=hashlib.sha256(
-                        f"logical-routes:{connection}".encode("utf-8")
-                    ).hexdigest()[:16],
-                    requested_connection=connection,
-                )
-                selected_format = (
-                    arguments.get("result_format") or profile.result_format
-                ).lower()
-                if selected_format not in {"csv", "json", "compact"}:
-                    raise ValueError("result_format must be csv, json or compact")
-                return [
-                    TextContent(
-                        type="text",
-                        text=result.fit_response(
-                            selected_format,
-                            _response_budget(
-                                profile, arguments.get("max_response_bytes")
-                            ),
-                        ).render(selected_format),
-                    )
-                ]
-            profile = registry.get(connection)
-            query = _database_listing_query(profile)
-            return await run_query(
-                query,
-                connection=connection,
-                internal=True,
-                max_rows=arguments.get("max_rows"),
-                offset=arguments.get("offset", 0),
-                result_format=arguments.get("result_format"),
-                max_response_bytes=arguments.get("max_response_bytes"),
-                timeout_ms=arguments.get("timeout_ms"),
-            )
-
-        if name == "list_tables":
-            target = load_connection_registry().resolve(connection, database)
-            schema_filter = f"'{target.database}'" if target.database else "DATABASE()"
-            table_name = _table_argument(arguments)
-            table_pattern = arguments.get("table_pattern")
-            if table_name and table_pattern is not None:
-                raise ValueError(
-                    "Use either table_name/table or table_pattern, not both"
-                )
-            name_filter = ""
-            if table_name:
-                table = validate_identifier(table_name)
-                name_filter = f" AND TABLE_NAME = '{table}'"
-            elif table_pattern is not None:
-                name_filter = table_pattern_filter(table_pattern)
-            query = (
-                "SELECT TABLE_NAME, TABLE_TYPE, TABLE_ROWS, TABLE_COMMENT "
-                "FROM information_schema.TABLES "
-                f"WHERE TABLE_SCHEMA = {schema_filter}{name_filter} "
-                "ORDER BY TABLE_NAME"
-            )
-            if arguments.get("search") is not None:
-                query = search_tables_sql(
-                    schema_filter, name_filter, arguments["search"]
-                )
-            return await run_query(
-                query,
-                connection=connection,
-                database=database,
-                max_rows=arguments.get("max_rows"),
-                offset=arguments.get("offset", 0),
-                internal=True,
-                result_format=arguments.get("result_format"),
-                max_response_bytes=arguments.get("max_response_bytes"),
-                timeout_ms=arguments.get("timeout_ms"),
-            )
-
-        if name in {"execute_sql", "query", "explain_sql"}:
-            query_argument = arguments.get("query")
-            if not isinstance(query_argument, str):
-                raise ValueError("Query is required")
-            return await run_query(
-                query_argument,
-                explain=name == "explain_sql",
-                **(
-                    {
-                        "plan_output": arguments.get("plan_output", "rows"),
-                        "expected_plan_id": arguments.get("expected_plan_id"),
-                    }
-                    if name == "explain_sql"
-                    else {}
-                ),
-                connection=connection,
-                database=database,
-                max_rows=arguments.get("max_rows"),
-                offset=arguments.get("offset", 0),
-                result_format=arguments.get("result_format"),
-                max_response_bytes=arguments.get("max_response_bytes"),
-                timeout_ms=arguments.get("timeout_ms"),
-            )
-
-        if name == "get_schema_info":
-            table_name = _table_argument(arguments)
-            table_database, schema_table = (
-                parse_table_arg(table_name) if table_name else (None, None)
-            )
-            if table_database and database and table_database != database:
-                raise ValueError("database and qualified table_name must agree")
-            selected_database = table_database or database
-            target = load_connection_registry().resolve(connection, selected_database)
-            if (
-                target.database in SYSTEM_DATABASES
-                and not target.profile.allow_system_databases
-            ):
-                raise ValueError("System database access is blocked")
-            schema_filter = f"'{target.database}'" if target.database else "DATABASE()"
-            filters = _metadata_name_filter(arguments, table=schema_table)
-            detail = arguments.get("detail", False)
-            if not isinstance(detail, bool):
-                raise ValueError("detail must be a boolean")
-            if detail:
-                query = detailed_schema_sql(schema_filter, filters)
-            elif schema_table:
-                query = (
-                    "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT, "
-                    "COLUMN_COMMENT FROM information_schema.COLUMNS "
-                    f"WHERE TABLE_SCHEMA = {schema_filter}{filters} "
-                    "ORDER BY ORDINAL_POSITION, COLUMN_NAME"
-                )
-            else:
-                query = (
-                    "SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, IS_NULLABLE "
-                    "FROM information_schema.COLUMNS "
-                    f"WHERE TABLE_SCHEMA = {schema_filter}{filters} "
-                    "ORDER BY TABLE_NAME, ORDINAL_POSITION, COLUMN_NAME"
-                )
-            return await run_query(
-                query,
-                connection=connection,
-                database=selected_database,
-                internal=True,
-                max_rows=arguments.get("max_rows"),
-                offset=arguments.get("offset", 0),
-                result_format=arguments.get("result_format"),
-                max_response_bytes=arguments.get("max_response_bytes"),
-                timeout_ms=arguments.get("timeout_ms"),
-            )
-
-        if name == "get_table_sample":
-            table_name = _table_argument(arguments, required=True)
-            assert table_name is not None
-            table_database, table = parse_table_arg(table_name)
-            limit = int(arguments.get("limit", 5))
-            if not 1 <= limit <= 100:
-                raise ValueError("limit must be between 1 and 100")
-            page_offset = int(arguments.get("offset", 0))
-            if not 0 <= page_offset <= 1_000_000:
-                raise ValueError("offset must be between 0 and 1000000")
-            selected_database = table_database or database
-            target = load_connection_registry().resolve(connection, selected_database)
-            table_ref = (
-                f"`{target.database}`.`{table}`" if target.database else f"`{table}`"
-            )
-            query = (
-                f"SELECT * FROM {table_ref} " f"LIMIT {limit + 1} OFFSET {page_offset}"
-            )
-            return await run_query(
-                query,
-                connection=connection,
-                database=selected_database,
-                max_rows=limit,
-                result_offset=page_offset,
-                bounded_result=True,
-                result_format=arguments.get("result_format"),
-                max_response_bytes=arguments.get("max_response_bytes"),
-                timeout_ms=arguments.get("timeout_ms"),
-            )
-
-        if name == "inspect_catalog":
-            kind = arguments.get("kind")
-            if not isinstance(kind, str):
-                raise ValueError("kind is required")
-            table_name = _table_argument(arguments)
-            catalog_table = validate_identifier(table_name) if table_name else None
-            target = load_connection_registry().resolve(connection, database)
-            if not target.database:
-                raise ValueError("database is required for inspect_catalog")
-            query = _catalog_query(
-                kind,
-                target.database,
-                _metadata_name_filter(arguments, table=catalog_table),
-            )
-            return await run_query(
-                query,
-                connection=connection,
-                database=database,
-                internal=True,
-                max_rows=arguments.get("max_rows"),
-                offset=arguments.get("offset", 0),
-                result_format=arguments.get("result_format"),
-                max_response_bytes=arguments.get("max_response_bytes"),
-                timeout_ms=arguments.get("timeout_ms"),
-            )
-
-        if name == "dump_schema":
-            return await _dump_schema(
-                arguments, connection=connection, database=database
-            )
-
-        raise ValueError(f"Unknown tool: {name}")
+        handler = _TOOL_HANDLERS.get(name)
+        if handler is None:
+            raise ValueError(f"Unknown tool: {name}")
+        return await handler(name, arguments, connection, database)
     except Exception as exc:
         logger.error("Error in call_tool %r (%s)", name, type(exc).__name__)
         if isinstance(exc, QueryFailure):
@@ -1726,6 +1370,16 @@ def _write_audit_event(
     audit_logger.info(serialized)
 
 
+# ER_ACCESS_DENIED_ERROR and ER_ACCESS_DENIED_NO_PASSWORD_ERROR.
+_CREDENTIAL_REJECTED_ERRNOS = {1045, 1698}
+
+
+def _forget_rejected_credential(profile: ConnectionProfile, exc: Error) -> None:
+    """Drop a cached secret the server rejected; the next request reloads it."""
+    if getattr(exc, "errno", None) in _CREDENTIAL_REJECTED_ERRNOS:
+        profile.invalidate_cached_credential()
+
+
 def _response_budget(profile: ConnectionProfile, requested: int | None) -> int:
     budget = profile.max_response_bytes if requested is None else requested
     if (
@@ -1737,6 +1391,47 @@ def _response_budget(profile: ConnectionProfile, requested: int | None) -> int:
             f"max_response_bytes must be between 4096 and profile limit {profile.max_response_bytes}"
         )
     return budget
+
+
+@dataclass(frozen=True)
+class _QueryScope:
+    """Resolved target fields shared by every audit event and failure payload."""
+
+    profile: ConnectionProfile
+    database: str | None
+    internal: bool
+    requested_connection: str | None
+    requested_database: str | None
+    route_applied: bool
+
+    def audit(self, *, query: str, status: str, duration_ms: int, **fields) -> None:
+        _write_audit_event(
+            self.profile,
+            query=query,
+            status=status,
+            duration_ms=duration_ms,
+            database=self.database,
+            internal=self.internal,
+            requested_connection=self.requested_connection,
+            requested_database=self.requested_database,
+            route_applied=self.route_applied,
+            **fields,
+        )
+
+    def failure_context(self, *, query: str) -> dict[str, Any]:
+        return {
+            "connection": self.profile.name,
+            "database": self.database,
+            "requested_connection": self.requested_connection,
+            "requested_database": self.requested_database,
+            "route_applied": self.route_applied,
+            "query_id": query_fingerprint(query),
+        }
+
+    def enrich(self, exc: BaseException, *, query: str) -> None:
+        if isinstance(exc, QueryFailure):
+            for key, value in self.failure_context(query=query).items():
+                exc.payload.setdefault(key, value)
 
 
 async def execute_query(
@@ -1779,8 +1474,16 @@ async def execute_query(
         raise
     profile = target.profile
     selected_database = target.database
+    scope = _QueryScope(
+        profile=profile,
+        database=selected_database,
+        internal=internal,
+        requested_connection=target.requested_connection,
+        requested_database=target.requested_database,
+        route_applied=target.route_applied,
+    )
     try:
-        ready, readiness = profile.runtime_status()
+        ready, readiness, password = profile.runtime_readiness()
         if not ready:
             raise ValueError(readiness)
         validate_required_audit_context(profile, current_audit_context())
@@ -1806,14 +1509,18 @@ async def execute_query(
                 f"System database '{selected_database}' is blocked for connection "
                 f"'{profile.name}'"
             )
+        statement = parse_mysql_query(query)
         validate_database_access(
             query,
             selected_database=selected_database,
             allowed_databases=profile.allowed_databases,
             allow_system_databases=profile.allow_system_databases,
             internal=internal,
+            statement=statement,
         )
-        validate_function_safety(query, allowed_functions=profile.allowed_functions)
+        validate_function_safety(
+            query, allowed_functions=profile.allowed_functions, statement=statement
+        )
 
         selected_format = result_format or (
             "json" if plan_output == "chunks" else profile.result_format
@@ -1848,41 +1555,32 @@ async def execute_query(
                 "timeout_ms must be at least 100 and cannot exceed the profile limit "
                 f"{profile.query_timeout_ms}"
             )
+        # Paging pushdown depends only on validated inputs; build it once, not per retry.
+        bounded_query = (
+            None
+            if bounded_result
+            else _bounded_query_sql(
+                query,
+                row_limit=row_limit,
+                page_offset=page_offset,
+                parsed=statement,
+            )
+        )
+        executed_query = query if bounded_query is None else bounded_query
         audit_sink.preflight(profile)
-        _write_audit_event(
-            profile,
+        scope.audit(
             query=query,
             status="started",
             duration_ms=round((time.monotonic() - started) * 1000),
-            database=selected_database,
-            internal=internal,
-            requested_connection=target.requested_connection,
-            requested_database=target.requested_database,
-            route_applied=target.route_applied,
         )
     except Exception as exc:
-        if isinstance(exc, QueryFailure):
-            for key, value in {
-                "connection": profile.name,
-                "database": selected_database,
-                "requested_connection": target.requested_connection,
-                "requested_database": target.requested_database,
-                "route_applied": target.route_applied,
-                "query_id": query_fingerprint(query),
-            }.items():
-                exc.payload.setdefault(key, value)
-        _write_audit_event(
-            profile,
+        scope.enrich(exc, query=query)
+        scope.audit(
             query=query,
             status="denied",
             policy="denied",
-            database=selected_database,
-            internal=internal,
             duration_ms=round((time.monotonic() - started) * 1000),
             error_type=type(exc).__name__,
-            requested_connection=target.requested_connection,
-            requested_database=target.requested_database,
-            route_applied=target.route_applied,
         )
         raise
 
@@ -1890,6 +1588,7 @@ async def execute_query(
     lease: QueryLease | None = None
 
     def _sync_execute_admitted(queue_wait_ms: int) -> QueryResult:
+        nonlocal password
         for attempt in range(2):
             if control.cancelled:
                 raise RuntimeError("Query was cancelled before connecting")
@@ -1897,26 +1596,22 @@ async def execute_query(
             discard_connection = False
             phase = "connect"
             try:
+                if password is None:
+                    # Command providers resolve here, once for all attempts.
+                    password = profile.resolve_password()
                 connection_object, config = _open_connection(
                     profile,
                     database=selected_database,
                     query_timeout_ms=effective_timeout,
+                    password=password,
                 )
                 control.bind(connection_object)
                 with connection_object.cursor() as cursor:
                     phase = "session_setup"
-                    _apply_server_query_timeout(cursor, effective_timeout)
-                    _start_read_only_transaction(cursor)
+                    _prepare_read_only_session(
+                        connection_object, cursor, effective_timeout
+                    )
                     phase = "execute"
-                    executed_query = query
-                    if not bounded_result:
-                        bounded_query = _bounded_query_sql(
-                            query,
-                            row_limit=row_limit,
-                            page_offset=page_offset,
-                        )
-                        if bounded_query is not None:
-                            executed_query = bounded_query
                     cursor.execute(executed_query)
                     if cursor.description is None:
                         raise RuntimeError(
@@ -2020,6 +1715,8 @@ async def execute_query(
             except Error as exc:
                 if isinstance(exc, (ReadTimeoutError, WriteTimeoutError)):
                     discard_connection = True
+                if phase == "connect":
+                    _forget_rejected_credential(profile, exc)
                 if attempt == 0 and retryable_connector_read(exc, phase=phase):
                     logger.warning(
                         "Retrying transient Connector/Python read failure "
@@ -2030,14 +1727,7 @@ async def execute_query(
                     )
                     continue
                 raise database_failure(
-                    exc,
-                    phase=phase,
-                    connection=profile.name,
-                    database=selected_database,
-                    requested_connection=target.requested_connection,
-                    requested_database=target.requested_database,
-                    route_applied=target.route_applied,
-                    query_id=query_fingerprint(query),
+                    exc, phase=phase, **scope.failure_context(query=query)
                 ) from exc
             finally:
                 if connection_object is not None:
@@ -2074,18 +1764,11 @@ async def execute_query(
             )
     except TimeoutError as exc:
         control.cancel()
-        duration = round((time.monotonic() - started) * 1000)
-        _write_audit_event(
-            profile,
+        scope.audit(
             query=query,
             status="timeout",
-            duration_ms=duration,
-            database=selected_database,
-            internal=internal,
+            duration_ms=round((time.monotonic() - started) * 1000),
             error_type="TimeoutError",
-            requested_connection=target.requested_connection,
-            requested_database=target.requested_database,
-            route_applied=target.route_applied,
         )
         raise QueryFailure(
             "QUERY_TIMEOUT",
@@ -2096,43 +1779,20 @@ async def execute_query(
             error_type="TimeoutError",
             phase="deadline",
             timeout_ms=effective_timeout,
-            connection=profile.name,
-            database=selected_database,
-            requested_connection=target.requested_connection,
-            requested_database=target.requested_database,
-            route_applied=target.route_applied,
-            query_id=query_fingerprint(query),
+            **scope.failure_context(query=query),
         ) from exc
     except anyio.get_cancelled_exc_class():
         control.cancel()
-        duration = round((time.monotonic() - started) * 1000)
-        _write_audit_event(
-            profile,
+        scope.audit(
             query=query,
             status="cancelled",
-            duration_ms=duration,
-            database=selected_database,
-            internal=internal,
+            duration_ms=round((time.monotonic() - started) * 1000),
             error_type="CancelledError",
-            requested_connection=target.requested_connection,
-            requested_database=target.requested_database,
-            route_applied=target.route_applied,
         )
         raise
     except Exception as exc:
-        duration = round((time.monotonic() - started) * 1000)
-        if isinstance(exc, QueryFailure):
-            for key, value in {
-                "connection": profile.name,
-                "database": selected_database,
-                "requested_connection": target.requested_connection,
-                "requested_database": target.requested_database,
-                "route_applied": target.route_applied,
-                "query_id": query_fingerprint(query),
-            }.items():
-                exc.payload.setdefault(key, value)
-        _write_audit_event(
-            profile,
+        scope.enrich(exc, query=query)
+        scope.audit(
             query=query,
             status=(
                 "timeout"
@@ -2140,13 +1800,8 @@ async def execute_query(
                 and exc.payload["code"] == "QUERY_TIMEOUT"
                 else "error"
             ),
-            duration_ms=duration,
-            database=selected_database,
-            internal=internal,
+            duration_ms=round((time.monotonic() - started) * 1000),
             error_type=type(exc).__name__,
-            requested_connection=target.requested_connection,
-            requested_database=target.requested_database,
-            route_applied=target.route_applied,
         )
         raise
 
@@ -2154,19 +1809,13 @@ async def execute_query(
         if lease is not None:
             lease.release_pending()
 
-    _write_audit_event(
-        profile,
+    scope.audit(
         query=query,
         status="success",
         duration_ms=result.duration_ms,
-        database=selected_database,
-        internal=internal,
         row_count=len(result.rows),
         truncated=result.truncated,
         retry_count=result.retry_count,
-        requested_connection=target.requested_connection,
-        requested_database=target.requested_database,
-        route_applied=target.route_applied,
     )
     return result
 
@@ -2428,6 +2077,20 @@ async def check_connection(
             text=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
         )
     ]
+
+
+def _verify_tool_registry_matches_definitions() -> None:
+    """Fail at import when a defined tool lacks a handler, or vice versa."""
+    defined = [tool.name for tool in tool_definitions()]
+    missing = sorted(set(defined) - set(_TOOL_HANDLERS))
+    extra = sorted(set(_TOOL_HANDLERS) - set(defined))
+    if missing or extra or len(defined) != len(set(defined)):
+        raise RuntimeError(
+            f"Tool registry mismatch: missing={missing} extra={extra}"
+        )
+
+
+_verify_tool_registry_matches_definitions()
 
 
 async def main():

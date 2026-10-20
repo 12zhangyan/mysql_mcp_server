@@ -214,3 +214,28 @@ def test_safe_or_explicitly_reviewed_functions_are_allowed():
         "SELECT reviewed_metric(id) FROM users",
         allowed_functions=("REVIEWED_METRIC",),
     ) == {"REVIEWED_METRIC"}
+
+
+@pytest.mark.parametrize(
+    ("query", "name"),
+    [
+        ("SELECT sleep(1)", "SLEEP"),
+        ("SELECT id FROM users WHERE Benchmark (1, 1)", "BENCHMARK"),
+        ("SELECT 1, get_lock('a', 1), sleep(1)", "GET_LOCK"),
+    ],
+)
+def test_blocked_function_reports_first_match_case_insensitively(query, name):
+    with pytest.raises(ReadOnlyViolation, match=rf"Function '{name}' is not allowed"):
+        validate_read_only_query(query)
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SELECT my_sleep_count FROM stats",
+        "SELECT sleep FROM schedule",
+        "SELECT 'SLEEP(1)' AS text",
+    ],
+)
+def test_blocked_function_names_require_a_real_call(query):
+    assert validate_read_only_query(query) == query

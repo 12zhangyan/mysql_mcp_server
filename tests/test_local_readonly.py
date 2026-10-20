@@ -455,3 +455,31 @@ async def test_real_default_preserves_fields_and_nested_json(local_db):
         "nested": [{"token": "synthetic-token"}],
     }
     assert payload["masked_columns"] == []
+
+
+async def test_real_combined_session_setup_enforces_read_only_and_timeout(local_db):
+    from unittest.mock import patch
+
+    from mysql_mcp_server import server
+
+    decisions = []
+    original = server._supports_combined_session_setup
+
+    def spy(connection_object):
+        decisions.append(original(connection_object))
+        return decisions[-1]
+
+    with patch.object(server, "_supports_combined_session_setup", side_effect=spy):
+        result = await call_tool(
+            "execute_sql",
+            {
+                "query": "SELECT @@SESSION.transaction_read_only AS ro, "
+                "@@SESSION.max_execution_time AS met",
+                "timeout_ms": 4321,
+                "result_format": "json",
+            },
+        )
+
+    payload = json.loads(result[0].text)
+    assert decisions == [True]
+    assert payload["rows"] == [[1, 4321]]

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import atexit
 import hashlib
 import os
@@ -19,6 +20,7 @@ from mysql.connector import connect
 from mysql.connector.pooling import MySQLConnectionPool
 
 from .config import ConnectionProfile
+from .credential_store import credential_cache
 from .errors import QueryFailure
 
 
@@ -363,6 +365,10 @@ class QueryControl:
                 pass
 
 
+# Safety net only: waiters are woken by release(); this bounds a missed wake-up.
+_ADMISSION_WAKE_FALLBACK_SECONDS = 0.05
+
+
 class QueryAdmission:
     """Bound work per profile; a cancelled worker retains its slot until cleanup."""
 
@@ -370,13 +376,24 @@ class QueryAdmission:
         self._condition = threading.Condition()
         self._active: dict[str, int] = {}
         self._waiting: dict[str, int] = {}
+        self._waiters: dict[
+            str, set[tuple[asyncio.AbstractEventLoop, asyncio.Event]]
+        ] = {}
 
     def release(self, key: str) -> None:
+        """Free a slot from any thread and wake that profile's queued callers."""
         with self._condition:
             self._active[key] -= 1
             if not self._active[key]:
                 del self._active[key]
+            waiters = tuple(self._waiters.get(key, ()))
             self._condition.notify_all()
+        for loop, event in waiters:
+            try:
+                loop.call_soon_threadsafe(event.set)
+            except RuntimeError:
+                # The waiter's event loop already closed; nothing to wake.
+                pass
 
     async def acquire(self, profile: ConnectionProfile) -> QueryLease:
         """Queue before using AnyIO worker threads, so one busy profile cannot fill them."""
@@ -388,8 +405,16 @@ class QueryAdmission:
         started = time.monotonic()
         queued = False
         try:
+            loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None  # Non-asyncio backend: keep short polling.
+        waiter = (loop, asyncio.Event()) if loop is not None else None
+        try:
             while True:
                 with self._condition:
+                    if waiter is not None:
+                        # Clear under the lock: a release after this check sets it.
+                        waiter[1].clear()
                     elapsed = time.monotonic() - started
                     if queued and elapsed >= profile.queue_timeout_ms / 1000:
                         raise QueryFailure(
@@ -414,14 +439,29 @@ class QueryAdmission:
                                 phase="queue",
                             )
                         self._waiting[key] = self._waiting.get(key, 0) + 1
+                        if waiter is not None:
+                            self._waiters.setdefault(key, set()).add(waiter)
                         queued = True
-                await anyio.sleep(min(0.01, profile.queue_timeout_ms / 1000))
+                remaining = profile.queue_timeout_ms / 1000 - elapsed
+                if waiter is None:
+                    await anyio.sleep(min(0.01, max(remaining, 0)))
+                    continue
+                with anyio.move_on_after(
+                    min(_ADMISSION_WAKE_FALLBACK_SECONDS, max(remaining, 0))
+                ):
+                    await waiter[1].wait()
         finally:
             if queued:
                 with self._condition:
                     self._waiting[key] -= 1
                     if not self._waiting[key]:
                         del self._waiting[key]
+                    if waiter is not None:
+                        waiters = self._waiters.get(key)
+                        if waiters is not None:
+                            waiters.discard(waiter)
+                            if not waiters:
+                                del self._waiters[key]
 
 
 class QueryLease:
@@ -460,6 +500,7 @@ connection_pool_manager = ConnectionPoolManager()
 def close_runtime_resources() -> None:
     connection_pool_manager.clear()
     ssh_tunnel_manager.close_all()
+    credential_cache.clear()
 
 
 atexit.register(close_runtime_resources)

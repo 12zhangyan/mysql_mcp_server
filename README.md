@@ -195,6 +195,8 @@ readonly-db-mcp credentials --profiles-file C:/absolute/path/mysql-connections.t
 
 Windows 下 `keyring` 使用 Windows 凭据管理器。无桌面的服务环境可设置 `credential_provider = "command"`，并通过 `credential_command = ["executable", "arg1"]` 调用经过批准的密钥管理 CLI。程序不会通过 shell 执行命令；stderr 会被丢弃，输出长度受限，且只接受一行非空 UTF-8 文本。失败信息不会包含密钥、命令参数或凭据引用。
 
+每次请求最多读取一次凭据（含连接重试）。`keyring` 或 `command` 较慢时，可设置 `credential_cache_seconds = 30`（0–300，默认 0 即不缓存）在进程内存中短期复用密码：轮换后的新密码最晚在该时长后生效；服务端返回认证失败（1045/1698）、调用 `validate_connections` 或进程退出时立即丢弃缓存。该项只对 `keyring` 和 `command` 有效。
+
 ### 逻辑环境路由
 
 一个逻辑环境分布在多个物理实例时，可声明精确别名：

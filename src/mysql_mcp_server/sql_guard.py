@@ -77,6 +77,10 @@ BLOCKED_FUNCTIONS = {
     "SETVAL",
 }
 
+_BLOCKED_FUNCTION_PATTERN = re.compile(
+    r"\b(" + "|".join(sorted(BLOCKED_FUNCTIONS)) + r")\s*\(", re.IGNORECASE
+)
+
 SYSTEM_DATABASES = {"information_schema", "mysql", "performance_schema", "sys"}
 
 # SHOW statements are parsed separately from ordinary table expressions by
@@ -280,14 +284,16 @@ def validate_read_only_query(sql: str) -> str:
             f"Only read-only SQL is allowed; keyword '{blocked}' is blocked"
         )
 
-    for function_name in BLOCKED_FUNCTIONS:
-        if re.search(rf"\b{function_name}\s*\(", sanitized_trimmed, re.IGNORECASE):
-            raise ReadOnlyViolation(f"Function '{function_name}' is not allowed")
+    blocked_function = _BLOCKED_FUNCTION_PATTERN.search(sanitized_trimmed)
+    if blocked_function:
+        raise ReadOnlyViolation(
+            f"Function '{blocked_function.group(1).upper()}' is not allowed"
+        )
 
     return normalized_query
 
 
-def _parse_mysql_query(sql: str) -> exp.Expression:
+def parse_mysql_query(sql: str) -> exp.Expression:
     """Expose parser coordinates, never its SQL-bearing diagnostic text."""
     try:
         return cast(exp.Expression, sqlglot.parse_one(sql, read="mysql"))
@@ -317,7 +323,7 @@ def build_explain_query(sql: str, *, json_plan: bool = False) -> str:
         raise ReadOnlyViolation(
             "explain_sql requires a SELECT or WITH query without an EXPLAIN prefix"
         )
-    statement = _parse_mysql_query(query)
+    statement = parse_mysql_query(query)
     if not isinstance(statement, exp.Query):
         raise ReadOnlyViolation("explain_sql requires a SELECT or WITH query")
     # Keep the original query, including its LIMIT/OFFSET and optimizer hints.
@@ -358,14 +364,17 @@ def validate_database_access(
     allowed_databases: tuple[str, ...],
     allow_system_databases: bool,
     internal: bool = False,
+    statement: exp.Expression | None = None,
 ) -> set[str]:
     """
     Parse table references with the MySQL dialect and enforce schema policy.
 
     Unqualified tables use selected_database. CTE aliases have no database and
     therefore do not create false positives like regex-based `alias.column` checks.
+    Pass ``statement`` from parse_mysql_query(sql) to reuse one parse.
     """
-    statement = _parse_mysql_query(sql)
+    if statement is None:
+        statement = parse_mysql_query(sql)
 
     accessed: set[str] = set()
     if selected_database:
@@ -425,7 +434,10 @@ def validate_database_access(
 
 
 def validate_function_safety(
-    sql: str, *, allowed_functions: tuple[str, ...] = ()
+    sql: str,
+    *,
+    allowed_functions: tuple[str, ...] = (),
+    statement: exp.Expression | None = None,
 ) -> set[str]:
     """
     Reject unresolved functions unless they are known-safe or explicitly allowed.
@@ -434,7 +446,8 @@ def validate_function_safety(
     database or external side effects. This check keeps a write-capable account
     outside the read-only correctness boundary.
     """
-    statement = _parse_mysql_query(sql)
+    if statement is None:
+        statement = parse_mysql_query(sql)
 
     configured = {name.upper() for name in allowed_functions}
     # sqlglot also models optimizer hints such as NO_MERGE as Anonymous nodes;

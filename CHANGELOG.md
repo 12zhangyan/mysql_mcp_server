@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Parse each validated query once and share the AST between database-access checks,
+  function-safety checks and paging pushdown; build the pushed-down SQL once instead of
+  on every connector retry. LIMIT/OFFSET are attached as literal nodes so sqlglot no
+  longer re-parses them. Executed SQL is unchanged.
+- Scan for blocked functions with one precompiled pattern; the error now names the
+  first blocked call in the query.
+- Resolve credentials at most once per request, including connector retries.
+- Combine the statement timeout and read-only session settings into one `SET` on
+  MySQL 5.7.20+ (detected from the handshake, no extra round trip). MariaDB, older or
+  unrecognized servers, and MySQL-compatible servers rejecting the combined statement
+  keep the original statement sequence.
+- Wake queued queries as soon as a slot is released instead of polling every 10 ms.
+- Cache resolved audit log paths and created directories; a removed log directory is
+  recreated on the next write. Rotation, fsync and fail-closed behavior are unchanged.
+- Move MCP tool definitions to `tool_specs.py` and dispatch tools through a handler
+  registry that is checked against the definitions at import. The published tool list
+  is unchanged and pinned by a snapshot test.
+
+### Added
+- Optional per-connection `credential_cache_seconds` (0-300, default 0) for the
+  `keyring` and `command` providers. Cached secrets stay in process memory and are
+  dropped on authentication failure, `validate_connections` or shutdown.
+
 ## [0.9.2] - 2026-10-14
 
 ### Changed

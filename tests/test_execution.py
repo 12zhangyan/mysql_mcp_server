@@ -365,6 +365,46 @@ async def test_errno_minus_one_is_retried_once_without_exposing_details(caplog):
 
 
 @pytest.mark.asyncio
+async def test_query_is_parsed_once_across_validation_paging_and_retry():
+    import sqlglot
+
+    failed_connection, failed_cursor = fake_connection([], ["id"])
+    successful_connection, successful_cursor = fake_connection([(7,)], ["id"])
+    pushed_down = "SELECT id FROM users LIMIT 3 OFFSET 4"
+
+    def fail_main_query(sql):
+        if sql == pushed_down:
+            raise InterfaceError(msg="unread", errno=-1)
+
+    failed_cursor.execute.side_effect = fail_main_query
+    with (
+        patch(
+            "mysql_mcp_server.server._open_connection",
+            side_effect=[
+                (failed_connection, {"database": "app"}),
+                (successful_connection, {"database": "app"}),
+            ],
+        ),
+        patch("sqlglot.parse_one", wraps=sqlglot.parse_one) as parse_one,
+    ):
+        response = await call_tool(
+            "execute_sql",
+            {
+                "query": "SELECT id FROM users",
+                "database": "app",
+                "max_rows": 2,
+                "offset": 4,
+                "result_format": "json",
+            },
+        )
+
+    assert parse_one.call_count == 1
+    failed_cursor.execute.assert_any_call(pushed_down)
+    successful_cursor.execute.assert_any_call(pushed_down)
+    assert json.loads(response[0].text)["retry_count"] == 1
+
+
+@pytest.mark.asyncio
 async def test_persistent_errno_minus_one_reports_safe_phase_and_type():
     connections = []
 
@@ -771,3 +811,83 @@ database = "app"
 
     with pytest.raises(ValueError, match="System database"):
         await read_resource(AnyUrl("mysql://database/mysql"))
+
+
+@pytest.mark.parametrize(
+    "server_info", ["8.4.6", "8.0.36-28", "5.7.20-log", "9.1.0-commercial"]
+)
+async def test_mysql_session_setup_uses_one_combined_set(server_info):
+    connection, cursor = fake_connection([(1,)], ["id"])
+    connection.server_info = server_info
+    with patch(
+        "mysql_mcp_server.server._open_connection",
+        return_value=(connection, {"database": "app"}),
+    ):
+        await call_tool("execute_sql", {"query": "SELECT id FROM users", "database": "app"})
+
+    assert [call.args[0] for call in cursor.execute.call_args_list] == [
+        "SET SESSION MAX_EXECUTION_TIME = 30000, SESSION transaction_read_only = ON",
+        "START TRANSACTION READ ONLY",
+        "SELECT id FROM users LIMIT 501",
+    ]
+    connection.rollback.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    "server_info",
+    ["10.11.6-MariaDB", "5.5.5-10.6.12-MariaDB-log", "5.7.19", "garbage", None, 8],
+)
+async def test_other_servers_keep_the_original_session_sequence(server_info):
+    connection, cursor = fake_connection([(1,)], ["id"])
+    connection.server_info = server_info
+    with patch(
+        "mysql_mcp_server.server._open_connection",
+        return_value=(connection, {"database": "app"}),
+    ):
+        await call_tool("execute_sql", {"query": "SELECT id FROM users", "database": "app"})
+
+    assert [call.args[0] for call in cursor.execute.call_args_list] == [
+        "SET SESSION MAX_EXECUTION_TIME = 30000",
+        "SET SESSION TRANSACTION READ ONLY",
+        "START TRANSACTION READ ONLY",
+        "SELECT id FROM users LIMIT 501",
+    ]
+
+
+async def test_rejected_combined_set_falls_back_to_original_sequence():
+    connection, cursor = fake_connection([(1,)], ["id"])
+    connection.server_info = "8.0.11-compatible"
+
+    def execute(sql):
+        if "transaction_read_only" in sql:
+            raise Error(msg="unknown system variable", errno=1193)
+
+    cursor.execute.side_effect = execute
+    with patch(
+        "mysql_mcp_server.server._open_connection",
+        return_value=(connection, {"database": "app"}),
+    ):
+        await call_tool("execute_sql", {"query": "SELECT id FROM users", "database": "app"})
+
+    assert [call.args[0] for call in cursor.execute.call_args_list][1:] == [
+        "SET SESSION MAX_EXECUTION_TIME = 30000",
+        "SET SESSION TRANSACTION READ ONLY",
+        "START TRANSACTION READ ONLY",
+        "SELECT id FROM users LIMIT 501",
+    ]
+
+
+async def test_unexpected_combined_set_error_is_not_masked():
+    connection, cursor = fake_connection([(1,)], ["id"])
+    connection.server_info = "8.4.6"
+    cursor.execute.side_effect = Error(msg="lost", errno=2013)
+    with patch(
+        "mysql_mcp_server.server._open_connection",
+        return_value=(connection, {"database": "app"}),
+    ):
+        response = await call_tool(
+            "execute_sql", {"query": "SELECT id FROM users", "database": "app"}
+        )
+
+    assert response.isError is True
+    assert cursor.execute.call_count == 1
