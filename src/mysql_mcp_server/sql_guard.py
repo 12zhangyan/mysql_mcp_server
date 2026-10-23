@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from functools import lru_cache
 from typing import Any, cast
 
 import sqlglot
@@ -331,6 +332,9 @@ def build_explain_query(sql: str, *, json_plan: bool = False) -> str:
     return ("EXPLAIN FORMAT=JSON " if json_plan else "EXPLAIN ") + query
 
 
+# Every audit event of one request re-derives these from the same SQL text;
+# a small cache avoids re-sanitizing it per event.
+@lru_cache(maxsize=32)
 def query_fingerprint(sql: str) -> str:
     """Create a stable audit identifier without logging SQL or literal values."""
     try:
@@ -347,6 +351,7 @@ def query_fingerprint(sql: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
 
 
+@lru_cache(maxsize=32)
 def query_type(sql: str) -> str:
     """Best-effort statement classification for allowed and denied audit events."""
     try:

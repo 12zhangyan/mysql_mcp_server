@@ -92,6 +92,30 @@ def test_csv_uses_real_escaping_and_explicit_null():
     assert ",,NULL" in rendered
 
 
+def test_render_is_cached_per_instance_and_not_shared_by_replace():
+    from dataclasses import replace
+
+    result = QueryResult(
+        connection="dev",
+        database="app",
+        columns=["id"],
+        rows=[[1], [2]],
+        offset=0,
+        truncated=False,
+        duration_ms=1,
+        query_id="q",
+        result_format="json",
+    )
+    fitted = result.fit_response("json", 4096)
+    assert fitted is result
+    assert result.render("json") is result.render("json")
+
+    shorter = replace(result, rows=[[1]], truncated=True)
+    assert shorter.result_format == "json"
+    assert json.loads(shorter.render("json"))["rows"] == [[1]]
+    assert json.loads(result.render("json"))["rows"] == [[1], [2]]
+
+
 def test_large_cell_is_truncated_deterministically():
     assert serialize_value("abcdefgh", 4) == "abcd…[truncated]"
 

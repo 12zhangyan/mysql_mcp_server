@@ -270,6 +270,41 @@ async def test_inspect_catalog_pages_a_large_database_without_silent_truncation(
 
 
 @pytest.mark.asyncio
+async def test_dump_schema_keeps_the_largest_row_prefix_within_the_budget():
+    columns = [
+        (table, column, ordinal, kind, nullable, default, extra, "x" * 200)
+        for table, column, ordinal, kind, nullable, default, extra, _ in catalog_rows(
+            10, 10
+        )
+    ]
+    connection, _cursor = connection_applying_sql_pages(
+        columns, table_rows_from_columns(columns)
+    )
+    budget = 8192
+    with patch(
+        "mysql_mcp_server.server._open_connection",
+        return_value=(connection, {"database": "app"}),
+    ):
+        dumped, result = await _json_tool(
+            "dump_schema",
+            {"database": "app", "max_rows": 100, "max_response_bytes": budget},
+        )
+        kept = dumped["returned_rows"]
+        assert 0 < kept < 100
+        assert len(result[0].text.encode("utf-8")) <= budget
+        assert dumped["truncated"] is True
+        assert dumped["next_offset"] == kept
+        assert sum(len(table["columns"]) for table in dumped["tables"]) == kept
+
+        # One more source row must not fit, so the kept prefix is the largest.
+        wider, _ = await _json_tool(
+            "dump_schema",
+            {"database": "app", "max_rows": kept + 1, "max_response_bytes": budget},
+        )
+        assert wider["returned_rows"] == kept
+
+
+@pytest.mark.asyncio
 async def test_table_names_limit_is_enforced_not_silently_truncated():
     with patch("mysql_mcp_server.server._open_connection") as opened:
         rejected = await call_tool(

@@ -282,6 +282,13 @@ class QueryResult:
     truncation_reasons: tuple[str, ...] = ()
     queue_wait_ms: int = 0
     plan: dict[str, Any] | None = None
+    # Format the response budget was fitted for; not part of the payload.
+    result_format: str | None = field(default=None, compare=False)
+    # Rendered text per format. Instances are never mutated after creation,
+    # and replace() starts a fresh cache because this field is not an init arg.
+    _rendered: dict[str, str] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
 
     @property
     def next_offset(self) -> int | None:
@@ -403,6 +410,12 @@ class QueryResult:
         return candidate(low)
 
     def render(self, result_format: str) -> str:
+        rendered = self._rendered.get(result_format)
+        if rendered is None:
+            rendered = self._rendered[result_format] = self._render(result_format)
+        return rendered
+
+    def _render(self, result_format: str) -> str:
         if result_format == "compact":
             metadata = {
                 key: value

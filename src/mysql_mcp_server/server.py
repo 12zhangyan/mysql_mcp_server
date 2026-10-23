@@ -8,7 +8,6 @@ import os
 import re
 import time
 import uuid
-from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional, Tuple
 
@@ -140,8 +139,6 @@ def _table_argument(arguments: dict, *, required: bool = False) -> str | None:
     return value
 
 
-
-
 def _metadata_name_filter(arguments: dict, *, table: str | None = None) -> str:
     """Apply one mutually exclusive table filter for catalog and schema tools."""
     return catalog_name_filter(
@@ -204,14 +201,6 @@ def _bounded_query_sql(
     else:
         statement.set("offset", None)
     return statement.sql(dialect="mysql")
-
-
-@contextmanager
-def maybe_ssh_tunnel(connection: str | None = None):
-    """Yield a reusable direct or SSH-tunneled endpoint."""
-    profile = load_connection_registry().get(connection)
-    endpoint = ssh_tunnel_manager.endpoint(profile)
-    yield endpoint.host, endpoint.port
 
 
 def get_db_config(
@@ -1691,6 +1680,7 @@ async def execute_query(
                         requested_connection=target.requested_connection,
                         requested_database=target.requested_database,
                         route_applied=target.route_applied,
+                        result_format=selected_format,
                     )
                     if plan_output == "chunks":
                         result = result.plan_chunks(
@@ -1898,46 +1888,55 @@ async def _dump_schema(
 
     profile = load_connection_registry().get(result.connection)
     budget = _response_budget(profile, arguments.get("max_response_bytes"))
-    rows = result.rows
-    truncated = result.truncated
-    text = ""
-    while True:
+    header = {
+        key: value
+        for key, value in result.to_payload().items()
+        if key not in {"rows", "columns"}
+    }
+
+    def render(count: int) -> str | None:
+        """Render the first ``count`` rows, or None when over budget."""
+        truncated = result.truncated or count < len(result.rows)
+        rows = result.rows[:count]
         payload = {
-            key: value
-            for key, value in result.to_payload().items()
-            if key not in {"rows", "columns"}
+            **header,
+            "kinds": list(kinds),
+            "tables": group_schema_dump(
+                result.columns,
+                rows,
+                table_meta=table_meta or None,
+                include_columns=include_columns,
+            ),
+            "returned_rows": count,
+            "row_count": count,
+            "truncated": truncated,
+            "next_offset": result.offset + count if truncated else None,
         }
-        payload.update(
-            {
-                "kinds": list(kinds),
-                "tables": group_schema_dump(
-                    result.columns,
-                    rows,
-                    table_meta=table_meta or None,
-                    include_columns=include_columns,
-                ),
-                "returned_rows": len(rows),
-                "row_count": len(rows),
-                "truncated": truncated,
-                "next_offset": result.offset + len(rows) if truncated else None,
-            }
-        )
         text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        if len(text.encode("utf-8")) <= budget:
-            break
-        if not rows:
-            raise QueryFailure(
-                "RESULT_TOO_LARGE",
-                "The grouped schema header exceeds the response budget.",
-                "Request fewer kinds or a narrower table_pattern; retry the same offset.",
-                connection=result.connection,
-                database=result.database,
-                query_id=result.query_id,
-                offset=result.offset,
-                max_response_bytes=budget,
-            )
-        rows = rows[:-1]
-        truncated = True
+        return text if len(text.encode("utf-8")) <= budget else None
+
+    # Grouped size grows with the row prefix, so keep the largest prefix that fits.
+    text = render(len(result.rows))
+    if text is None:
+        low, high, text = 0, len(result.rows) - 1, None
+        while low <= high:
+            middle = (low + high) // 2
+            candidate = render(middle)
+            if candidate is None:
+                high = middle - 1
+            else:
+                low, text = middle + 1, candidate
+    if text is None:
+        raise QueryFailure(
+            "RESULT_TOO_LARGE",
+            "The grouped schema header exceeds the response budget.",
+            "Request fewer kinds or a narrower table_pattern; retry the same offset.",
+            connection=result.connection,
+            database=result.database,
+            query_id=result.query_id,
+            offset=result.offset,
+            max_response_bytes=budget,
+        )
     return [TextContent(type="text", text=text)]
 
 
@@ -1979,8 +1978,11 @@ async def run_query(
         internal=internal,
         bounded_result=bounded_result,
     )
-    profile = load_connection_registry().get(result.connection)
-    selected_format = requested_format or profile.result_format
+    # Render in the format execute_query fitted; the text is already cached.
+    selected_format = result.result_format or requested_format
+    if selected_format is None:
+        profile = load_connection_registry().get(result.connection)
+        selected_format = profile.result_format
     return [TextContent(type="text", text=result.render(selected_format))]
 
 
