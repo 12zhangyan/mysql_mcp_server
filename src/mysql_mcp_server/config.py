@@ -9,6 +9,7 @@ import threading
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+from stat import S_ISREG
 from typing import Any, Callable
 
 from .credential_store import (credential_cache, get_keyring_password,
@@ -883,12 +884,20 @@ def load_connection_registry(*, force_reload: bool = False) -> ConnectionRegistr
             source="environment",
         )
 
-    path = Path(configured_path).expanduser().resolve()
-    if not path.is_file():
+    # Every tool call reloads the registry, so the cache hit costs one stat().
+    # It follows symlinks, and the file identity in the key catches a retarget;
+    # the slower resolve() runs only when the file is (re)loaded.
+    configured = Path(configured_path).expanduser()
+    try:
+        stat = os.stat(configured)
+    except OSError:
+        stat = None
+    if stat is None or not S_ISREG(stat.st_mode):
         raise ValueError("MySQL profiles file does not exist")
-    stat = path.stat()
     cache_key = (
-        str(path),
+        str(configured),
+        stat.st_dev,
+        stat.st_ino,
         stat.st_mtime_ns,
         stat.st_size,
         os.getenv("MYSQL_DEFAULT_CONNECTION"),
@@ -902,7 +911,7 @@ def load_connection_registry(*, force_reload: bool = False) -> ConnectionRegistr
             and _registry_cache is not None
         ):
             return _registry_cache
-        registry = _load_file_registry(path)
+        registry = _load_file_registry(configured.resolve())
         _registry_cache_key = cache_key
         _registry_cache = registry
         return registry
