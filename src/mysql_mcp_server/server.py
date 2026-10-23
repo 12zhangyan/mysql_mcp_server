@@ -1,14 +1,11 @@
 import asyncio
 import hashlib
-import hmac
 import json
 import logging
-import math
 import os
 import re
 import time
 import uuid
-from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional, Tuple
 
@@ -40,6 +37,17 @@ from .runtime import (QueryControl, QueryLease, close_runtime_resources,
                       connection_pool_manager, query_admission,
                       ssh_tunnel_manager)
 from .tool_specs import tool_definitions
+from .transport import (  # noqa: F401  (helpers re-exported for callers/tests)
+    _default_allowed_hosts,
+    _positive_seconds_env,
+    _server_port,
+    _validate_http_exposure,
+    _validate_sse_exposure,
+    _with_bearer_auth,
+    run_sse,
+    run_stdio,
+    run_streamable_http,
+)
 from .sql_guard import (
     build_explain_query,
     parse_mysql_query,
@@ -63,45 +71,6 @@ audit_logger = logging.getLogger("mysql_mcp_server.audit")
 
 # System databases that are typically filtered out from resource listings.
 SYSTEM_DATABASES = {"information_schema", "mysql", "performance_schema", "sys"}
-
-
-def _server_port(primary_env: str) -> int:
-    """Read an HTTP server port with a shared PORT fallback and clear errors."""
-    primary_value = os.getenv(primary_env)
-    fallback_value = os.getenv("PORT")
-    value = primary_value or fallback_value or "8000"
-    source = primary_env if primary_value else "PORT" if fallback_value else primary_env
-    try:
-        port = int(value)
-    except ValueError as exc:
-        raise ValueError(f"{source} must be an integer between 1 and 65535") from exc
-    if not 1 <= port <= 65535:
-        raise ValueError(f"{source} must be between 1 and 65535")
-    return port
-
-
-def _positive_seconds_env(name: str, default: float) -> float:
-    """Read a positive, finite duration from an environment variable."""
-    value = os.getenv(name, str(default))
-    try:
-        seconds = float(value)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be a positive finite number") from exc
-    if not math.isfinite(seconds) or seconds <= 0:
-        raise ValueError(f"{name} must be a positive finite number")
-    return seconds
-
-
-def _default_allowed_hosts(host: str, port: int) -> list[str]:
-    """Build exact safe Host header values, including bracketed IPv6 forms."""
-    allowed = [f"localhost:{port}", f"127.0.0.1:{port}"]
-    if host in {"0.0.0.0", "::"}:
-        return allowed
-    authority = f"[{host}]" if ":" in host else host
-    host_header = f"{authority}:{port}"
-    if host_header not in allowed:
-        allowed.append(host_header)
-    return allowed
 
 
 def validate_identifier(name: str) -> str:
@@ -140,8 +109,6 @@ def _table_argument(arguments: dict, *, required: bool = False) -> str | None:
     return value
 
 
-
-
 def _metadata_name_filter(arguments: dict, *, table: str | None = None) -> str:
     """Apply one mutually exclusive table filter for catalog and schema tools."""
     return catalog_name_filter(
@@ -160,12 +127,11 @@ def _bounded_query_sql(
 ) -> str | None:
     """Push MCP paging into an outer query when it can be preserved exactly.
 
-    ``parsed`` is an already parsed AST of ``query``; it is copied, not mutated.
+    ``parsed`` is an already parsed AST of ``query``. It is consumed: its LIMIT
+    and OFFSET may be rewritten in place, so callers must not reuse it.
     """
     try:
-        statement = (
-            sqlglot.parse_one(query, read="mysql") if parsed is None else parsed.copy()
-        )
+        statement = sqlglot.parse_one(query, read="mysql") if parsed is None else parsed
     except Exception:
         return None
     if not isinstance(statement, exp.Query):
@@ -203,15 +169,8 @@ def _bounded_query_sql(
         statement = statement.offset(exp.Literal.number(effective_offset), copy=False)
     else:
         statement.set("offset", None)
-    return statement.sql(dialect="mysql")
-
-
-@contextmanager
-def maybe_ssh_tunnel(connection: str | None = None):
-    """Yield a reusable direct or SSH-tunneled endpoint."""
-    profile = load_connection_registry().get(connection)
-    endpoint = ssh_tunnel_manager.endpoint(profile)
-    yield endpoint.host, endpoint.port
+    # The AST is owned here, so the generator need not copy it first.
+    return statement.sql(dialect="mysql", copy=False)
 
 
 def get_db_config(
@@ -453,6 +412,64 @@ def _catalog_query(
         ) from exc
 
 
+def _ready_password(profile: ConnectionProfile) -> str | None:
+    """Fail before policy checks when the profile or audit context is not ready.
+
+    Returns the password when the readiness check had to resolve it.
+    """
+    ready, readiness, password = profile.runtime_readiness()
+    if not ready:
+        raise ValueError(readiness)
+    validate_required_audit_context(profile, current_audit_context())
+    return password
+
+
+def _enforce_query_policy(
+    profile: ConnectionProfile,
+    query: str,
+    *,
+    selected_database: str | None,
+    internal: bool,
+) -> exp.Expression:
+    """Apply schema and function policy to read-only-validated SQL; return its AST."""
+    if selected_database in SYSTEM_DATABASES and not profile.allow_system_databases:
+        raise ValueError(
+            f"System database '{selected_database}' is blocked for connection "
+            f"'{profile.name}'"
+        )
+    statement = parse_mysql_query(query)
+    validate_database_access(
+        query,
+        selected_database=selected_database,
+        allowed_databases=profile.allowed_databases,
+        allow_system_databases=profile.allow_system_databases,
+        internal=internal,
+        statement=statement,
+    )
+    validate_function_safety(
+        query, allowed_functions=profile.allowed_functions, statement=statement
+    )
+    return statement
+
+
+def _release_connection(connection_object, *, discard: bool) -> None:
+    """Return a connection: shut down an unread/timed-out socket, else roll back."""
+    if discard:
+        try:
+            connection_object.shutdown()
+        except Exception:
+            logger.debug("Socket shutdown failed during connection cleanup")
+    else:
+        try:
+            connection_object.rollback()
+        except Exception:
+            logger.debug("Rollback failed during connection cleanup")
+    try:
+        connection_object.close()
+    except Exception:
+        logger.debug("Connection close failed during cleanup")
+
+
 def _sync_resource_query(
     profile: ConnectionProfile,
     query: str,
@@ -466,28 +483,11 @@ def _sync_resource_query(
     connection_object = None
     discard_connection = False
     try:
-        ready, readiness, password = profile.runtime_readiness()
-        if not ready:
-            raise ValueError(readiness)
-        validate_required_audit_context(profile, current_audit_context())
+        password = _ready_password(profile)
         query = validate_read_only_query(query)
         selected_database = ensure_database_allowed(profile, database)
-        if selected_database in SYSTEM_DATABASES and not profile.allow_system_databases:
-            raise ValueError(
-                f"System database '{selected_database}' is blocked for connection "
-                f"'{profile.name}'"
-            )
-        statement = parse_mysql_query(query)
-        validate_database_access(
-            query,
-            selected_database=selected_database,
-            allowed_databases=profile.allowed_databases,
-            allow_system_databases=profile.allow_system_databases,
-            internal=True,
-            statement=statement,
-        )
-        validate_function_safety(
-            query, allowed_functions=profile.allowed_functions, statement=statement
+        statement = _enforce_query_policy(
+            profile, query, selected_database=selected_database, internal=True
         )
         audit_sink.preflight(profile)
         _write_audit_event(
@@ -548,20 +548,7 @@ def _sync_resource_query(
         raise
     finally:
         if connection_object is not None:
-            if discard_connection:
-                try:
-                    connection_object.shutdown()
-                except Exception:
-                    logger.debug("Socket shutdown failed for resource result cleanup")
-            else:
-                try:
-                    connection_object.rollback()
-                except Exception:
-                    logger.debug("Rollback failed during resource connection cleanup")
-            try:
-                connection_object.close()
-            except Exception:
-                logger.debug("Connection close failed during resource cleanup")
+            _release_connection(connection_object, discard=discard_connection)
 
 
 @app.list_resources()
@@ -1483,10 +1470,7 @@ async def execute_query(
         route_applied=target.route_applied,
     )
     try:
-        ready, readiness, password = profile.runtime_readiness()
-        if not ready:
-            raise ValueError(readiness)
-        validate_required_audit_context(profile, current_audit_context())
+        password = _ready_password(profile)
         if plan_output not in {"rows", "chunks"} or (
             not explain and plan_output != "rows"
         ):
@@ -1504,22 +1488,8 @@ async def execute_query(
             if explain
             else validate_read_only_query(query)
         )
-        if selected_database in SYSTEM_DATABASES and not profile.allow_system_databases:
-            raise ValueError(
-                f"System database '{selected_database}' is blocked for connection "
-                f"'{profile.name}'"
-            )
-        statement = parse_mysql_query(query)
-        validate_database_access(
-            query,
-            selected_database=selected_database,
-            allowed_databases=profile.allowed_databases,
-            allow_system_databases=profile.allow_system_databases,
-            internal=internal,
-            statement=statement,
-        )
-        validate_function_safety(
-            query, allowed_functions=profile.allowed_functions, statement=statement
+        statement = _enforce_query_policy(
+            profile, query, selected_database=selected_database, internal=internal
         )
 
         selected_format = result_format or (
@@ -1647,11 +1617,9 @@ async def execute_query(
                         truncated and not bounded_result and executed_query == query
                     )
                     raw_rows = raw_rows[:fetch_limit]
+                    # Masking builds new rows when it changes anything.
                     rows, masked_columns = mask_result_rows(
-                        query,
-                        columns,
-                        [list(row) for row in raw_rows],
-                        profile.mask_columns,
+                        query, columns, raw_rows, profile.mask_columns
                     )
                     serialized_rows = [
                         [
@@ -1691,6 +1659,7 @@ async def execute_query(
                         requested_connection=target.requested_connection,
                         requested_database=target.requested_database,
                         route_applied=target.route_applied,
+                        result_format=selected_format,
                     )
                     if plan_output == "chunks":
                         result = result.plan_chunks(
@@ -1731,22 +1700,7 @@ async def execute_query(
                 ) from exc
             finally:
                 if connection_object is not None:
-                    if discard_connection:
-                        try:
-                            connection_object.shutdown()
-                        except Exception:
-                            logger.debug(
-                                "Socket shutdown failed during result or timeout cleanup"
-                            )
-                    else:
-                        try:
-                            connection_object.rollback()
-                        except Exception:
-                            logger.debug("Rollback failed during connection cleanup")
-                    try:
-                        connection_object.close()
-                    except Exception:
-                        logger.debug("Connection close failed during cleanup")
+                    _release_connection(connection_object, discard=discard_connection)
                 control.unbind()
         raise RuntimeError("Connector retry loop exited unexpectedly")
 
@@ -1898,46 +1852,55 @@ async def _dump_schema(
 
     profile = load_connection_registry().get(result.connection)
     budget = _response_budget(profile, arguments.get("max_response_bytes"))
-    rows = result.rows
-    truncated = result.truncated
-    text = ""
-    while True:
+    header = {
+        key: value
+        for key, value in result.to_payload().items()
+        if key not in {"rows", "columns"}
+    }
+
+    def render(count: int) -> str | None:
+        """Render the first ``count`` rows, or None when over budget."""
+        truncated = result.truncated or count < len(result.rows)
+        rows = result.rows[:count]
         payload = {
-            key: value
-            for key, value in result.to_payload().items()
-            if key not in {"rows", "columns"}
+            **header,
+            "kinds": list(kinds),
+            "tables": group_schema_dump(
+                result.columns,
+                rows,
+                table_meta=table_meta or None,
+                include_columns=include_columns,
+            ),
+            "returned_rows": count,
+            "row_count": count,
+            "truncated": truncated,
+            "next_offset": result.offset + count if truncated else None,
         }
-        payload.update(
-            {
-                "kinds": list(kinds),
-                "tables": group_schema_dump(
-                    result.columns,
-                    rows,
-                    table_meta=table_meta or None,
-                    include_columns=include_columns,
-                ),
-                "returned_rows": len(rows),
-                "row_count": len(rows),
-                "truncated": truncated,
-                "next_offset": result.offset + len(rows) if truncated else None,
-            }
-        )
         text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        if len(text.encode("utf-8")) <= budget:
-            break
-        if not rows:
-            raise QueryFailure(
-                "RESULT_TOO_LARGE",
-                "The grouped schema header exceeds the response budget.",
-                "Request fewer kinds or a narrower table_pattern; retry the same offset.",
-                connection=result.connection,
-                database=result.database,
-                query_id=result.query_id,
-                offset=result.offset,
-                max_response_bytes=budget,
-            )
-        rows = rows[:-1]
-        truncated = True
+        return text if len(text.encode("utf-8")) <= budget else None
+
+    # Grouped size grows with the row prefix, so keep the largest prefix that fits.
+    text = render(len(result.rows))
+    if text is None:
+        low, high, text = 0, len(result.rows) - 1, None
+        while low <= high:
+            middle = (low + high) // 2
+            candidate = render(middle)
+            if candidate is None:
+                high = middle - 1
+            else:
+                low, text = middle + 1, candidate
+    if text is None:
+        raise QueryFailure(
+            "RESULT_TOO_LARGE",
+            "The grouped schema header exceeds the response budget.",
+            "Request fewer kinds or a narrower table_pattern; retry the same offset.",
+            connection=result.connection,
+            database=result.database,
+            query_id=result.query_id,
+            offset=result.offset,
+            max_response_bytes=budget,
+        )
     return [TextContent(type="text", text=text)]
 
 
@@ -1979,8 +1942,11 @@ async def run_query(
         internal=internal,
         bounded_result=bounded_result,
     )
-    profile = load_connection_registry().get(result.connection)
-    selected_format = requested_format or profile.result_format
+    # Render in the format execute_query fitted; the text is already cached.
+    selected_format = result.result_format or requested_format
+    if selected_format is None:
+        profile = load_connection_registry().get(result.connection)
+        selected_format = profile.result_format
     return [TextContent(type="text", text=result.render(selected_format))]
 
 
@@ -2114,276 +2080,19 @@ async def main():
         close_runtime_resources()
 
 
+
+
+# Thin wrappers keep the transport entry points patchable on this module.
 async def _run_stdio_server():
-    """Runs the server using standard input/output streams."""
-    from mcp.server.stdio import stdio_server
-
-    logger.info("Starting MySQL MCP server (STDIO)...")
-    async with stdio_server() as (read_stream, write_stream):
-        try:
-            await app.run(
-                read_stream, write_stream, app.create_initialization_options()
-            )
-        except Exception as e:
-            logger.error(f"Server error: {str(e)}", exc_info=True)
-            raise
-
-
-def _validate_sse_exposure(
-    host: str, bearer_token: str | None, trust_proxy_auth: bool
-) -> None:
-    loopback_hosts = {"127.0.0.1", "localhost", "::1"}
-    public_bind = host not in loopback_hosts
-    if bearer_token is not None and len(bearer_token) < 32:
-        raise ValueError("MCP_SSE_BEARER_TOKEN must be at least 32 characters")
-    if public_bind and not bearer_token and not trust_proxy_auth:
-        raise ValueError(
-            "Refusing unauthenticated public SSE bind. Configure "
-            "MCP_SSE_BEARER_TOKEN, bind to 127.0.0.1, or explicitly set "
-            "MCP_SSE_TRUST_PROXY_AUTH=true when an authenticated reverse proxy "
-            "is the only network entry point."
-        )
+    await run_stdio(app)
 
 
 async def _run_sse_server():
-    """
-    Runs the server using Server-Sent Events (SSE) over HTTP.
-    Requires 'starlette' and 'uvicorn' dependencies.
-    """
-    try:
-        import uvicorn
-        from mcp.server.sse import SseServerTransport
-        from starlette.applications import Starlette
-        from starlette.responses import Response
-        from starlette.routing import Mount, Route
-    except ImportError:
-        logger.error(
-            "SSE transport requires additional dependencies. Install with: pip install mysql_mcp_server[sse]"
-        )
-        raise
-
-    logger.info("Starting MySQL MCP server (SSE)...")
-
-    host = os.getenv("MCP_SSE_HOST", "127.0.0.1")
-    port = _server_port("MCP_SSE_PORT")
-    bearer_token = os.getenv("MCP_SSE_BEARER_TOKEN") or None
-    trust_proxy_auth = os.getenv("MCP_SSE_TRUST_PROXY_AUTH", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-    _validate_sse_exposure(host, bearer_token, trust_proxy_auth)
-
-    # Build security settings with DNS rebinding protection.
-    # allowed_hosts controls which Host header values are accepted; without this
-    # a DNS rebinding attack can relay requests through the victim's browser.
-    try:
-        from mcp.server.transport_security import TransportSecuritySettings
-
-        allowed_hosts_env = os.getenv("MCP_SSE_ALLOWED_HOSTS", "")
-        if allowed_hosts_env:
-            allowed_hosts = [
-                h.strip() for h in allowed_hosts_env.split(",") if h.strip()
-            ]
-        else:
-            allowed_hosts = _default_allowed_hosts(host, port)
-
-        logger.info(
-            "SSE DNS rebinding protection enabled. Allowed hosts: %s. "
-            "Override with MCP_SSE_ALLOWED_HOSTS (comma-separated).",
-            ", ".join(allowed_hosts),
-        )
-        security_settings = TransportSecuritySettings(
-            enable_dns_rebinding_protection=True,
-            allowed_hosts=allowed_hosts,
-        )
-    except ImportError:
-        logger.warning(
-            "mcp.server.transport_security not available (upgrade mcp>=1.9.0 for DNS rebinding protection). "
-            "Running without Origin/Host validation."
-        )
-        security_settings = None
-
-    sse = (
-        SseServerTransport("/messages/", security_settings=security_settings)
-        if security_settings is not None
-        else SseServerTransport("/messages/")
-    )
-
-    async def handle_sse(request):
-        """Handler for the SSE connection endpoint."""
-        async with sse.connect_sse(
-            request.scope, request.receive, request._send
-        ) as streams:
-            await app.run(streams[0], streams[1], app.create_initialization_options())
-        return Response()
-
-    async def health_check(request):
-        """Simple health check endpoint."""
-        return Response("MySQL MCP Server is running", media_type="text/plain")
-
-    # Define the Starlette application with SSE routes and a health check.
-    starlette_app = Starlette(
-        routes=[
-            Route("/", endpoint=health_check),
-            Route("/sse", endpoint=handle_sse),
-            Mount("/messages/", app=sse.handle_post_message),
-        ]
-    )
-
-    if bearer_token:
-
-        class BearerAuthMiddleware:
-            def __init__(self, wrapped_app, token: str):
-                self.wrapped_app = wrapped_app
-                self.expected = f"Bearer {token}"
-
-            async def __call__(self, scope, receive, send):
-                if scope["type"] == "http" and scope.get("path") != "/":
-                    headers = dict(scope.get("headers", []))
-                    provided = headers.get(b"authorization", b"").decode("latin-1")
-                    if not hmac.compare_digest(provided, self.expected):
-                        response = Response(
-                            "Unauthorized",
-                            status_code=401,
-                            headers={"WWW-Authenticate": "Bearer"},
-                        )
-                        await response(scope, receive, send)
-                        return
-                await self.wrapped_app(scope, receive, send)
-
-        secured_app = BearerAuthMiddleware(starlette_app, bearer_token)
-    else:
-        secured_app = starlette_app
-
-    # Configure and start the Uvicorn server.
-    server_config = uvicorn.Config(secured_app, host=host, port=port, log_level="info")
-    server = uvicorn.Server(server_config)
-    await server.serve()
+    await run_sse(app)
 
 
 async def _run_streamable_http_server():
-    """Run the MCP server over the standard Streamable HTTP transport."""
-    try:
-        import uvicorn
-        from mcp.server.streamable_http_manager import \
-            StreamableHTTPSessionManager
-        from mcp.server.transport_security import TransportSecuritySettings
-        from starlette.applications import Starlette
-        from starlette.responses import Response
-        from starlette.routing import Route
-    except ImportError:
-        logger.error(
-            "Streamable HTTP requires additional dependencies. "
-            "Install with: pip install mysql_mcp_server[http]"
-        )
-        raise
-
-    host = os.getenv("MCP_HTTP_HOST", "127.0.0.1")
-    port = _server_port("MCP_HTTP_PORT")
-    path = os.getenv("MCP_HTTP_PATH", "/mcp").strip()
-    bearer_token = os.getenv("MCP_HTTP_BEARER_TOKEN") or None
-    trust_proxy_auth = os.getenv("MCP_HTTP_TRUST_PROXY_AUTH", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-    if not path.startswith("/") or path == "/":
-        raise ValueError("MCP_HTTP_PATH must start with '/' and cannot be '/'")
-    _validate_http_exposure(host, bearer_token, trust_proxy_auth)
-
-    allowed_hosts_env = os.getenv("MCP_HTTP_ALLOWED_HOSTS", "")
-    if allowed_hosts_env:
-        allowed_hosts = [
-            value.strip() for value in allowed_hosts_env.split(",") if value.strip()
-        ]
-    else:
-        allowed_hosts = _default_allowed_hosts(host, port)
-
-    security_settings = TransportSecuritySettings(
-        enable_dns_rebinding_protection=True,
-        allowed_hosts=allowed_hosts,
-    )
-    session_manager = StreamableHTTPSessionManager(
-        app=app,
-        security_settings=security_settings,
-        session_idle_timeout=_positive_seconds_env(
-            "MCP_HTTP_SESSION_IDLE_TIMEOUT_SECONDS", 1800
-        ),
-    )
-
-    class StreamableHTTPASGIApp:
-        async def __call__(self, scope, receive, send):
-            await session_manager.handle_request(scope, receive, send)
-
-    async def health_check(request):
-        return Response("MySQL MCP Server is running", media_type="text/plain")
-
-    starlette_app = Starlette(
-        routes=[
-            Route("/", endpoint=health_check),
-            Route(path, endpoint=StreamableHTTPASGIApp()),
-        ],
-        lifespan=lambda _: session_manager.run(),
-    )
-    secured_app = _with_bearer_auth(starlette_app, bearer_token, Response)
-
-    logger.info(
-        "Starting MySQL MCP server (Streamable HTTP) at http://%s:%s%s",
-        host,
-        port,
-        path,
-    )
-    server_config = uvicorn.Config(secured_app, host=host, port=port, log_level="info")
-    server = uvicorn.Server(server_config)
-    await server.serve()
-
-
-def _validate_http_exposure(
-    host: str, bearer_token: str | None, trust_proxy_auth: bool
-) -> None:
-    """Fail closed when Streamable HTTP would be exposed without authentication."""
-    loopback_hosts = {"127.0.0.1", "localhost", "::1"}
-    public_bind = host not in loopback_hosts
-    if bearer_token is not None and len(bearer_token) < 32:
-        raise ValueError("MCP_HTTP_BEARER_TOKEN must be at least 32 characters")
-    if public_bind and not bearer_token and not trust_proxy_auth:
-        raise ValueError(
-            "Refusing unauthenticated public Streamable HTTP bind. Configure "
-            "MCP_HTTP_BEARER_TOKEN, bind to 127.0.0.1, or explicitly set "
-            "MCP_HTTP_TRUST_PROXY_AUTH=true when an authenticated reverse proxy "
-            "is the only network entry point."
-        )
-
-
-def _with_bearer_auth(asgi_app, bearer_token: str | None, response_type):
-    """Protect every non-health HTTP route with an optional static bearer token."""
-    if not bearer_token:
-        return asgi_app
-
-    class BearerAuthMiddleware:
-        def __init__(self, wrapped_app, token: str):
-            self.wrapped_app = wrapped_app
-            self.expected = f"Bearer {token}"
-
-        async def __call__(self, scope, receive, send):
-            if scope["type"] == "http" and scope.get("path") != "/":
-                headers = dict(scope.get("headers", []))
-                provided = headers.get(b"authorization", b"").decode("latin-1")
-                if not hmac.compare_digest(provided, self.expected):
-                    response = response_type(
-                        "Unauthorized",
-                        status_code=401,
-                        headers={"WWW-Authenticate": "Bearer"},
-                    )
-                    await response(scope, receive, send)
-                    return
-            await self.wrapped_app(scope, receive, send)
-
-    return BearerAuthMiddleware(asgi_app, bearer_token)
-
+    await run_streamable_http(app)
 
 if __name__ == "__main__":
     # Start the asyncio event loop.

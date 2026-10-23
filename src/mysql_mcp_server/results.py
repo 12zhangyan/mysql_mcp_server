@@ -7,6 +7,7 @@ import csv
 import hashlib
 import io
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time
 from decimal import Decimal
@@ -25,7 +26,18 @@ TRUNCATION_SUFFIX = "…[truncated]"
 MASKED_VALUE = "[REDACTED]"
 
 
+_PASSTHROUGH_TYPES = frozenset({type(None), bool, int, float})
+
+
 def serialize_value(value: Any, max_length: int | None) -> Any:
+    # Exact-type fast paths for the common driver values; this runs per cell.
+    value_type = type(value)
+    if value_type in _PASSTHROUGH_TYPES:
+        return value
+    if value_type is str:
+        if max_length is not None and len(value) > max_length:
+            return value[:max_length] + TRUNCATION_SUFFIX
+        return value
     if value is None or isinstance(value, (bool, int, float)):
         return value
     if isinstance(value, Decimal):
@@ -208,9 +220,9 @@ def _mask_json_keys(value: Any, matches) -> tuple[Any, bool]:
 def mask_result_rows(
     query: str,
     columns: list[str],
-    rows: list[list[Any]],
+    rows: Sequence[Sequence[Any]],
     patterns: tuple[str, ...],
-) -> tuple[list[list[Any]], list[str]]:
+) -> tuple[Sequence[Sequence[Any]], list[str]]:
     """Mask sensitive source columns and sensitive keys nested in JSON values."""
     normalized_patterns = tuple(pattern.lower() for pattern in patterns if pattern)
     if not normalized_patterns or not rows:
@@ -282,6 +294,13 @@ class QueryResult:
     truncation_reasons: tuple[str, ...] = ()
     queue_wait_ms: int = 0
     plan: dict[str, Any] | None = None
+    # Format the response budget was fitted for; not part of the payload.
+    result_format: str | None = field(default=None, compare=False)
+    # Rendered text per format. Instances are never mutated after creation,
+    # and replace() starts a fresh cache because this field is not an init arg.
+    _rendered: dict[str, str] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
 
     @property
     def next_offset(self) -> int | None:
@@ -403,6 +422,12 @@ class QueryResult:
         return candidate(low)
 
     def render(self, result_format: str) -> str:
+        rendered = self._rendered.get(result_format)
+        if rendered is None:
+            rendered = self._rendered[result_format] = self._render(result_format)
+        return rendered
+
+    def _render(self, result_format: str) -> str:
         if result_format == "compact":
             metadata = {
                 key: value

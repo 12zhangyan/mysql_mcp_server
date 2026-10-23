@@ -294,6 +294,57 @@ def test_legacy_safety_limits_are_validated(monkeypatch):
         load_connection_registry()
 
 
+def test_profiles_path_must_be_an_existing_file(tmp_path: Path, monkeypatch):
+    for configured in (tmp_path / "missing.toml", tmp_path):
+        monkeypatch.setenv("MYSQL_PROFILES_FILE", str(configured))
+        with pytest.raises(ValueError, match="profiles file does not exist"):
+            load_connection_registry()
+
+    profiles_file = tmp_path / "connections.toml"
+    profiles_file.write_text(
+        '[connections.main]\nuser = "reader"\npassword = "secret"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MYSQL_PROFILES_FILE", str(profiles_file))
+    registry = load_connection_registry()
+    assert registry.source == str(profiles_file.resolve())
+    assert load_connection_registry() is registry
+
+
+def test_legacy_and_profile_files_share_limits_but_keep_legacy_defaults(
+    tmp_path: Path, monkeypatch
+):
+    for name in ("MYSQL_POOL_SIZE", "MYSQL_LOCAL_PORT", "MYSQL_SSH_PORT"):
+        monkeypatch.delenv(name, raising=False)
+    legacy = load_connection_registry().get()
+    assert legacy.pool_size == 0
+    assert legacy.ssh.local_port == 3330
+
+    monkeypatch.setenv("MYSQL_LOCAL_PORT", "65536")
+    with pytest.raises(ValueError, match="MYSQL_LOCAL_PORT must be between 0 and 65535"):
+        load_connection_registry()
+
+    profiles_file = tmp_path / "connections.toml"
+    profiles_file.write_text(
+        '[connections.main]\nuser = "reader"\npassword = "secret"\n'
+        "[connections.main.ssh]\nport = 0\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MYSQL_PROFILES_FILE", str(profiles_file))
+    registry = load_connection_registry()
+    assert "Connection 'main'.ssh.port must be between 1 and 65535" in registry.errors[
+        "main"
+    ]
+
+    profiles_file.write_text(
+        '[connections.main]\nuser = "reader"\npassword = "secret"\n',
+        encoding="utf-8",
+    )
+    named = load_connection_registry(force_reload=True).get("main")
+    assert named.pool_size == 5
+    assert named.ssh.local_port == 0
+
+
 @pytest.mark.asyncio
 async def test_validate_connections_reports_profile_local_errors_without_connecting(
     tmp_path: Path, monkeypatch

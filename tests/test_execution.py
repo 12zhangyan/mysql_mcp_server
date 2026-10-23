@@ -891,3 +891,20 @@ async def test_unexpected_combined_set_error_is_not_masked():
 
     assert response.isError is True
     assert cursor.execute.call_count == 1
+
+
+async def test_run_query_renders_the_format_execute_query_fitted():
+    connection, _cursor = fake_connection([(1,), (2,)], ["id"])
+    with patch(
+        "mysql_mcp_server.server._open_connection",
+        return_value=(connection, {"database": "app"}),
+    ), patch(
+        "mysql_mcp_server.server.load_connection_registry",
+        wraps=load_connection_registry,
+    ) as registry:
+        result = await call_tool(
+            "execute_sql", {"query": "SELECT id FROM t", "result_format": "json"}
+        )
+    assert json.loads(result[0].text)["rows"] == [[1], [2]]
+    # One registry lookup in execute_query; rendering reuses its fitted format.
+    assert registry.call_count == 1
