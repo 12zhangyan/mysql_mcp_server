@@ -199,7 +199,8 @@ def _bounded_query_sql(
         statement = statement.offset(exp.Literal.number(effective_offset), copy=False)
     else:
         statement.set("offset", None)
-    return statement.sql(dialect="mysql")
+    # The AST is owned here, so the generator need not copy it first.
+    return statement.sql(dialect="mysql", copy=False)
 
 
 def get_db_config(
