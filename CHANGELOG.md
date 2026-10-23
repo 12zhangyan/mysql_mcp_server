@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.5] - 2026-10-23
+
+### Changed
+- `dump_schema` trims an over-budget page with a binary search instead of
+  re-serializing the grouped payload once per dropped row.
+- Query results cache their rendered text and remember the format they were fitted
+  for, so a tool call no longer renders the payload twice or reloads the connection
+  registry to choose the format.
+- Audit query fingerprints and statement types are computed once per SQL text.
+- Paging pushdown reuses the validated AST without deep-copying it, including when
+  generating the paged SQL. Executed SQL is unchanged.
+- A cached profile registry is revalidated with a single `stat()` per lookup; file
+  identity (`st_dev`/`st_ino`) is part of the cache key, so a retargeted symlink still
+  reloads.
+- Common cell types (`str`, `int`, `float`, `bool`, `None`) serialize on a fast path,
+  and fetched rows are no longer copied before masking.
+- Integer limits for profile files and legacy `MYSQL_*` variables come from one shared
+  table; legacy defaults (`MYSQL_POOL_SIZE=0`, `MYSQL_LOCAL_PORT=3330`) are unchanged.
+- The query tool path and the resource path share one readiness, query-policy and
+  connection-release implementation.
+- HTTP/SSE/stdio transport startup and bearer authentication moved to
+  `mysql_mcp_server.transport`; existing `mysql_mcp_server.server` names remain
+  importable.
+
+### Fixed
+- A bearer `Authorization` header containing non-ASCII bytes is rejected with HTTP 401
+  instead of failing with HTTP 500.
+
 ## [0.9.4] - 2026-10-19
 
 ### Fixed
