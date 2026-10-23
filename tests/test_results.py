@@ -120,6 +120,22 @@ def test_large_cell_is_truncated_deterministically():
     assert serialize_value("abcdefgh", 4) == "abcd…[truncated]"
 
 
+def test_fast_paths_match_the_general_serialization_rules():
+    class Label(str):
+        pass
+
+    class Flag(int):
+        pass
+
+    assert serialize_value("abcd", 4) == "abcd"
+    assert serialize_value("abcdefgh", None) == "abcdefgh"
+    assert serialize_value(Label("abcdefgh"), 4) == "abcd…[truncated]"
+    assert type(serialize_value(Label("ab"), 4)) is str
+    assert serialize_value(True, 1) is True
+    assert serialize_value(Flag(7), 1) == 7
+    assert serialize_value(None, 1) is None
+
+
 @pytest.mark.parametrize(
     "query",
     [

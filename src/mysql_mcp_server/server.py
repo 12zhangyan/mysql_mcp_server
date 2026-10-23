@@ -1646,11 +1646,9 @@ async def execute_query(
                         truncated and not bounded_result and executed_query == query
                     )
                     raw_rows = raw_rows[:fetch_limit]
+                    # Masking builds new rows when it changes anything.
                     rows, masked_columns = mask_result_rows(
-                        query,
-                        columns,
-                        [list(row) for row in raw_rows],
-                        profile.mask_columns,
+                        query, columns, raw_rows, profile.mask_columns
                     )
                     serialized_rows = [
                         [
