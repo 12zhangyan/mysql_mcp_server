@@ -157,12 +157,11 @@ def _bounded_query_sql(
 ) -> str | None:
     """Push MCP paging into an outer query when it can be preserved exactly.
 
-    ``parsed`` is an already parsed AST of ``query``; it is copied, not mutated.
+    ``parsed`` is an already parsed AST of ``query``. It is consumed: its LIMIT
+    and OFFSET may be rewritten in place, so callers must not reuse it.
     """
     try:
-        statement = (
-            sqlglot.parse_one(query, read="mysql") if parsed is None else parsed.copy()
-        )
+        statement = sqlglot.parse_one(query, read="mysql") if parsed is None else parsed
     except Exception:
         return None
     if not isinstance(statement, exp.Query):
