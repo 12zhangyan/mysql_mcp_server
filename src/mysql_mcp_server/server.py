@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 import logging
@@ -2092,3 +2093,7 @@ async def _run_sse_server():
 
 async def _run_streamable_http_server():
     await run_streamable_http(app)
+
+if __name__ == "__main__":
+    # Start the asyncio event loop.
+    asyncio.run(main())

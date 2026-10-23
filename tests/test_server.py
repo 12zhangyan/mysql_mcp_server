@@ -392,3 +392,40 @@ async def test_list_resources():
 
     assert resources == []
     connector.assert_called_once()
+
+
+def test_module_entry_point_serves_stdio():
+    """The Docker image starts the server with `python -m mysql_mcp_server.server`."""
+    import json
+    import os
+    import subprocess
+    import sys
+
+    initialize = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "entry-point-test", "version": "1"},
+        },
+    }
+    env = {
+        **os.environ,
+        "MYSQL_USER": "readonly_test",
+        "MYSQL_PASSWORD": "readonly_test",
+        "MCP_TRANSPORT": "stdio",
+    }
+    env.pop("MYSQL_PROFILES_FILE", None)
+    completed = subprocess.run(
+        [sys.executable, "-m", "mysql_mcp_server.server"],
+        input=json.dumps(initialize) + "\n",
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+    )
+    responses = [json.loads(line) for line in completed.stdout.splitlines() if line]
+    assert responses and responses[0]["id"] == 1
+    assert responses[0]["result"]["serverInfo"]["name"] == "mysql_mcp_server"

@@ -294,7 +294,3 @@ def _with_bearer_auth(asgi_app, bearer_token: str | None, response_type):
 
     return BearerAuthMiddleware(asgi_app, bearer_token)
 
-
-if __name__ == "__main__":
-    # Start the asyncio event loop.
-    asyncio.run(main())
