@@ -9,7 +9,7 @@ import threading
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .credential_store import (credential_cache, get_keyring_password,
                                run_credential_command)
@@ -67,6 +67,49 @@ def _bounded_float(
     if not minimum <= number <= maximum:
         raise ValueError(f"{name} must be between {minimum} and {maximum}")
     return number
+
+
+# (default, minimum, maximum) for integer settings, shared by profile files and
+# legacy MYSQL_* variables so the two sources cannot drift apart.
+_INT_LIMITS: dict[str, tuple[int, int, int]] = {
+    "port": (3306, 1, 65535),
+    "connect_timeout": (10, 1, 300),
+    "query_timeout_ms": (30_000, 100, 300_000),
+    "max_rows": (500, 1, 1000),
+    "max_cell_length": (20_000, 100, 1_000_000),
+    "max_response_bytes": (262144, 4096, 4194304),
+    "max_concurrent_queries": (5, 1, 32),
+    "max_queued_queries": (16, 0, 128),
+    "queue_timeout_ms": (1000, 1, 300000),
+    "pool_size": (5, 0, 32),
+    "audit_log_max_bytes": (10_000_000, 10_000, 1_000_000_000),
+    "audit_log_backup_count": (10, 1, 100),
+}
+_SSH_INT_LIMITS: dict[str, tuple[int, int, int]] = {
+    "port": (22, 1, 65535),
+    "remote_port": (3306, 1, 65535),
+    "local_port": (0, 0, 65535),
+}
+_SSH_STARTUP_TIMEOUT_LIMITS = (5.0, 0.1, 60)
+
+
+def _limited_ints(
+    limits: dict[str, tuple[int, int, int]],
+    read: Callable[[str], Any],
+    label: Callable[[str], str],
+    defaults: dict[str, int] | None = None,
+) -> dict[str, int]:
+    """Validate each limited integer setting, in table order."""
+    values: dict[str, int] = {}
+    for key, (default, minimum, maximum) in limits.items():
+        values[key] = _bounded_int(
+            read(key),
+            name=label(key),
+            default=(defaults or {}).get(key, default),
+            minimum=minimum,
+            maximum=maximum,
+        )
+    return values
 
 
 def _validate_identifier(name: str, *, label: str) -> str:
@@ -529,17 +572,16 @@ def _profile_from_toml(name: str, values: dict[str, Any]) -> ConnectionProfile:
     if not isinstance(ssh_values, dict):
         raise ValueError(f"Connection '{name}'.ssh must be a table")
 
+    limits = _limited_ints(
+        _INT_LIMITS, values.get, lambda key: f"Connection '{name}'.{key}"
+    )
+    ssh_limits = _limited_ints(
+        _SSH_INT_LIMITS, ssh_values.get, lambda key: f"Connection '{name}'.ssh.{key}"
+    )
     return ConnectionProfile(
         name=name,
         description=str(values.get("description", "")),
         host=str(values.get("host", "localhost")),
-        port=_bounded_int(
-            values.get("port"),
-            name=f"Connection '{name}'.port",
-            default=3306,
-            minimum=1,
-            maximum=65535,
-        ),
         user=str(user),
         password=password,
         password_env=password_env,
@@ -556,87 +598,10 @@ def _profile_from_toml(name: str, values: dict[str, Any]) -> ConnectionProfile:
         charset=str(values.get("charset", "utf8mb4")),
         collation=str(values.get("collation", "utf8mb4_unicode_ci")),
         sql_mode=str(values.get("sql_mode", "TRADITIONAL")),
-        connect_timeout=_bounded_int(
-            values.get("connect_timeout"),
-            name=f"Connection '{name}'.connect_timeout",
-            default=10,
-            minimum=1,
-            maximum=300,
-        ),
-        query_timeout_ms=_bounded_int(
-            values.get("query_timeout_ms"),
-            name=f"Connection '{name}'.query_timeout_ms",
-            default=30_000,
-            minimum=100,
-            maximum=300_000,
-        ),
-        max_rows=_bounded_int(
-            values.get("max_rows"),
-            name=f"Connection '{name}'.max_rows",
-            default=500,
-            minimum=1,
-            maximum=1000,
-        ),
-        max_cell_length=_bounded_int(
-            values.get("max_cell_length"),
-            name=f"Connection '{name}'.max_cell_length",
-            default=20_000,
-            minimum=100,
-            maximum=1_000_000,
-        ),
-        max_response_bytes=_bounded_int(
-            values.get("max_response_bytes"),
-            name=f"Connection '{name}'.max_response_bytes",
-            default=262144,
-            minimum=4096,
-            maximum=4194304,
-        ),
-        max_concurrent_queries=_bounded_int(
-            values.get("max_concurrent_queries"),
-            name=f"Connection '{name}'.max_concurrent_queries",
-            default=5,
-            minimum=1,
-            maximum=32,
-        ),
-        max_queued_queries=_bounded_int(
-            values.get("max_queued_queries"),
-            name=f"Connection '{name}'.max_queued_queries",
-            default=16,
-            minimum=0,
-            maximum=128,
-        ),
-        queue_timeout_ms=_bounded_int(
-            values.get("queue_timeout_ms"),
-            name=f"Connection '{name}'.queue_timeout_ms",
-            default=1000,
-            minimum=1,
-            maximum=300000,
-        ),
         mask_columns=mask_columns,
         result_format=result_format,
-        pool_size=_bounded_int(
-            values.get("pool_size"),
-            name=f"Connection '{name}'.pool_size",
-            default=5,
-            minimum=0,
-            maximum=32,
-        ),
         audit_enabled=audit_enabled,
         audit_log_file=audit_log_file,
-        audit_log_max_bytes=_bounded_int(
-            values.get("audit_log_max_bytes"),
-            name=f"Connection '{name}'.audit_log_max_bytes",
-            default=10_000_000,
-            minimum=10_000,
-            maximum=1_000_000_000,
-        ),
-        audit_log_backup_count=_bounded_int(
-            values.get("audit_log_backup_count"),
-            name=f"Connection '{name}'.audit_log_backup_count",
-            default=10,
-            minimum=1,
-            maximum=100,
-        ),
         audit_hmac_key_env=audit_hmac_key_env,
         audit_required_context=required_context,
         audit_fail_closed=audit_fail_closed,
@@ -649,41 +614,34 @@ def _profile_from_toml(name: str, values: dict[str, Any]) -> ConnectionProfile:
         ssh=SshConfig(
             enabled=_as_bool(ssh_values.get("enabled")),
             host=str(ssh_values["host"]) if ssh_values.get("host") else None,
-            port=_bounded_int(
-                ssh_values.get("port"),
-                name=f"Connection '{name}'.ssh.port",
-                default=22,
-                minimum=1,
-                maximum=65535,
-            ),
             user=str(ssh_values["user"]) if ssh_values.get("user") else None,
             key_path=(
                 str(ssh_values["key_path"]) if ssh_values.get("key_path") else None
             ),
             remote_host=str(ssh_values.get("remote_host", "localhost")),
-            remote_port=_bounded_int(
-                ssh_values.get("remote_port"),
-                name=f"Connection '{name}'.ssh.remote_port",
-                default=3306,
-                minimum=1,
-                maximum=65535,
-            ),
-            local_port=_bounded_int(
-                ssh_values.get("local_port"),
-                name=f"Connection '{name}'.ssh.local_port",
-                default=0,
-                minimum=0,
-                maximum=65535,
-            ),
-            startup_timeout=_bounded_float(
+            startup_timeout=_ssh_startup_timeout(
                 ssh_values.get("startup_timeout"),
                 name=f"Connection '{name}'.ssh.startup_timeout",
-                default=5.0,
-                minimum=0.1,
-                maximum=60,
             ),
+            **ssh_limits,
         ),
+        **limits,
     )
+
+
+def _ssh_startup_timeout(value: Any, *, name: str) -> float:
+    default, minimum, maximum = _SSH_STARTUP_TIMEOUT_LIMITS
+    return _bounded_float(
+        value, name=name, default=default, minimum=minimum, maximum=maximum
+    )
+
+
+# Legacy variable names; most follow MYSQL_<KEY>, these do not.
+_LEGACY_SSH_INT_ENV = {
+    "port": "MYSQL_SSH_PORT",
+    "remote_port": "MYSQL_SSH_REMOTE_PORT",
+    "local_port": "MYSQL_LOCAL_PORT",
+}
 
 
 def _legacy_profile() -> ConnectionProfile:
@@ -763,17 +721,26 @@ def _legacy_profile() -> ConnectionProfile:
             "MYSQL_AUDIT_ENABLED=true"
         )
 
+    def env_name(key: str) -> str:
+        return f"MYSQL_{key.upper()}"
+
+    limits = _limited_ints(
+        _INT_LIMITS,
+        lambda key: os.getenv(env_name(key)),
+        env_name,
+        # Legacy deployments connect without a pool unless MYSQL_POOL_SIZE is set.
+        defaults={"pool_size": 0},
+    )
+    ssh_limits = _limited_ints(
+        _SSH_INT_LIMITS,
+        lambda key: os.getenv(_LEGACY_SSH_INT_ENV[key]),
+        _LEGACY_SSH_INT_ENV.__getitem__,
+        defaults={"local_port": 3330},
+    )
     return ConnectionProfile(
         name="default",
         description="Legacy MYSQL_* environment configuration",
         host=os.getenv("MYSQL_HOST", "localhost"),
-        port=_bounded_int(
-            os.getenv("MYSQL_PORT"),
-            name="MYSQL_PORT",
-            default=3306,
-            minimum=1,
-            maximum=65535,
-        ),
         user=user,
         password=password,
         database=database,
@@ -783,87 +750,10 @@ def _legacy_profile() -> ConnectionProfile:
         charset=os.getenv("MYSQL_CHARSET", "utf8mb4"),
         collation=os.getenv("MYSQL_COLLATION", "utf8mb4_unicode_ci"),
         sql_mode=os.getenv("MYSQL_SQL_MODE", "TRADITIONAL"),
-        connect_timeout=_bounded_int(
-            os.getenv("MYSQL_CONNECT_TIMEOUT"),
-            name="MYSQL_CONNECT_TIMEOUT",
-            default=10,
-            minimum=1,
-            maximum=300,
-        ),
-        query_timeout_ms=_bounded_int(
-            os.getenv("MYSQL_QUERY_TIMEOUT_MS"),
-            name="MYSQL_QUERY_TIMEOUT_MS",
-            default=30_000,
-            minimum=100,
-            maximum=300_000,
-        ),
-        max_rows=_bounded_int(
-            os.getenv("MYSQL_MAX_ROWS"),
-            name="MYSQL_MAX_ROWS",
-            default=500,
-            minimum=1,
-            maximum=1000,
-        ),
-        max_cell_length=_bounded_int(
-            os.getenv("MYSQL_MAX_CELL_LENGTH"),
-            name="MYSQL_MAX_CELL_LENGTH",
-            default=20_000,
-            minimum=100,
-            maximum=1_000_000,
-        ),
-        max_response_bytes=_bounded_int(
-            os.getenv("MYSQL_MAX_RESPONSE_BYTES"),
-            name="MYSQL_MAX_RESPONSE_BYTES",
-            default=262144,
-            minimum=4096,
-            maximum=4194304,
-        ),
-        max_concurrent_queries=_bounded_int(
-            os.getenv("MYSQL_MAX_CONCURRENT_QUERIES"),
-            name="MYSQL_MAX_CONCURRENT_QUERIES",
-            default=5,
-            minimum=1,
-            maximum=32,
-        ),
-        max_queued_queries=_bounded_int(
-            os.getenv("MYSQL_MAX_QUEUED_QUERIES"),
-            name="MYSQL_MAX_QUEUED_QUERIES",
-            default=16,
-            minimum=0,
-            maximum=128,
-        ),
-        queue_timeout_ms=_bounded_int(
-            os.getenv("MYSQL_QUEUE_TIMEOUT_MS"),
-            name="MYSQL_QUEUE_TIMEOUT_MS",
-            default=1000,
-            minimum=1,
-            maximum=300000,
-        ),
         mask_columns=mask_columns,
         result_format=result_format,
-        pool_size=_bounded_int(
-            os.getenv("MYSQL_POOL_SIZE"),
-            name="MYSQL_POOL_SIZE",
-            default=0,
-            minimum=0,
-            maximum=32,
-        ),
         audit_enabled=audit_enabled,
         audit_log_file=audit_log_file,
-        audit_log_max_bytes=_bounded_int(
-            os.getenv("MYSQL_AUDIT_LOG_MAX_BYTES"),
-            name="MYSQL_AUDIT_LOG_MAX_BYTES",
-            default=10_000_000,
-            minimum=10_000,
-            maximum=1_000_000_000,
-        ),
-        audit_log_backup_count=_bounded_int(
-            os.getenv("MYSQL_AUDIT_LOG_BACKUP_COUNT"),
-            name="MYSQL_AUDIT_LOG_BACKUP_COUNT",
-            default=10,
-            minimum=1,
-            maximum=100,
-        ),
         audit_hmac_key_env=audit_hmac_key_env,
         audit_required_context=required_context,
         audit_fail_closed=audit_fail_closed,
@@ -876,38 +766,16 @@ def _legacy_profile() -> ConnectionProfile:
         ssh=SshConfig(
             enabled=_env_bool("MYSQL_SSH_ENABLE"),
             host=os.getenv("MYSQL_SSH_HOST") or None,
-            port=_bounded_int(
-                os.getenv("MYSQL_SSH_PORT"),
-                name="MYSQL_SSH_PORT",
-                default=22,
-                minimum=1,
-                maximum=65535,
-            ),
             user=os.getenv("MYSQL_SSH_USER") or None,
             key_path=os.getenv("MYSQL_SSH_KEY_PATH") or None,
             remote_host=os.getenv("MYSQL_SSH_REMOTE_HOST", "localhost"),
-            remote_port=_bounded_int(
-                os.getenv("MYSQL_SSH_REMOTE_PORT"),
-                name="MYSQL_SSH_REMOTE_PORT",
-                default=3306,
-                minimum=1,
-                maximum=65535,
-            ),
-            local_port=_bounded_int(
-                os.getenv("MYSQL_LOCAL_PORT"),
-                name="MYSQL_LOCAL_PORT",
-                default=3330,
-                minimum=0,
-                maximum=65535,
-            ),
-            startup_timeout=_bounded_float(
+            startup_timeout=_ssh_startup_timeout(
                 os.getenv("MYSQL_SSH_STARTUP_TIMEOUT"),
                 name="MYSQL_SSH_STARTUP_TIMEOUT",
-                default=5.0,
-                minimum=0.1,
-                maximum=60,
             ),
+            **ssh_limits,
         ),
+        **limits,
     )
 
 

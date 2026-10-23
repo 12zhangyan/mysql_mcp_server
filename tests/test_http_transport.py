@@ -145,4 +145,15 @@ async def test_bearer_auth_protects_mcp_route_but_not_health_route():
         send,
     )
 
-    assert calls == ["/", 401, "/mcp"]
+    # Non-ASCII credentials are rejected with 401 instead of raising TypeError.
+    await middleware(
+        {
+            "type": "http",
+            "path": "/mcp",
+            "headers": [(b"authorization", "Bearer é".encode("latin-1"))],
+        },
+        receive,
+        send,
+    )
+
+    assert calls == ["/", 401, "/mcp", 401]

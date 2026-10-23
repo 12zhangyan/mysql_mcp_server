@@ -2131,20 +2131,58 @@ async def _run_stdio_server():
             raise
 
 
-def _validate_sse_exposure(
-    host: str, bearer_token: str | None, trust_proxy_auth: bool
+def _validate_exposure(
+    host: str,
+    bearer_token: str | None,
+    trust_proxy_auth: bool,
+    *,
+    env_prefix: str,
+    label: str,
 ) -> None:
+    """Fail closed when an HTTP transport would be exposed without authentication."""
     loopback_hosts = {"127.0.0.1", "localhost", "::1"}
     public_bind = host not in loopback_hosts
     if bearer_token is not None and len(bearer_token) < 32:
-        raise ValueError("MCP_SSE_BEARER_TOKEN must be at least 32 characters")
+        raise ValueError(f"{env_prefix}_BEARER_TOKEN must be at least 32 characters")
     if public_bind and not bearer_token and not trust_proxy_auth:
         raise ValueError(
-            "Refusing unauthenticated public SSE bind. Configure "
-            "MCP_SSE_BEARER_TOKEN, bind to 127.0.0.1, or explicitly set "
-            "MCP_SSE_TRUST_PROXY_AUTH=true when an authenticated reverse proxy "
+            f"Refusing unauthenticated public {label} bind. Configure "
+            f"{env_prefix}_BEARER_TOKEN, bind to 127.0.0.1, or explicitly set "
+            f"{env_prefix}_TRUST_PROXY_AUTH=true when an authenticated reverse proxy "
             "is the only network entry point."
         )
+
+
+def _validate_sse_exposure(
+    host: str, bearer_token: str | None, trust_proxy_auth: bool
+) -> None:
+    _validate_exposure(
+        host, bearer_token, trust_proxy_auth, env_prefix="MCP_SSE", label="SSE"
+    )
+
+
+def _validate_http_exposure(
+    host: str, bearer_token: str | None, trust_proxy_auth: bool
+) -> None:
+    _validate_exposure(
+        host,
+        bearer_token,
+        trust_proxy_auth,
+        env_prefix="MCP_HTTP",
+        label="Streamable HTTP",
+    )
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _allowed_hosts(env_name: str, host: str, port: int) -> list[str]:
+    """Read a comma-separated Host allowlist, defaulting to the bind address."""
+    configured = os.getenv(env_name, "")
+    if configured:
+        return [value.strip() for value in configured.split(",") if value.strip()]
+    return _default_allowed_hosts(host, port)
 
 
 async def _run_sse_server():
@@ -2169,12 +2207,7 @@ async def _run_sse_server():
     host = os.getenv("MCP_SSE_HOST", "127.0.0.1")
     port = _server_port("MCP_SSE_PORT")
     bearer_token = os.getenv("MCP_SSE_BEARER_TOKEN") or None
-    trust_proxy_auth = os.getenv("MCP_SSE_TRUST_PROXY_AUTH", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    trust_proxy_auth = _env_flag("MCP_SSE_TRUST_PROXY_AUTH")
     _validate_sse_exposure(host, bearer_token, trust_proxy_auth)
 
     # Build security settings with DNS rebinding protection.
@@ -2183,14 +2216,7 @@ async def _run_sse_server():
     try:
         from mcp.server.transport_security import TransportSecuritySettings
 
-        allowed_hosts_env = os.getenv("MCP_SSE_ALLOWED_HOSTS", "")
-        if allowed_hosts_env:
-            allowed_hosts = [
-                h.strip() for h in allowed_hosts_env.split(",") if h.strip()
-            ]
-        else:
-            allowed_hosts = _default_allowed_hosts(host, port)
-
+        allowed_hosts = _allowed_hosts("MCP_SSE_ALLOWED_HOSTS", host, port)
         logger.info(
             "SSE DNS rebinding protection enabled. Allowed hosts: %s. "
             "Override with MCP_SSE_ALLOWED_HOSTS (comma-separated).",
@@ -2234,30 +2260,7 @@ async def _run_sse_server():
         ]
     )
 
-    if bearer_token:
-
-        class BearerAuthMiddleware:
-            def __init__(self, wrapped_app, token: str):
-                self.wrapped_app = wrapped_app
-                self.expected = f"Bearer {token}"
-
-            async def __call__(self, scope, receive, send):
-                if scope["type"] == "http" and scope.get("path") != "/":
-                    headers = dict(scope.get("headers", []))
-                    provided = headers.get(b"authorization", b"").decode("latin-1")
-                    if not hmac.compare_digest(provided, self.expected):
-                        response = Response(
-                            "Unauthorized",
-                            status_code=401,
-                            headers={"WWW-Authenticate": "Bearer"},
-                        )
-                        await response(scope, receive, send)
-                        return
-                await self.wrapped_app(scope, receive, send)
-
-        secured_app = BearerAuthMiddleware(starlette_app, bearer_token)
-    else:
-        secured_app = starlette_app
+    secured_app = _with_bearer_auth(starlette_app, bearer_token, Response)
 
     # Configure and start the Uvicorn server.
     server_config = uvicorn.Config(secured_app, host=host, port=port, log_level="info")
@@ -2286,27 +2289,14 @@ async def _run_streamable_http_server():
     port = _server_port("MCP_HTTP_PORT")
     path = os.getenv("MCP_HTTP_PATH", "/mcp").strip()
     bearer_token = os.getenv("MCP_HTTP_BEARER_TOKEN") or None
-    trust_proxy_auth = os.getenv("MCP_HTTP_TRUST_PROXY_AUTH", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    trust_proxy_auth = _env_flag("MCP_HTTP_TRUST_PROXY_AUTH")
     if not path.startswith("/") or path == "/":
         raise ValueError("MCP_HTTP_PATH must start with '/' and cannot be '/'")
     _validate_http_exposure(host, bearer_token, trust_proxy_auth)
 
-    allowed_hosts_env = os.getenv("MCP_HTTP_ALLOWED_HOSTS", "")
-    if allowed_hosts_env:
-        allowed_hosts = [
-            value.strip() for value in allowed_hosts_env.split(",") if value.strip()
-        ]
-    else:
-        allowed_hosts = _default_allowed_hosts(host, port)
-
     security_settings = TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
-        allowed_hosts=allowed_hosts,
+        allowed_hosts=_allowed_hosts("MCP_HTTP_ALLOWED_HOSTS", host, port),
     )
     session_manager = StreamableHTTPSessionManager(
         app=app,
@@ -2343,23 +2333,6 @@ async def _run_streamable_http_server():
     await server.serve()
 
 
-def _validate_http_exposure(
-    host: str, bearer_token: str | None, trust_proxy_auth: bool
-) -> None:
-    """Fail closed when Streamable HTTP would be exposed without authentication."""
-    loopback_hosts = {"127.0.0.1", "localhost", "::1"}
-    public_bind = host not in loopback_hosts
-    if bearer_token is not None and len(bearer_token) < 32:
-        raise ValueError("MCP_HTTP_BEARER_TOKEN must be at least 32 characters")
-    if public_bind and not bearer_token and not trust_proxy_auth:
-        raise ValueError(
-            "Refusing unauthenticated public Streamable HTTP bind. Configure "
-            "MCP_HTTP_BEARER_TOKEN, bind to 127.0.0.1, or explicitly set "
-            "MCP_HTTP_TRUST_PROXY_AUTH=true when an authenticated reverse proxy "
-            "is the only network entry point."
-        )
-
-
 def _with_bearer_auth(asgi_app, bearer_token: str | None, response_type):
     """Protect every non-health HTTP route with an optional static bearer token."""
     if not bearer_token:
@@ -2368,12 +2341,14 @@ def _with_bearer_auth(asgi_app, bearer_token: str | None, response_type):
     class BearerAuthMiddleware:
         def __init__(self, wrapped_app, token: str):
             self.wrapped_app = wrapped_app
-            self.expected = f"Bearer {token}"
+            self.expected = f"Bearer {token}".encode("utf-8")
 
         async def __call__(self, scope, receive, send):
             if scope["type"] == "http" and scope.get("path") != "/":
                 headers = dict(scope.get("headers", []))
-                provided = headers.get(b"authorization", b"").decode("latin-1")
+                # Compare raw bytes: str comparison rejects non-ASCII input
+                # with TypeError, which would surface as a 500, not a 401.
+                provided = headers.get(b"authorization", b"")
                 if not hmac.compare_digest(provided, self.expected):
                     response = response_type(
                         "Unauthorized",
