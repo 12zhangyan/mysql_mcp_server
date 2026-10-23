@@ -442,6 +442,64 @@ def _catalog_query(
         ) from exc
 
 
+def _ready_password(profile: ConnectionProfile) -> str | None:
+    """Fail before policy checks when the profile or audit context is not ready.
+
+    Returns the password when the readiness check had to resolve it.
+    """
+    ready, readiness, password = profile.runtime_readiness()
+    if not ready:
+        raise ValueError(readiness)
+    validate_required_audit_context(profile, current_audit_context())
+    return password
+
+
+def _enforce_query_policy(
+    profile: ConnectionProfile,
+    query: str,
+    *,
+    selected_database: str | None,
+    internal: bool,
+) -> exp.Expression:
+    """Apply schema and function policy to read-only-validated SQL; return its AST."""
+    if selected_database in SYSTEM_DATABASES and not profile.allow_system_databases:
+        raise ValueError(
+            f"System database '{selected_database}' is blocked for connection "
+            f"'{profile.name}'"
+        )
+    statement = parse_mysql_query(query)
+    validate_database_access(
+        query,
+        selected_database=selected_database,
+        allowed_databases=profile.allowed_databases,
+        allow_system_databases=profile.allow_system_databases,
+        internal=internal,
+        statement=statement,
+    )
+    validate_function_safety(
+        query, allowed_functions=profile.allowed_functions, statement=statement
+    )
+    return statement
+
+
+def _release_connection(connection_object, *, discard: bool) -> None:
+    """Return a connection: shut down an unread/timed-out socket, else roll back."""
+    if discard:
+        try:
+            connection_object.shutdown()
+        except Exception:
+            logger.debug("Socket shutdown failed during connection cleanup")
+    else:
+        try:
+            connection_object.rollback()
+        except Exception:
+            logger.debug("Rollback failed during connection cleanup")
+    try:
+        connection_object.close()
+    except Exception:
+        logger.debug("Connection close failed during cleanup")
+
+
 def _sync_resource_query(
     profile: ConnectionProfile,
     query: str,
@@ -455,28 +513,11 @@ def _sync_resource_query(
     connection_object = None
     discard_connection = False
     try:
-        ready, readiness, password = profile.runtime_readiness()
-        if not ready:
-            raise ValueError(readiness)
-        validate_required_audit_context(profile, current_audit_context())
+        password = _ready_password(profile)
         query = validate_read_only_query(query)
         selected_database = ensure_database_allowed(profile, database)
-        if selected_database in SYSTEM_DATABASES and not profile.allow_system_databases:
-            raise ValueError(
-                f"System database '{selected_database}' is blocked for connection "
-                f"'{profile.name}'"
-            )
-        statement = parse_mysql_query(query)
-        validate_database_access(
-            query,
-            selected_database=selected_database,
-            allowed_databases=profile.allowed_databases,
-            allow_system_databases=profile.allow_system_databases,
-            internal=True,
-            statement=statement,
-        )
-        validate_function_safety(
-            query, allowed_functions=profile.allowed_functions, statement=statement
+        statement = _enforce_query_policy(
+            profile, query, selected_database=selected_database, internal=True
         )
         audit_sink.preflight(profile)
         _write_audit_event(
@@ -537,20 +578,7 @@ def _sync_resource_query(
         raise
     finally:
         if connection_object is not None:
-            if discard_connection:
-                try:
-                    connection_object.shutdown()
-                except Exception:
-                    logger.debug("Socket shutdown failed for resource result cleanup")
-            else:
-                try:
-                    connection_object.rollback()
-                except Exception:
-                    logger.debug("Rollback failed during resource connection cleanup")
-            try:
-                connection_object.close()
-            except Exception:
-                logger.debug("Connection close failed during resource cleanup")
+            _release_connection(connection_object, discard=discard_connection)
 
 
 @app.list_resources()
@@ -1472,10 +1500,7 @@ async def execute_query(
         route_applied=target.route_applied,
     )
     try:
-        ready, readiness, password = profile.runtime_readiness()
-        if not ready:
-            raise ValueError(readiness)
-        validate_required_audit_context(profile, current_audit_context())
+        password = _ready_password(profile)
         if plan_output not in {"rows", "chunks"} or (
             not explain and plan_output != "rows"
         ):
@@ -1493,22 +1518,8 @@ async def execute_query(
             if explain
             else validate_read_only_query(query)
         )
-        if selected_database in SYSTEM_DATABASES and not profile.allow_system_databases:
-            raise ValueError(
-                f"System database '{selected_database}' is blocked for connection "
-                f"'{profile.name}'"
-            )
-        statement = parse_mysql_query(query)
-        validate_database_access(
-            query,
-            selected_database=selected_database,
-            allowed_databases=profile.allowed_databases,
-            allow_system_databases=profile.allow_system_databases,
-            internal=internal,
-            statement=statement,
-        )
-        validate_function_safety(
-            query, allowed_functions=profile.allowed_functions, statement=statement
+        statement = _enforce_query_policy(
+            profile, query, selected_database=selected_database, internal=internal
         )
 
         selected_format = result_format or (
@@ -1721,22 +1732,7 @@ async def execute_query(
                 ) from exc
             finally:
                 if connection_object is not None:
-                    if discard_connection:
-                        try:
-                            connection_object.shutdown()
-                        except Exception:
-                            logger.debug(
-                                "Socket shutdown failed during result or timeout cleanup"
-                            )
-                    else:
-                        try:
-                            connection_object.rollback()
-                        except Exception:
-                            logger.debug("Rollback failed during connection cleanup")
-                    try:
-                        connection_object.close()
-                    except Exception:
-                        logger.debug("Connection close failed during cleanup")
+                    _release_connection(connection_object, discard=discard_connection)
                 control.unbind()
         raise RuntimeError("Connector retry loop exited unexpectedly")
 
