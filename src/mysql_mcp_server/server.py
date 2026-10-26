@@ -710,6 +710,7 @@ async def read_resource(uri: AnyUrl) -> str:
                 columns,
                 [list(row) for row in rows],
                 profile.mask_columns,
+                database=profile.database,
             )
             serialized_rows = [
                 [serialize_value(value, profile.max_cell_length) for value in row]
@@ -1647,7 +1648,11 @@ async def execute_query(
                     raw_rows = raw_rows[:fetch_limit]
                     # Masking builds new rows when it changes anything.
                     rows, masked_columns = mask_result_rows(
-                        query, columns, raw_rows, profile.mask_columns
+                        query,
+                        columns,
+                        raw_rows,
+                        profile.mask_columns,
+                        database=selected_database,
                     )
                     serialized_rows = [
                         [

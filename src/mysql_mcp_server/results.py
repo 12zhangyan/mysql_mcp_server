@@ -7,7 +7,8 @@ import csv
 import hashlib
 import io
 import json
-from collections.abc import Sequence
+import re
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time
 from decimal import Decimal
@@ -16,9 +17,7 @@ from typing import Any
 
 import sqlglot
 from sqlglot import exp
-from sqlglot.lineage import lineage
-from sqlglot.optimizer.qualify import qualify
-from sqlglot.optimizer.scope import build_scope
+from sqlglot.optimizer.scope import Scope, ScopeType, build_scope
 
 from .errors import QueryFailure
 
@@ -57,154 +56,548 @@ def serialize_value(value: Any, max_length: int | None) -> Any:
     return value
 
 
-def _column_candidates(column: exp.Column) -> set[str]:
-    parts = [
-        value.lower()
-        for value in (column.catalog, column.db, column.table, column.name)
-        if value
-    ]
-    return {".".join(parts[index:]) for index in range(len(parts))}
+# Projection names are recorded before COUNT is rewritten for analysis.
+_KEY_META = "mcp_output_key"
 
 
-def _name_candidates(name: str) -> set[str]:
-    parts = [part.strip('`"').lower() for part in name.split(".") if part]
-    return {".".join(parts[index:]) for index in range(len(parts))}
+def _output_key(name: str) -> str:
+    """Compare a result column name with SQL text despite re-spacing and quoting."""
+    return re.sub(r"[\s`]", "", name).lower()
 
 
-def _lineage_source_candidates(
-    statement: exp.Query, columns: list[str]
-) -> list[set[str] | None]:
-    """Prepare one query scope, then trace each output without copying the query."""
+def _projection_key(projection: exp.Expression) -> str:
+    """The name MySQL gives a projection: its alias, column name or SQL text."""
+    recorded = projection.meta.get(_KEY_META)
+    if recorded is not None:
+        return recorded
+    # Only an Alias node names a column; a window's `alias` is its WINDOW name.
+    if isinstance(projection, exp.Alias):
+        return _output_key(projection.alias)
+    if isinstance(projection, exp.Column):
+        return _output_key(projection.name)
+    if isinstance(projection, exp.Literal) and projection.is_string:
+        return _output_key(projection.this)
+    return _output_key(projection.sql(dialect="mysql"))
+
+
+def _is_star(projection: exp.Expression) -> bool:
+    return isinstance(projection, exp.Star) or (
+        isinstance(projection, exp.Column) and isinstance(projection.this, exp.Star)
+    )
+
+
+def _is_table_function(table: exp.Table) -> bool:
+    """JSON_TABLE and other table functions produce rows from expressions."""
+    return not isinstance(table.this, exp.Identifier)
+
+
+def _table_function_columns(table: exp.Table) -> set[str] | None:
+    """Columns a JSON_TABLE declares, or None when they cannot be listed."""
+    if not isinstance(table.this, exp.JSONTable):
+        return None
+    names = {
+        _output_key(definition.name)
+        for definition in table.this.find_all(exp.JSONColumnDef)
+        if definition.name
+    }
+    return names or None
+
+
+def _column_list(expression: exp.Expr) -> list[str] | None:
+    """Output names declared by a CTE or derived table column list, e.g. x(p)."""
+    parent = expression.parent
+    if isinstance(parent, (exp.Subquery, exp.CTE)):
+        alias = parent.args.get("alias")
+        if alias is not None and alias.columns:
+            return [_output_key(column.name) for column in alias.columns]
+    return None
+
+
+def _contains(ancestor: exp.Expr, node: exp.Expr) -> bool:
+    current = node.parent
+    while current is not None:
+        if current is ancestor:
+            return True
+        current = current.parent
+    return False
+
+
+def _is_filter_subquery(select: exp.Select, root: exp.Expr) -> bool:
+    """EXISTS and IN subqueries inside a projection yield only a boolean."""
+    node = select.parent
+    while node is not None and node is not root:
+        if isinstance(node, exp.Exists) or (
+            isinstance(node, exp.In) and node.args.get("query") is not None
+        ):
+            return True
+        node = node.parent
+    return isinstance(root, exp.Exists)
+
+
+# Scopes whose unqualified names MySQL may resolve in the enclosing query.
+_CORRELATING_SCOPES = {ScopeType.SUBQUERY, ScopeType.UDTF}
+
+
+def _reaches_parent(scope: Scope) -> bool:
+    """Subqueries, LATERAL, and anything nested inside them see outer sources."""
+    current: Scope | None = scope
+    while current is not None:
+        if current.scope_type in _CORRELATING_SCOPES:
+            return True
+        current = current.parent
+    return False
+
+_TABLE_STATEMENT_CONTEXT = re.compile(
+    r"(?:^|\(|\b(?:UNION|INTERSECT|EXCEPT|ALL|DISTINCT))$", re.IGNORECASE
+)
+
+
+def _table_statements_as_select(query: str) -> str:
+    """Rewrite `TABLE t` query blocks as `SELECT * FROM t` for analysis only."""
+    from .sql_guard import _sanitize_sql
+
     try:
-        qualified = qualify(
-            statement.copy(),
-            dialect="mysql",
-            schema={},
-            validate_qualify_columns=False,
-            identify=False,
-        )
-        scope = build_scope(qualified)
-    except Exception:
-        return [None] * len(columns)
-    if scope is None:
-        return [None] * len(columns)
-
-    resolved: list[set[str] | None] = []
-    for column in columns:
-        try:
-            node = lineage(
-                column,
-                qualified,
-                schema={},
-                dialect="mysql",
-                scope=scope,
-                copy=False,
-                trim_selects=False,
-            )
-            candidates = {
-                candidate
-                for lineage_node in node.walk()
-                for candidate in _name_candidates(str(lineage_node.name))
-            }
-            resolved.append(candidates or None)
-        except Exception:
-            resolved.append(None)
-    return resolved
+        sanitized, _ = _sanitize_sql(query)
+    except ValueError:
+        return query
+    pieces: list[str] = []
+    position = 0
+    for match in re.finditer(r"\bTABLE\b", sanitized, re.IGNORECASE):
+        if _TABLE_STATEMENT_CONTEXT.search(sanitized[: match.start()].rstrip()):
+            pieces.append(query[position : match.start()])
+            pieces.append("SELECT * FROM")
+            position = match.end()
+    pieces.append(query[position:])
+    return "".join(pieces)
 
 
-def _nested_projection_candidates(statement: exp.Query) -> dict[str, set[str]]:
-    """Map each name projected by a nested SELECT to the source columns it reads."""
-    nested: dict[str, set[str]] = {}
-    for select in statement.find_all(exp.Select):
-        if select is statement:
-            continue
-        for projection in select.expressions:
-            name = projection.alias_or_name
-            if not name or projection.find(exp.Star) is not None:
-                continue
-            sources = {
-                candidate
-                for column in projection.find_all(exp.Column)
-                for candidate in _column_candidates(column)
-            }
-            if sources:
-                nested.setdefault(name.lower(), set()).update(sources)
-    return nested
+class _SensitivityResolver:
+    """Decide fail-closed whether each result column may carry a masked source.
 
-
-def _result_source_candidates(query: str, columns: list[str]) -> list[set[str] | None]:
-    """Resolve each SELECT output to its source columns, including CTE aliases.
-
-    ``None`` means the projection contains a star or could not be mapped safely;
-    callers then use the connector's output name as the source-column fallback.
+    Every output is traced through its scope to base-table columns: aliases,
+    expressions, scalar subqueries, derived tables, CTEs, set operations,
+    LATERAL, table functions and stars. A column whose source cannot be
+    determined is treated as sensitive. Filter subqueries (WHERE, HAVING,
+    EXISTS, IN) are never visited because their values cannot reach the
+    result. Results are memoized per scope so shared CTEs are analysed once.
     """
-    statement = sqlglot.parse_one(query, read="mysql")
+
+    def __init__(
+        self,
+        root: Scope,
+        matches: Callable[[set[str]], bool],
+        patterns: tuple[str, ...],
+        database: str | None,
+        output_keys: set[str],
+    ) -> None:
+        self.matches = matches
+        self.patterns = patterns
+        self.database = (database or "").lower()
+        self.output_keys = output_keys
+        self.scopes = {id(scope.expression): scope for scope in root.traverse()}
+        # Projections other than stars and plain column references that
+        # produce each name; a name produced twice vouches for neither.
+        self.producers: dict[str, int] = {}
+        for scope in self.scopes.values():
+            for key in _column_list(scope.expression) or ():
+                self.producers[key] = self.producers.get(key, 0) + 1
+            if isinstance(scope.expression, exp.Select):
+                for projection in scope.expression.expressions:
+                    if not _is_star(projection) and not isinstance(
+                        projection, exp.Column
+                    ):
+                        key = _projection_key(projection)
+                        self.producers[key] = self.producers.get(key, 0) + 1
+        self.cache: dict[tuple[str, int, str], bool] = {}
+
+    def memo(self, key: tuple[str, int, str], compute: Callable[[], bool]) -> bool:
+        if key not in self.cache:
+            # A recursive CTE reaches itself while being analysed; fail closed.
+            self.cache[key] = True
+            self.cache[key] = compute()
+        return self.cache[key]
+
+    def table_column(self, table: exp.Table, name: str, alias: str = "") -> bool:
+        column = name.lower()
+        table_name = table.name.lower()
+        database = (table.db or self.database).lower()
+        candidates = {column, f"{table_name}.{column}"}
+        if database:
+            candidates.add(f"{database}.{table_name}.{column}")
+        if alias:
+            candidates.add(f"{alias.lower()}.{column}")
+        return self.matches(candidates)
+
+    def table_may_hold_match(self, table: exp.Table) -> bool:
+        """A star over a base table exposes columns the parser cannot list."""
+        table_name = table.name.lower()
+        database = (table.db or self.database).lower()
+        for pattern in self.patterns:
+            parts = pattern.split(".")
+            if len(parts) == 1:
+                return True
+            if fnmatchcase(table_name, parts[-2]) and (
+                len(parts) == 2 or not database or fnmatchcase(database, parts[-3])
+            ):
+                return True
+        return False
+
+    def lookup(
+        self, scope: Scope, alias: str, database: str = ""
+    ) -> list[tuple[Any, Scope]]:
+        """Find the sources a qualifier may name, in this or an enclosing scope.
+
+        sqlglot renames a second table of the same name (users -> users_2), so
+        a qualifier matches by alias or by the name of an unaliased base table
+        (an aliased table cannot be referenced by its name). With a database
+        (app.users.x) only that database's table matches; without one, every
+        same-named table is a candidate.
+        """
+        alias = alias.lower()
+        current: Scope | None = scope
+        while current is not None:
+            found: list[tuple[Any, Scope]] = []
+            for key, source in current.sources.items():
+                table_name = (
+                    source.name.lower()
+                    if isinstance(source, exp.Table) and not source.alias
+                    else None
+                )
+                if database:
+                    if (
+                        isinstance(source, exp.Table)
+                        and not source.alias
+                        and table_name == alias
+                        and (source.db or self.database).lower() == database.lower()
+                    ):
+                        found.append((source, current))
+                elif key.lower() == alias or table_name == alias:
+                    found.append((source, current))
+            if found:
+                return found
+            current = current.parent
+        return []
+
+    def source_output(
+        self, source: Any, name: str, alias: str, owner: Scope | None
+    ) -> bool:
+        if isinstance(source, exp.Table):
+            if _is_table_function(source):
+                declared = _table_function_columns(source)
+                if declared is not None and _output_key(name) not in declared:
+                    return False
+                # Each declared column is extracted from the function's input.
+                return owner is None or self.expression(source.this, owner)
+            return self.table_column(source, name, alias)
+        if isinstance(source, Scope):
+            # A derived table or CTE column is itself a named source column,
+            # whatever expression produces it; only final aliases are exempt.
+            column = name.lower()
+            candidates = {column, f"{alias.lower()}.{column}"} if alias else {column}
+            return self.matches(candidates) or self.scope_output(source, name)
+        return True
+
+    def column(self, column: exp.Column, scope: Scope) -> bool:
+        return self.memo(
+            ("column", id(scope), column.sql(dialect="mysql").lower()),
+            lambda: self._column(column, scope),
+        )
+
+    def _column(self, column: exp.Column, scope: Scope) -> bool:
+        name = column.name
+        if column.table:
+            sources = self.lookup(scope, column.table, column.db)
+            return not sources or any(
+                self.source_output(source, name, column.table, owner)
+                for source, owner in sources
+            )
+        # MySQL resolves an unqualified name to whichever source has it, and a
+        # subquery may resolve it in the enclosing query, including that
+        # query's select-list aliases.
+        current: Scope | None = scope
+        found_source = False
+        while current is not None:
+            for alias, (_node, source) in current.selected_sources.items():
+                found_source = True
+                if self.source_output(source, name, alias, current):
+                    return True
+            if current is not scope and isinstance(current.expression, exp.Select):
+                key = _output_key(name)
+                for projection in current.expression.expressions:
+                    if (
+                        isinstance(projection, exp.Alias)
+                        and _projection_key(projection) == key
+                        and not _contains(projection, column)
+                        and self.expression(projection.this, current)
+                    ):
+                        return True
+            if not _reaches_parent(current):
+                break
+            current = current.parent
+        return not found_source
+
+    def branches(self, scope: Scope) -> list[Scope]:
+        if not isinstance(scope.expression, exp.SetOperation):
+            return [scope]
+        return [
+            branch for child in scope.union_scopes for branch in self.branches(child)
+        ]
+
+    def scope_output(self, scope: Scope, name: str) -> bool:
+        key = _output_key(name)
+        return self.memo(
+            ("output", id(scope), key), lambda: self._scope_output(scope, key)
+        )
+
+    def _scope_output(self, scope: Scope, key: str) -> bool:
+        expression = scope.expression
+        declared = _column_list(expression)
+        if declared is not None:
+            indexes = [index for index, name in enumerate(declared) if name == key]
+            if not indexes:
+                return True
+            return any(self.projection_at(scope, index) for index in indexes)
+        if isinstance(expression, exp.SetOperation):
+            branches = self.branches(scope)
+            first = branches[0].expression
+            projections = first.expressions if isinstance(first, exp.Select) else []
+            if not projections or any(_is_star(p) for p in projections):
+                # Later branches line up by a position the star hides.
+                return self.scope_output(branches[0], key) or any(
+                    self.any_projection(branch) for branch in branches[1:]
+                )
+            indexes = [
+                index
+                for index, projection in enumerate(projections)
+                if _projection_key(projection) == key
+            ]
+            if not indexes:
+                return any(self.any_projection(branch) for branch in branches)
+            return any(
+                self.projection_at(branch, index)
+                for branch in branches
+                for index in indexes
+            )
+        if isinstance(expression, exp.Values):
+            return self.expression(expression, scope)
+        if not isinstance(expression, exp.Select):
+            # LATERAL and table functions wrap the scopes they read from.
+            inner = self.inner_scopes(scope)
+            return not inner or any(self.scope_output(source, key) for source in inner)
+
+        projections = expression.expressions
+        named = [
+            projection
+            for projection in projections
+            if not _is_star(projection) and _projection_key(projection) == key
+        ]
+        stars = [projection for projection in projections if _is_star(projection)]
+        # Equally named outputs from explicit projections and stars are
+        # indistinguishable by name, so every candidate is considered.
+        if any(self.expression(projection, scope) for projection in named):
+            return True
+        if any(self.star_output(star, scope, key) for star in stars):
+            return True
+        if not named and not stars and self.matches({key}):
+            # The output maps to no projection; judge it by its name.
+            return True
+        # An unaliased expression whose generated name matches no result column
+        # may be surfacing under a name the parser cannot reproduce.
+        return (not named or bool(stars)) and any(
+            self.expression(projection, scope)
+            for projection in projections
+            if not _is_star(projection)
+            and not isinstance(projection, (exp.Alias, exp.Column))
+            and (
+                _projection_key(projection) not in self.output_keys
+                or self.producers.get(_projection_key(projection), 0) > 1
+            )
+        )
+
+    def inner_scopes(self, scope: Scope) -> list[Scope]:
+        return [
+            source
+            for source in scope.sources.values()
+            if isinstance(source, Scope)
+            and source.expression.find_ancestor(type(scope.expression))
+            is scope.expression
+        ]
+
+    def star_sources(
+        self, star: exp.Expression, scope: Scope
+    ) -> list[tuple[str, Any, Scope | None]]:
+        if isinstance(star, exp.Column) and star.table:
+            sources = self.lookup(scope, star.table, star.db)
+            if not sources:
+                return [(star.table, None, None)]
+            return [(star.table, source, owner) for source, owner in sources]
+        return [
+            (alias, source, scope)
+            for alias, (_node, source) in scope.selected_sources.items()
+        ]
+
+    def star_output(self, star: exp.Expression, scope: Scope, name: str) -> bool:
+        return any(
+            source is None or self.source_output(source, name, alias, owner)
+            for alias, source, owner in self.star_sources(star, scope)
+        )
+
+    def star_any(self, star: exp.Expression, scope: Scope) -> bool:
+        for _alias, source, owner in self.star_sources(star, scope):
+            if isinstance(source, exp.Table):
+                if _is_table_function(source):
+                    if owner is None or self.expression(source.this, owner):
+                        return True
+                elif self.table_may_hold_match(source):
+                    return True
+            elif not isinstance(source, Scope) or self.any_projection(source):
+                return True
+        return False
+
+    def projection_at(self, scope: Scope, index: int) -> bool:
+        expression = scope.expression
+        if isinstance(expression, exp.SetOperation):
+            return any(
+                self.projection_at(branch, index) for branch in self.branches(scope)
+            )
+        if not isinstance(expression, exp.Select):
+            return self.any_projection(scope)
+        projections = expression.expressions
+        if index >= len(projections) or any(
+            _is_star(projection) for projection in projections[: index + 1]
+        ):
+            # A star shifts positions by a column count the parser cannot know.
+            return self.any_projection(scope)
+        return self.expression(projections[index], scope)
+
+    def any_projection(self, scope: Scope) -> bool:
+        return self.memo(
+            ("any", id(scope), ""), lambda: self._any_projection(scope)
+        )
+
+    def _any_projection(self, scope: Scope) -> bool:
+        expression = scope.expression
+        if isinstance(expression, exp.SetOperation):
+            return any(self.any_projection(branch) for branch in self.branches(scope))
+        if isinstance(expression, exp.Values):
+            return self.expression(expression, scope)
+        if not isinstance(expression, exp.Select):
+            inner = self.inner_scopes(scope)
+            return not inner or any(self.any_projection(source) for source in inner)
+        return any(
+            self.star_any(projection, scope)
+            if _is_star(projection)
+            else self.expression(projection, scope)
+            for projection in expression.expressions
+        )
+
+    def expression(self, expression: exp.Expr, scope: Scope) -> bool:
+        for node in expression.walk(prune=lambda node: isinstance(node, exp.Select)):
+            if isinstance(node, exp.Select):
+                if _is_filter_subquery(node, expression):
+                    continue
+                inner = self.scopes.get(id(node))
+                if inner is None or self.any_projection(inner):
+                    return True
+            elif isinstance(node, exp.Column) and not _is_star(node):
+                if self.column(node, scope):
+                    return True
+        return False
+
+
+def _sensitive_outputs(
+    query: str,
+    columns: list[str],
+    matches: Callable[[set[str]], bool],
+    patterns: tuple[str, ...],
+    database: str | None,
+) -> list[bool]:
+    """Return, per result column, whether it may carry a masked source value."""
+    statement = sqlglot.parse_one(_table_statements_as_select(query), read="mysql")
     if not isinstance(statement, exp.Query):
-        return [None] * len(columns)
+        # SHOW, DESCRIBE and EXPLAIN report metadata under fixed column names.
+        return [matches({str(column).lower()}) for column in columns]
+
+    # MySQL names columns after the SQL as written; record those names before
+    # the analysis-only COUNT rewrite below changes the expressions.
+    for select in statement.find_all(exp.Select):
+        for projection in select.expressions:
+            projection.meta[_KEY_META] = _projection_key(projection)
 
     # COUNT reveals cardinality, not its input values. Remove its source
     # references only in this masking AST; the executed SQL is unchanged.
     for aggregate in list(statement.find_all(exp.Count)):
-        aggregate.replace(exp.Literal.number(0))
+        replacement = exp.Literal.number(0)
+        if _KEY_META in aggregate.meta:
+            replacement.meta[_KEY_META] = aggregate.meta[_KEY_META]
+        aggregate.replace(replacement)
 
-    if not isinstance(statement, exp.Select):
-        query_columns = {
-            candidate
-            for column in statement.find_all(exp.Column)
-            for candidate in _column_candidates(column)
-        }
-        return [
-            candidates if candidates is not None else query_columns or None
-            for candidates in _lineage_source_candidates(statement, columns)
-        ]
-
-    projections = list(statement.expressions)
-    if any(projection.find(exp.Star) is not None for projection in projections):
-        # A star expands into output columns that do not line up with the
-        # projections, and may surface aliases from a derived table or CTE.
-        # Trace each output name; when a star over an unknown base table
-        # defeats tracing, fall back to nested projections of the same name.
-        nested = _nested_projection_candidates(statement)
-        star_resolved: list[set[str] | None] = []
-        for column, traced in zip(
-            columns, _lineage_source_candidates(statement, columns)
-        ):
-            sources = (traced or set()) | nested.get(str(column).lower(), set())
-            star_resolved.append(
-                sources | _name_candidates(column) if sources else None
-            )
-        return star_resolved
-    if len(projections) != len(columns):
-        return _lineage_source_candidates(statement, columns)
-
-    traced_statement = statement.copy()
-    traced_projections = list(traced_statement.expressions)
-    aliases = [f"__mcp_output_{index}" for index in range(len(columns))]
-    traced_statement.set(
-        "expressions",
-        [
-            projection.as_(alias, copy=False)
-            for projection, alias in zip(traced_projections, aliases)
-        ],
+    root = build_scope(statement)
+    if root is None:
+        raise ValueError("query scope could not be analysed")
+    resolver = _SensitivityResolver(
+        root,
+        matches,
+        patterns,
+        database,
+        {_output_key(str(column)) for column in columns},
     )
+    if all(
+        isinstance(branch.expression, exp.Select)
+        and len(branch.expression.expressions) == len(columns)
+        and not any(_is_star(projection) for projection in branch.expression.expressions)
+        for branch in resolver.branches(root)
+    ):
+        # Without a star, result columns line up with projections by position.
+        return [resolver.projection_at(root, index) for index in range(len(columns))]
+    return [resolver.scope_output(root, str(column)) for column in columns]
 
-    resolved: list[set[str] | None] = []
-    traced_candidates = _lineage_source_candidates(traced_statement, aliases)
-    for projection, traced in zip(projections, traced_candidates):
-        candidates = {
-            candidate
-            for column in projection.find_all(exp.Column)
-            for candidate in _column_candidates(column)
-        }
-        if traced is not None:
-            candidates.update(traced)
-        elif not candidates:
-            # Keep the output-name fallback when an indirect source cannot be
-            # resolved, and preserve direct source columns on analysis failure.
-            resolved.append(None)
-            continue
-        resolved.append(candidates)
-    return resolved
+
+def _references_match(
+    expression: exp.Expr, matches: Callable[[set[str]], bool]
+) -> bool:
+    for column in expression.find_all(exp.Column):
+        parts = [
+            part.lower()
+            for part in (column.catalog, column.db, column.table, column.name)
+            if part
+        ]
+        if matches({".".join(parts[index:]) for index in range(len(parts))}):
+            return True
+    return False
+
+
+def _fallback_sensitive_outputs(
+    query: str, columns: list[str], matches: Callable[[set[str]], bool]
+) -> list[bool]:
+    """Fail closed when scope analysis fails.
+
+    A single SELECT without subqueries keeps per-column decisions from its
+    direct references; otherwise any matching reference or star masks every
+    column, because sources nested elsewhere cannot be attributed.
+    """
+    by_name = [matches({str(column).lower()}) for column in columns]
+    try:
+        statement = sqlglot.parse_one(query, read="mysql")
+    except Exception:
+        return by_name
+    flat = isinstance(statement, exp.Select) and not any(
+        select is not statement for select in statement.find_all(exp.Select)
+    )
+    projections = statement.expressions if flat else []
+    if len(projections) == len(columns) and not any(
+        _is_star(projection) for projection in projections
+    ):
+        return [
+            named or _references_match(projection, matches)
+            for named, projection in zip(by_name, projections)
+        ]
+    # A star exposes columns the fallback cannot name; fail closed.
+    if _references_match(statement, matches) or any(
+        isinstance(node, exp.Star) for node in statement.find_all(exp.Star)
+    ):
+        return [True] * len(columns)
+    return by_name
 
 
 def _mask_json_keys(value: Any, matches) -> tuple[Any, bool]:
@@ -255,8 +648,13 @@ def mask_result_rows(
     columns: list[str],
     rows: Sequence[Sequence[Any]],
     patterns: tuple[str, ...],
+    database: str | None = None,
 ) -> tuple[Sequence[Sequence[Any]], list[str]]:
-    """Mask sensitive source columns and sensitive keys nested in JSON values."""
+    """Mask sensitive source columns and sensitive keys nested in JSON values.
+
+    ``database`` is the session's selected schema, which applies
+    database.table.column patterns to tables named without a database.
+    """
     normalized_patterns = tuple(pattern.lower() for pattern in patterns if pattern)
     if not normalized_patterns or not rows:
         return rows, []
@@ -277,19 +675,13 @@ def mask_result_rows(
         )
 
     try:
-        source_candidates = _result_source_candidates(query, columns)
-    except Exception:
-        source_candidates = [None] * len(columns)
-
-    masked_indexes = {
-        index
-        for index, (name, candidates) in enumerate(zip(columns, source_candidates))
-        if (
-            matches(candidates)
-            if candidates is not None
-            else matches({str(name).lower()})
+        sensitive = _sensitive_outputs(
+            query, columns, matches, normalized_patterns, database
         )
-    }
+    except Exception:
+        sensitive = _fallback_sensitive_outputs(query, columns, matches)
+
+    masked_indexes = {index for index, flag in enumerate(sensitive) if flag}
 
     changed_indexes = set(masked_indexes)
     masked_rows: list[list[Any]] = []
