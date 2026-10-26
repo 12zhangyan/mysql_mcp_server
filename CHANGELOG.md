@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.8] - 2026-10-25
+
+### Security
+- Result masking now resolves every result column through its query scopes and
+  fails closed. The previous lineage-based tracing returned sensitive values
+  unmasked for several query shapes, including unaliased expressions or
+  conversions passed through a derived table or CTE and `*`
+  (`SELECT * FROM (SELECT CAST(password AS CHAR) FROM users) t`), stars mixed with
+  expressions or scalar subqueries (`SELECT *, UPPER(password) FROM users`), and
+  table-qualified patterns behind same-named nested columns. Each output is traced
+  through aliases, expressions, window functions, scalar and correlated subqueries
+  (including outer select-list aliases and derived tables or CTEs nested inside
+  subqueries), derived tables, CTEs and their column lists, set operations,
+  LATERAL, JSON_TABLE, TABLE statements and stars to base-table columns; an output
+  whose source cannot be determined is masked when it could come from a matching
+  field, and analysis failures use conservative rules. Result names are taken from
+  the SQL as written, and a name produced by more than one projection (for example
+  a string literal or alias repeating an expression's text) is not trusted to
+  identify that expression. Each scope and column reference is analysed once, so
+  masking time grows linearly with query nesting.
+- Table-qualified mask patterns (`users.phone`, `app.users.phone`) now resolve table
+  aliases (`SELECT u.phone FROM users u`), apply to stars over base tables (including
+  the `mysql://<table>/data` resource) and to unqualified columns in joins, keep the
+  database through derived tables, use the selected database for tables named
+  without one, and distinguish same-named tables joined from different databases.
+
+### Changed
+- Values from WHERE, HAVING, EXISTS and IN subqueries no longer cause unrelated
+  columns to be masked, and a star over a base table no longer masks every column
+  when a scalar subquery reads a sensitive field.
+- README, SECURITY and the enterprise deployment guide describe masking as a
+  fail-closed static-analysis egress control and recommend database views or
+  column-level permissions for fields that must never be exposed.
+
 ## [0.9.7] - 2026-10-25
 
 ### Security
