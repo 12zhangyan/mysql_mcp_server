@@ -10,6 +10,7 @@ from mysql.connector import Error, InterfaceError
 from pydantic import AnyUrl
 
 from mysql_mcp_server.config import load_connection_registry
+from mysql_mcp_server.errors import QueryFailure
 from mysql_mcp_server.results import QueryResult
 from mysql_mcp_server.server import (
     _apply_server_query_timeout,
@@ -928,6 +929,45 @@ async def test_profile_sql_mode_is_applied_to_every_query_session(
         assert executed[index].endswith(f"sql_mode = '{applied}'")
     assert mode_setup[0] < executed.index("SELECT id FROM users LIMIT 501")
     assert mode_setup[1] < executed.index("SHOW TABLES")
+
+
+async def test_resource_reads_share_the_profile_admission_with_tools(monkeypatch):
+    # Connector pools raise instead of waiting when exhausted, so a resource
+    # read must queue behind tool queries rather than open another connection.
+    monkeypatch.setenv("MYSQL_POOL_SIZE", "1")
+    monkeypatch.setenv("MYSQL_MAX_QUEUED_QUERIES", "0")
+    started, release = threading.Event(), threading.Event()
+    connection, cursor = fake_connection([(1,)], ["id"])
+
+    def execute(sql):
+        if sql.startswith("SELECT id"):
+            started.set()
+            release.wait(5)
+
+    cursor.execute.side_effect = execute
+    opened = []
+
+    def open_connection(profile, **_kwargs):
+        opened.append(profile.name)
+        return connection, {"database": "app"}
+
+    with patch(
+        "mysql_mcp_server.server._open_connection", side_effect=open_connection
+    ):
+        tool = asyncio.create_task(
+            call_tool("execute_sql", {"query": "SELECT id FROM users", "database": "app"})
+        )
+        try:
+            assert await asyncio.to_thread(started.wait, 5)
+            with pytest.raises(QueryFailure) as busy:
+                await read_resource(AnyUrl("mysql://connection/default"))
+        finally:
+            release.set()
+            response = await tool
+
+    assert busy.value.payload["code"] == "CONNECTION_BUSY"
+    assert opened == ["default"]
+    assert not getattr(response, "isError", False)
 
 
 async def test_run_query_renders_the_format_execute_query_fitted():
