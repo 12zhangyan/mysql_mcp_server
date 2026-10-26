@@ -75,7 +75,10 @@ jobs:
         ls -R $(python -c "import site; print(site.getsitepackages()[0])")
 
     # The opt-in MySQL acceptance tests are read-only; give the metadata test a
-    # commented table to read in this throwaway service database.
+    # commented table to read in this throwaway service database. This first
+    # login uses TLS: caching_sha2_password requires a secure connection until
+    # the server has cached the account, after which the tests' plaintext
+    # connections authenticate normally.
     - name: Seed MySQL acceptance fixture
       env:
         MYSQL_PASSWORD: ci_test_password_only
@@ -91,7 +94,6 @@ jobs:
             user="root",
             password=os.environ["MYSQL_PASSWORD"],
             database="test_db",
-            ssl_disabled=True,
         )
         cursor = connection.cursor()
         cursor.execute(
