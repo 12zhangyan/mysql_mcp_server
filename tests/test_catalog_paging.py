@@ -376,3 +376,71 @@ async def test_inspect_catalog_indexes_and_views_use_the_same_offset_contract():
     assert payload["truncated"] is True
     assert payload["next_offset"] == 3
     assert payload["returned_rows"] == 2
+
+
+ROUTE_ONLY_PROFILES = """
+[connections.eam]
+host = "eam-db"
+user = "reader"
+password = "secret"
+database = "eam_physical"
+allowed_databases = ["eam_physical"]
+
+[routes.shared]
+eam_alias = { connection = "eam", database = "eam_physical" }
+"""
+
+# The logical name also names an unrestricted profile on another host, so a
+# lookup by physical database name would silently select the wrong environment.
+ROUTE_SHADOWING_PROFILES = """
+[connections.shared]
+host = "core-db"
+user = "reader"
+password = "secret"
+
+[connections.eam]
+host = "eam-db"
+user = "reader"
+password = "secret"
+database = "eam_physical"
+allowed_databases = ["eam_physical"]
+
+[routes.shared]
+eam_alias = { connection = "eam", database = "eam_physical" }
+"""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "profiles", [ROUTE_ONLY_PROFILES, ROUTE_SHADOWING_PROFILES], ids=["route", "shadow"]
+)
+async def test_dump_schema_table_metadata_follows_the_logical_route(
+    profiles, tmp_path, monkeypatch
+):
+    profiles_file = tmp_path / "connections.toml"
+    profiles_file.write_text(profiles, encoding="utf-8")
+    monkeypatch.setenv("MYSQL_PROFILES_FILE", str(profiles_file))
+    columns = catalog_rows(2, 2)
+    connection, cursor = connection_applying_sql_pages(
+        columns, table_rows_from_columns(columns)
+    )
+    opened = []
+
+    def open_connection(profile, *, database, **_kwargs):
+        opened.append((profile.name, database))
+        return connection, {"database": database}
+
+    with patch(
+        "mysql_mcp_server.server._open_connection", side_effect=open_connection
+    ):
+        dumped, _ = await _json_tool(
+            "dump_schema", {"connection": "shared", "database": "eam_alias"}
+        )
+
+    assert opened == [("eam", "eam_physical"), ("eam", "eam_physical")]
+    executed = [call.args[0] for call in cursor.execute.call_args_list]
+    assert any("information_schema.TABLES" in sql for sql in executed)
+    assert dumped["connection"] == "eam"
+    assert dumped["requested_database"] == "eam_alias"
+    assert [table["table_name"] for table in dumped["tables"]] == ["t000", "t001"]
+    assert dumped["tables"][0]["engine"] == "InnoDB"

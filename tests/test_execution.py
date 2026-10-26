@@ -88,6 +88,7 @@ async def test_json_pagination_executes_read_only_controls_and_audits(caplog):
     assert payload["next_offset"] == 2
     commands = [call.args[0] for call in cursor.execute.call_args_list]
     assert commands == [
+        "SET SESSION sql_mode = 'TRADITIONAL'",
         "SET SESSION MAX_EXECUTION_TIME = 30000",
         "SET SESSION TRANSACTION READ ONLY",
         "START TRANSACTION READ ONLY",
@@ -826,7 +827,8 @@ async def test_mysql_session_setup_uses_one_combined_set(server_info):
         await call_tool("execute_sql", {"query": "SELECT id FROM users", "database": "app"})
 
     assert [call.args[0] for call in cursor.execute.call_args_list] == [
-        "SET SESSION MAX_EXECUTION_TIME = 30000, SESSION transaction_read_only = ON",
+        "SET SESSION MAX_EXECUTION_TIME = 30000, SESSION transaction_read_only = ON, "
+        "SESSION sql_mode = 'TRADITIONAL'",
         "START TRANSACTION READ ONLY",
         "SELECT id FROM users LIMIT 501",
     ]
@@ -847,6 +849,7 @@ async def test_other_servers_keep_the_original_session_sequence(server_info):
         await call_tool("execute_sql", {"query": "SELECT id FROM users", "database": "app"})
 
     assert [call.args[0] for call in cursor.execute.call_args_list] == [
+        "SET SESSION sql_mode = 'TRADITIONAL'",
         "SET SESSION MAX_EXECUTION_TIME = 30000",
         "SET SESSION TRANSACTION READ ONLY",
         "START TRANSACTION READ ONLY",
@@ -870,6 +873,7 @@ async def test_rejected_combined_set_falls_back_to_original_sequence():
         await call_tool("execute_sql", {"query": "SELECT id FROM users", "database": "app"})
 
     assert [call.args[0] for call in cursor.execute.call_args_list][1:] == [
+        "SET SESSION sql_mode = 'TRADITIONAL'",
         "SET SESSION MAX_EXECUTION_TIME = 30000",
         "SET SESSION TRANSACTION READ ONLY",
         "START TRANSACTION READ ONLY",
@@ -891,6 +895,39 @@ async def test_unexpected_combined_set_error_is_not_masked():
 
     assert response.isError is True
     assert cursor.execute.call_count == 1
+
+
+@pytest.mark.parametrize("server_info", ["8.4.6", "10.11.6-MariaDB"])
+@pytest.mark.parametrize(
+    ("configured", "applied"),
+    [("strict_trans_tables, no_zero_date", "STRICT_TRANS_TABLES,NO_ZERO_DATE"), ("", "")],
+)
+async def test_profile_sql_mode_is_applied_to_every_query_session(
+    server_info, configured, applied, monkeypatch
+):
+    # Each session must carry the mode the SQL guard tokenizes against rather
+    # than relying on the connector, which skips an empty mode entirely.
+    monkeypatch.setenv("MYSQL_SQL_MODE", configured)
+    connection, cursor = fake_connection([(1,)], ["id"])
+    connection.server_info = server_info
+    with patch(
+        "mysql_mcp_server.server._open_connection",
+        return_value=(connection, {"database": "app"}),
+    ):
+        await call_tool("execute_sql", {"query": "SELECT id FROM users", "database": "app"})
+        _sync_resource_query(
+            load_connection_registry().get(), "SHOW TABLES", database="app"
+        )
+
+    executed = [call.args[0] for call in cursor.execute.call_args_list]
+    mode_setup = [
+        index for index, sql in enumerate(executed) if "sql_mode" in sql
+    ]
+    assert len(mode_setup) == 2
+    for index in mode_setup:
+        assert executed[index].endswith(f"sql_mode = '{applied}'")
+    assert mode_setup[0] < executed.index("SELECT id FROM users LIMIT 501")
+    assert mode_setup[1] < executed.index("SHOW TABLES")
 
 
 async def test_run_query_renders_the_format_execute_query_fitted():

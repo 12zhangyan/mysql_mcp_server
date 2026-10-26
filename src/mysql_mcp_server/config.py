@@ -21,6 +21,21 @@ CREDENTIAL_REFERENCE_PATTERN = re.compile(r"^[A-Za-z0-9_.:/-]+$")
 RESULT_FORMATS = {"csv", "json", "compact"}
 SSL_MODES = {"DISABLED", "REQUIRED", "VERIFY_CA", "VERIFY_IDENTITY"}
 CREDENTIAL_PROVIDERS = {"keyring", "command"}
+SQL_MODE_NAME_PATTERN = re.compile(r"^[A-Z_]+$")
+# The SQL guard tokenizes literals with MySQL's default quote and backslash
+# rules; these modes (or combinations containing ANSI_QUOTES) change them.
+UNSAFE_SQL_MODES = frozenset(
+    {
+        "ANSI_QUOTES",
+        "NO_BACKSLASH_ESCAPES",
+        "ANSI",
+        "DB2",
+        "MAXDB",
+        "MSSQL",
+        "ORACLE",
+        "POSTGRESQL",
+    }
+)
 # Result masking is opt-in: only explicitly configured fields are redacted.
 DEFAULT_MASK_COLUMNS: tuple[str, ...] = ()
 
@@ -117,6 +132,21 @@ def _validate_identifier(name: str, *, label: str) -> str:
     if not IDENTIFIER_PATTERN.fullmatch(name):
         raise ValueError(f"Invalid {label} '{name}': use letters, numbers, '_' or '$'")
     return name
+
+
+def _validate_sql_mode(value: Any, *, label: str) -> str:
+    """Normalize a sql_mode list that is safe to apply to every query session."""
+    modes = [part.strip().upper() for part in str(value).split(",") if part.strip()]
+    invalid = [mode for mode in modes if not SQL_MODE_NAME_PATTERN.fullmatch(mode)]
+    if invalid:
+        raise ValueError(f"{label} contains invalid mode names: {', '.join(invalid)}")
+    unsafe = sorted(set(modes) & UNSAFE_SQL_MODES)
+    if unsafe:
+        raise ValueError(
+            f"{label} cannot include {', '.join(unsafe)}: the read-only SQL guard "
+            "requires MySQL's default quote and backslash handling"
+        )
+    return ",".join(modes)
 
 
 @dataclass(frozen=True)
@@ -598,7 +628,10 @@ def _profile_from_toml(name: str, values: dict[str, Any]) -> ConnectionProfile:
         allow_system_databases=_as_bool(values.get("allow_system_databases")),
         charset=str(values.get("charset", "utf8mb4")),
         collation=str(values.get("collation", "utf8mb4_unicode_ci")),
-        sql_mode=str(values.get("sql_mode", "TRADITIONAL")),
+        sql_mode=_validate_sql_mode(
+            values.get("sql_mode", "TRADITIONAL"),
+            label=f"Connection '{name}'.sql_mode",
+        ),
         mask_columns=mask_columns,
         result_format=result_format,
         audit_enabled=audit_enabled,
@@ -750,7 +783,9 @@ def _legacy_profile() -> ConnectionProfile:
         allow_system_databases=_env_bool("MYSQL_ALLOW_SYSTEM_DATABASES"),
         charset=os.getenv("MYSQL_CHARSET", "utf8mb4"),
         collation=os.getenv("MYSQL_COLLATION", "utf8mb4_unicode_ci"),
-        sql_mode=os.getenv("MYSQL_SQL_MODE", "TRADITIONAL"),
+        sql_mode=_validate_sql_mode(
+            os.getenv("MYSQL_SQL_MODE", "TRADITIONAL"), label="MYSQL_SQL_MODE"
+        ),
         mask_columns=mask_columns,
         result_format=result_format,
         audit_enabled=audit_enabled,
