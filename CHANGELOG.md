@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.7] - 2026-10-25
+
+### Security
+- Result masking now traces columns surfaced through `*` over a derived table or
+  CTE (for example `WITH x AS (SELECT password AS p FROM users) SELECT * FROM x`).
+  Previously such a query matched output names only whenever its projection count
+  equalled its column count, so an aliased sensitive column was returned unmasked.
+  When tracing fails, nested projections of the same name are used conservatively.
+
+### Fixed
+- Resource reads (`list_resources`, `read_resource`) now share the per-profile query
+  admission with tool calls. Concurrent resource reads could otherwise exhaust the
+  Connector/Python pool, which fails instead of waiting, and surface as a generic
+  database error instead of a retryable `CONNECTION_BUSY`.
+- The npm launcher no longer starts a runtime that another process is still
+  reinstalling: a waiting process returns only once the installed runtime matches
+  the bundled wheel and dependency lock, not merely when an older marker exists.
+- `npm run release:version` and `npm run test:install` no longer fail with
+  `EALLOWSCRIPTS` when the user npm config sets `allow-scripts`.
+- `mypy` passes again for `src/mysql_mcp_server`.
+
 ## [0.9.6] - 2026-10-25
 
 ### Security
