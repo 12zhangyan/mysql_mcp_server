@@ -17,6 +17,7 @@ from typing import Any
 
 import sqlglot
 from sqlglot import exp
+from sqlglot.jsonpath import parse as parse_json_path
 from sqlglot.optimizer.scope import Scope, ScopeType, build_scope
 
 from .errors import QueryFailure
@@ -89,6 +90,73 @@ def _is_star(projection: exp.Expression) -> bool:
 def _is_table_function(table: exp.Table) -> bool:
     """JSON_TABLE and other table functions produce rows from expressions."""
     return not isinstance(table.this, exp.Identifier)
+
+
+# JSON functions that return the value stored at a path in a document.
+_JSON_EXTRACTIONS = tuple(
+    getattr(exp, name)
+    for name in (
+        "JSONExtract",
+        "JSONExtractScalar",
+        "JSONValue",
+        "JSONExtractArray",
+        "JSONExtractQuote",
+        "JSONBExtract",
+        "JSONBExtractScalar",
+    )
+    if hasattr(exp, name)
+)
+
+
+def _json_path_keys(path: Any) -> list[str] | None:
+    """Object keys a JSON path reads, or None when they cannot be listed.
+
+    Wildcards, recursive descent and computed (non-literal) paths may read
+    any key, so callers treat None as possibly sensitive.
+    """
+    if isinstance(path, exp.Literal) and path.is_string:
+        try:
+            path = parse_json_path(path.this)
+        except Exception:
+            return None
+    if not isinstance(path, exp.JSONPath):
+        return None
+    keys = []
+    for part in path.expressions:
+        if isinstance(part, (exp.JSONPathWildcard, exp.JSONPathRecursive)):
+            return None
+        if isinstance(part, exp.JSONPathKey):
+            if not isinstance(part.this, str):
+                return None
+            keys.append(part.this)
+    return keys
+
+
+def _json_extraction_paths(node: exp.Expr) -> list[Any]:
+    """Every path argument of a JSON extraction, e.g. JSON_EXTRACT(d, p1, p2)."""
+    paths = [node.args.get(name) for name in ("expression", "path")]
+    paths.extend(node.args.get("expressions") or ())
+    found = [path for path in paths if path is not None]
+    # No recognisable path argument: the keys read cannot be listed.
+    return found or [None]
+
+
+def _json_table_paths(table: exp.JSONTable, key: str) -> list[list[Any]] | None:
+    """For each JSON_TABLE column named `key`: root, NESTED and column paths."""
+    chains = []
+    for definition in table.find_all(exp.JSONColumnDef):
+        if not definition.name or _output_key(definition.name) != key:
+            continue
+        chain = [definition.args.get("path")]
+        node = definition.parent
+        while node is not None and node is not table:
+            nested_path = node.args.get("path")
+            if isinstance(node, exp.JSONColumnDef) and nested_path is not None:
+                chain.append(nested_path)
+            node = node.parent
+        chain.append(table.args.get("path"))
+        chains.append([path for path in chain if path is not None])
+    return chains or None
 
 
 def _table_function_columns(table: exp.Table) -> set[str] | None:
@@ -192,6 +260,8 @@ class _SensitivityResolver:
     ) -> None:
         self.matches = matches
         self.patterns = patterns
+        # JSON keys, like returned JSON text, are matched by bare patterns.
+        self.matches_json_keys = any("." not in pattern for pattern in patterns)
         self.database = (database or "").lower()
         self.output_keys = output_keys
         self.scopes = {id(scope.expression): scope for scope in root.traverse()}
@@ -286,8 +356,13 @@ class _SensitivityResolver:
                 declared = _table_function_columns(source)
                 if declared is not None and _output_key(name) not in declared:
                     return False
-                # Each declared column is extracted from the function's input.
-                return owner is None or self.expression(source.this, owner)
+                if owner is None:
+                    return True
+                # Each declared column is extracted from the function's input,
+                # at a path whose keys may themselves be sensitive.
+                return self.table_function_output(
+                    source.this, _output_key(name), owner
+                )
             return self.table_column(source, name, alias)
         if isinstance(source, Scope):
             # A derived table or CTE column is itself a named source column,
@@ -448,7 +523,9 @@ class _SensitivityResolver:
         for _alias, source, owner in self.star_sources(star, scope):
             if isinstance(source, exp.Table):
                 if _is_table_function(source):
-                    if owner is None or self.expression(source.this, owner):
+                    if owner is None or self.table_function_output(
+                        source.this, None, owner
+                    ):
                         return True
                 elif self.table_may_hold_match(source):
                     return True
@@ -493,6 +570,33 @@ class _SensitivityResolver:
             for projection in expression.expressions
         )
 
+    def json_path(self, path: Any) -> bool:
+        keys = _json_path_keys(path)
+        if keys is None:
+            return self.matches_json_keys
+        return any(self.matches({key.lower()}) for key in keys)
+
+    def table_function_output(
+        self, function: exp.Expr, key: str | None, owner: Scope
+    ) -> bool:
+        """A JSON_TABLE column: its document, or a sensitive key on its path.
+
+        ``key`` names one output column; None means any of them.
+        """
+        if not isinstance(function, exp.JSONTable):
+            return self.expression(function, owner)
+        if self.expression(function.this, owner):
+            return True
+        if key is None:
+            # Any column: the root path and every declared column path.
+            paths = [function.args.get("path")] + [
+                definition.args.get("path")
+                for definition in function.find_all(exp.JSONColumnDef)
+            ]
+            return any(self.json_path(path) for path in paths if path is not None)
+        chains = _json_table_paths(function, key) or []
+        return any(self.json_path(path) for chain in chains for path in chain)
+
     def expression(self, expression: exp.Expr, scope: Scope) -> bool:
         for node in expression.walk(prune=lambda node: isinstance(node, exp.Select)):
             if isinstance(node, exp.Select):
@@ -503,6 +607,11 @@ class _SensitivityResolver:
                     return True
             elif isinstance(node, exp.Column) and not _is_star(node):
                 if self.column(node, scope):
+                    return True
+            elif isinstance(node, _JSON_EXTRACTIONS):
+                # The value stored under a sensitive JSON key is sensitive,
+                # whichever column holds the document.
+                if any(self.json_path(path) for path in _json_extraction_paths(node)):
                     return True
         return False
 
@@ -556,7 +665,9 @@ def _sensitive_outputs(
 
 
 def _references_match(
-    expression: exp.Expr, matches: Callable[[set[str]], bool]
+    expression: exp.Expr,
+    matches: Callable[[set[str]], bool],
+    matches_json_keys: bool,
 ) -> bool:
     for column in expression.find_all(exp.Column):
         parts = [
@@ -566,11 +677,21 @@ def _references_match(
         ]
         if matches({".".join(parts[index:]) for index in range(len(parts))}):
             return True
+    for extraction in expression.find_all(*_JSON_EXTRACTIONS):
+        for path in _json_extraction_paths(extraction):
+            keys = _json_path_keys(path)
+            if (keys is None and matches_json_keys) or any(
+                matches({key.lower()}) for key in keys or ()
+            ):
+                return True
     return False
 
 
 def _fallback_sensitive_outputs(
-    query: str, columns: list[str], matches: Callable[[set[str]], bool]
+    query: str,
+    columns: list[str],
+    matches: Callable[[set[str]], bool],
+    patterns: tuple[str, ...],
 ) -> list[bool]:
     """Fail closed when scope analysis fails.
 
@@ -579,6 +700,7 @@ def _fallback_sensitive_outputs(
     column, because sources nested elsewhere cannot be attributed.
     """
     by_name = [matches({str(column).lower()}) for column in columns]
+    json_keys = any("." not in pattern for pattern in patterns)
     try:
         statement = sqlglot.parse_one(query, read="mysql")
     except Exception:
@@ -591,11 +713,11 @@ def _fallback_sensitive_outputs(
         _is_star(projection) for projection in projections
     ):
         return [
-            named or _references_match(projection, matches)
+            named or _references_match(projection, matches, json_keys)
             for named, projection in zip(by_name, projections)
         ]
     # A star exposes columns the fallback cannot name; fail closed.
-    if _references_match(statement, matches) or any(
+    if _references_match(statement, matches, json_keys) or any(
         isinstance(node, exp.Star) for node in statement.find_all(exp.Star)
     ):
         return [True] * len(columns)
@@ -681,7 +803,9 @@ def mask_result_rows(
             query, columns, matches, normalized_patterns, database
         )
     except Exception:
-        sensitive = _fallback_sensitive_outputs(query, columns, matches)
+        sensitive = _fallback_sensitive_outputs(
+            query, columns, matches, normalized_patterns
+        )
 
     masked_indexes = {index for index, flag in enumerate(sensitive) if flag}
 

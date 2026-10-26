@@ -457,6 +457,31 @@ async def test_real_default_preserves_fields_and_nested_json(local_db):
     assert payload["masked_columns"] == []
 
 
+async def test_real_json_path_extraction_masks_matching_keys(local_db, monkeypatch):
+    monkeypatch.setenv("MYSQL_MASK_COLUMNS", "phone")
+    source = (
+        "WITH users AS (SELECT 1 AS id, JSON_OBJECT('phone', 'synthetic-phone', "
+        "'city', 'synthetic-city', 'contact', JSON_OBJECT('phone', 'synthetic-phone')) "
+        "AS profile) "
+    )
+    response = await call_tool(
+        "execute_sql",
+        {
+            "query": source + "SELECT id, profile->>'$.phone' AS p, "
+            "profile->>'$.city' AS c, JSON_EXTRACT(profile, '$.contact.phone') AS n, "
+            "jt.v FROM users, JSON_TABLE(profile, '$' COLUMNS "
+            "(v VARCHAR(40) PATH '$.phone')) jt",
+            "result_format": "json",
+        },
+    )
+
+    assert not getattr(response, "isError", False)
+    payload = json.loads(response[0].text)
+    assert payload["columns"] == ["id", "p", "c", "n", "v"]
+    assert payload["rows"] == [[1, "[REDACTED]", "synthetic-city", "[REDACTED]", "[REDACTED]"]]
+    assert payload["masked_columns"] == ["p", "n", "v"]
+
+
 async def test_real_combined_session_setup_enforces_read_only_and_timeout(local_db):
     from unittest.mock import patch
 
