@@ -160,8 +160,14 @@ on unmatched started events and preserve them during incident review.
 
 Result masking is a final egress control, not an authorization boundary. Source
 columns matching `mask_columns` are redacted through aliases, expressions,
-subqueries and CTEs; unresolved outputs fall back to their result names. Bare
-patterns match only field names, and qualified patterns retain their scope.
+conversions, window functions, subqueries, derived tables, CTEs, set operations,
+JSON_TABLE, TABLE statements and stars. It is designed to fail closed: an output
+whose source cannot be determined is masked when it could come from a matching
+field, so complex queries may show extra redactions. Static analysis cannot see
+view definitions, stored-function bodies or real schemas, and cannot rule out
+SQL shapes it does not yet model. Bare
+patterns match only field names; qualified patterns retain their scope, resolve
+table aliases, and use the selected database for unqualified tables.
 COUNT statistics remain available without exposing their input values. Masking
 is disabled by default: omitted or empty `mask_columns` returns all field values
 without redaction. Configure the fields to mask per connection; there is no

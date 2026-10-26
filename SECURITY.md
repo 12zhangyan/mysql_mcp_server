@@ -161,13 +161,28 @@ The MCP server includes built-in protection against SQL injection for administra
 - Result masking is opt-in: `mask_columns` defaults to an empty list, and legacy
   `MYSQL_MASK_COLUMNS` defaults to empty. There is no built-in sensitive-field list;
   omitted or empty rules return all field values without redaction, including JSON
-  keys. When rules are configured, matching source columns (or output names when
-  unresolved) and JSON keys are replaced with `[REDACTED]`. Unqualified patterns
-  match only field names; qualified patterns retain table/database scope. Aliases,
-  expressions and CTEs retain tracing. COUNT statistics do not inherit masking
-  from their inputs, while matching raw values and combined expressions remain
-  masked. Configure rules against your schema; name-based masking cannot replace
-  database views or column-level permissions.
+  keys. When rules are configured, each result column is traced through aliases,
+  expressions and conversions, window functions, scalar and correlated
+  subqueries, derived tables, CTEs (including column lists), set operations,
+  LATERAL, JSON_TABLE, TABLE statements and stars to base-table columns, and
+  matching sources and JSON keys are replaced with `[REDACTED]`. Columns of derived
+  tables and CTEs whose names match are sensitive sources too; only final output
+  aliases are exempt. Unqualified patterns match only field names; qualified
+  patterns retain table/database scope, resolve table aliases, and apply the
+  selected database to tables named without one. COUNT statistics do not inherit
+  masking from their inputs, while matching raw values and combined expressions
+  remain masked. Values from WHERE, HAVING, EXISTS and IN subqueries never reach
+  the result and do not mask other columns.
+- Masking is designed to fail closed: a result column whose source cannot be
+  determined (including unqualified names a subquery may resolve in the outer
+  query) is treated as sensitive if it could come from a matching field, and
+  analysis failures fall back to conservative rules. Some complex queries may
+  therefore show extra `[REDACTED]` columns.
+- Masking is a static-analysis egress control, not an authorization boundary. It
+  cannot see view definitions, stored-function bodies, or actual table schemas,
+  and cannot rule out SQL shapes it does not yet model.
+  Fields that must never be exposed belong behind database views or column-level
+  permissions for the account this server uses.
 
 These controls enforce the MCP read-only contract even when the supplied MySQL
 account has write privileges. A `SELECT`-only account is still recommended as

@@ -534,6 +534,23 @@ audit_required_context = ["actor"]
 
 
 @pytest.mark.asyncio
+async def test_table_resource_applies_table_qualified_mask_patterns(monkeypatch):
+    # The resource reads SELECT * from a base table whose columns are unknown
+    # to the parser, so the pattern must still reach the table's column.
+    monkeypatch.setenv("MYSQL_MASK_COLUMNS", "users.phone")
+    monkeypatch.setenv("MYSQL_RESULT_FORMAT", "json")
+    connection, _cursor = fake_connection([(1, "13800000000")], ["id", "phone"])
+    with patch(
+        "mysql_mcp_server.server._open_connection",
+        return_value=(connection, {"database": "app"}),
+    ):
+        payload = json.loads(await read_resource(AnyUrl("mysql://users/data")))
+
+    assert payload["rows"] == [[1, "[REDACTED]"]]
+    assert payload["masked_columns"] == ["phone"]
+
+
+@pytest.mark.asyncio
 async def test_resource_uri_rejects_unknown_table_action_before_connecting():
     with patch("mysql_mcp_server.server._open_connection") as connector:
         with pytest.raises(ValueError, match="Invalid MySQL resource URI"):
