@@ -10,7 +10,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    
+
     services:
       mysql:
         image: mysql:8.0
@@ -22,34 +22,88 @@ jobs:
         options: --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=3
 
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
+        # SQL safety and masking analysis depend on sqlglot internals, so test
+        # the declared minimum, the version locked into the npm package, and
+        # the newest release that pip resolves.
+        sqlglot: ["latest"]
+        include:
+          - python-version: "3.12"
+            sqlglot: "minimum"
+          - python-version: "3.12"
+            sqlglot: "locked"
 
     steps:
     - uses: actions/checkout@v7
-    
+
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v7
       with:
         python-version: ${{ matrix.python-version }}
-    
+
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
         pip install -r requirements-dev.txt
         pip install -e .
-        
+
+    - name: Select sqlglot ${{ matrix.sqlglot }}
+      if: matrix.sqlglot != 'latest'
+      shell: bash
+      run: |
+        if [ "${{ matrix.sqlglot }}" = "minimum" ]; then
+          version="$(sed -n 's/.*"sqlglot>=\([0-9.]*\),.*/\1/p' pyproject.toml)"
+        else
+          version="$(sed -n 's/^sqlglot==\([0-9.]*\).*/\1/p' npm/requirements.lock)"
+        fi
+        test -n "$version"
+        pip install "sqlglot==${version}"
+
     - name: Verify installation
       run: |
         # Show Python path
         python -c "import sys; print('\n'.join(sys.path))"
         # Try importing the module
         python -c "import mysql_mcp_server; print('Module found at:', mysql_mcp_server.__file__)"
+        python -c "import sqlglot; print('sqlglot', sqlglot.__version__)"
         # List installed packages
         pip list | grep mysql
         # Show the content of site-packages
         ls -R $(python -c "import site; print(site.getsitepackages()[0])")
+
+    # The opt-in MySQL acceptance tests are read-only; give the metadata test a
+    # commented table to read in this throwaway service database.
+    - name: Seed MySQL acceptance fixture
+      env:
+        MYSQL_PASSWORD: ci_test_password_only
+      run: |
+        python - <<'EOF'
+        import os
+
+        import mysql.connector
+
+        connection = mysql.connector.connect(
+            host="127.0.0.1",
+            port=3306,
+            user="root",
+            password=os.environ["MYSQL_PASSWORD"],
+            database="test_db",
+            ssl_disabled=True,
+        )
+        cursor = connection.cursor()
+        cursor.execute(
+            "CREATE TABLE IF NOT EXISTS transfer_orders ("
+            "id INT PRIMARY KEY COMMENT '单号', "
+            "operator VARCHAR(20) COMMENT '调拨人', "
+            "KEY idx_operator (operator)"
+            ") COMMENT='调拨单'"
+        )
+        connection.commit()
+        connection.close()
+        EOF
 
     - name: Run tests
       env:
@@ -57,5 +111,6 @@ jobs:
         MYSQL_USER: root
         MYSQL_PASSWORD: ci_test_password_only
         MYSQL_DATABASE: test_db
+        MYSQL_MCP_LOCAL_TESTS: "1"
       run: |
         python -m pytest -v
