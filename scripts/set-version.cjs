@@ -43,10 +43,17 @@ const npmCommand =
   process.platform === "win32" ? process.env.ComSpec || "cmd.exe" : "npm";
 const npmPrefix =
   process.platform === "win32" ? ["/d", "/s", "/c", "npm.cmd"] : [];
+// `npm run` exports user config such as allow-scripts as npm_config_* variables;
+// npm 11 rejects that one as a flag in project installs. No scripts run here.
+const npmEnv = Object.fromEntries(
+  Object.entries(process.env).filter(
+    ([name]) => name.toLowerCase() !== "npm_config_allow_scripts",
+  ),
+);
 const npmLock = spawnSync(
   npmCommand,
   [...npmPrefix, "install", "--package-lock-only", "--ignore-scripts"],
-  { cwd: root, stdio: "inherit", windowsHide: true },
+  { cwd: root, env: npmEnv, stdio: "inherit", windowsHide: true },
 );
 if (npmLock.status !== 0) {
   throw new Error("Failed to update package-lock.json");

@@ -6,6 +6,10 @@ dist/
 wheels/
 *.egg-info
 
+# pytest caches and per-run --basetemp directories
+.pytest_cache/
+.pytest-tmp*/
+
 # Virtual environments
 .venv
 venv/
