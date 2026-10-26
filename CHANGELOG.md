@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.6] - 2026-10-25
+
+### Security
+- Profiles and `MYSQL_SQL_MODE` now reject `sql_mode` values that change how MySQL
+  delimits strings (`ANSI_QUOTES`, `NO_BACKSLASH_ESCAPES`, and the combination modes
+  `ANSI`, `DB2`, `MAXDB`, `MSSQL`, `ORACLE`, `POSTGRESQL`). The read-only SQL guard
+  tokenizes literals with MySQL's default rules, so these modes could make it read a
+  query differently from the server. An affected profile is reported as invalid
+  without disabling other profiles; mode names are normalized to upper case.
+- Every query session explicitly applies the validated `sql_mode`. Previously an
+  empty `sql_mode` left the session on the server's global mode. On MySQL 5.7.20+ the
+  setting joins the existing combined session `SET`, so no round trip is added.
+
+### Fixed
+- `dump_schema` through a logical route alias whose physical database name differs
+  no longer fails when loading table metadata, and no longer sends that second query
+  to a profile that happens to share the logical route's name.
+
 ## [0.9.5] - 2026-10-23
 
 ### Changed
