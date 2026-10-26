@@ -72,13 +72,15 @@ npx -y @yanzhang123/readonly-db-mcp@0.9.1
 
 服务启动后，建议依次调用 `validate_connections` 和 `check_connection`，确认配置有效、网络可达、账号权限符合预期。`check_connection` 只返回不可逆账号指纹和权限分类，不会暴露用户名或原始授权语句。
 
-### 手动安装 Python 包
+### 从源码安装 Python 包
+
+本项目只通过上述 npm 包发布，不发布到 PyPI。PyPI 上名为 `mysql-mcp-server` / `mysql_mcp_server` 的包属于上游原项目，不包含本分支的只读、审计和脱敏实现，请勿用 `pip install mysql-mcp-server` 安装。源码部署时从本仓库安装：
 
 ```bash
-pip install mysql-mcp-server
+git clone https://github.com/12zhangyan/mysql_mcp_server.git
+cd mysql_mcp_server
+pip install ".[http]"   # 只用 STDIO 时可省略 [http]
 ```
-
-Python 包仍适用于源码部署，但本分支的主要分发方式是上述 npm 包。
 
 ## 配置
 

@@ -131,7 +131,8 @@ async def run_sse(app: Server) -> None:
         from starlette.routing import Mount, Route
     except ImportError:
         logger.error(
-            "SSE transport requires additional dependencies. Install with: pip install mysql_mcp_server[sse]"
+            "SSE transport requires additional dependencies. Install starlette "
+            "and uvicorn (the [sse] extra of this package from source)."
         )
         raise
 
@@ -213,8 +214,8 @@ async def run_streamable_http(app: Server) -> None:
         from starlette.routing import Route
     except ImportError:
         logger.error(
-            "Streamable HTTP requires additional dependencies. "
-            "Install with: pip install mysql_mcp_server[http]"
+            "Streamable HTTP requires additional dependencies. Install starlette "
+            "and uvicorn (the [http] extra of this package from source)."
         )
         raise
 
