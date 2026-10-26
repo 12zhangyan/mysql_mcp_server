@@ -114,9 +114,13 @@ def _limited_ints(
     read: Callable[[str], Any],
     label: Callable[[str], str],
     defaults: dict[str, int] | None = None,
-) -> dict[str, int]:
-    """Validate each limited integer setting, in table order."""
-    values: dict[str, int] = {}
+) -> dict[str, Any]:
+    """Validate each limited integer setting, in table order.
+
+    The values are ints; the Any value type lets callers keyword-unpack them
+    into dataclasses whose other, non-int fields mypy cannot rule out.
+    """
+    values: dict[str, Any] = {}
     for key, (default, minimum, maximum) in limits.items():
         values[key] = _bounded_int(
             read(key),

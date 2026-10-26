@@ -112,6 +112,26 @@ def _lineage_source_candidates(
     return resolved
 
 
+def _nested_projection_candidates(statement: exp.Query) -> dict[str, set[str]]:
+    """Map each name projected by a nested SELECT to the source columns it reads."""
+    nested: dict[str, set[str]] = {}
+    for select in statement.find_all(exp.Select):
+        if select is statement:
+            continue
+        for projection in select.expressions:
+            name = projection.alias_or_name
+            if not name or projection.find(exp.Star) is not None:
+                continue
+            sources = {
+                candidate
+                for column in projection.find_all(exp.Column)
+                for candidate in _column_candidates(column)
+            }
+            if sources:
+                nested.setdefault(name.lower(), set()).update(sources)
+    return nested
+
+
 def _result_source_candidates(query: str, columns: list[str]) -> list[set[str] | None]:
     """Resolve each SELECT output to its source columns, including CTE aliases.
 
@@ -139,10 +159,23 @@ def _result_source_candidates(query: str, columns: list[str]) -> list[set[str] |
         ]
 
     projections = list(statement.expressions)
+    if any(projection.find(exp.Star) is not None for projection in projections):
+        # A star expands into output columns that do not line up with the
+        # projections, and may surface aliases from a derived table or CTE.
+        # Trace each output name; when a star over an unknown base table
+        # defeats tracing, fall back to nested projections of the same name.
+        nested = _nested_projection_candidates(statement)
+        star_resolved: list[set[str] | None] = []
+        for column, traced in zip(
+            columns, _lineage_source_candidates(statement, columns)
+        ):
+            sources = (traced or set()) | nested.get(str(column).lower(), set())
+            star_resolved.append(
+                sources | _name_candidates(column) if sources else None
+            )
+        return star_resolved
     if len(projections) != len(columns):
         return _lineage_source_candidates(statement, columns)
-    if any(projection.find(exp.Star) is not None for projection in projections):
-        return [None] * len(columns)
 
     traced_statement = statement.copy()
     traced_projections = list(traced_statement.expressions)

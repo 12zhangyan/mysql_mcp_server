@@ -163,6 +163,49 @@ def test_sensitive_results_are_masked_across_aliases_and_ctes(query):
     assert masked == ["safe"]
 
 
+# Each star projects exactly as many outputs as there are projections, the
+# shape that previously skipped lineage and matched output names only.
+@pytest.mark.parametrize(
+    ("query", "columns"),
+    [
+        ("SELECT * FROM (SELECT password AS p FROM users) t", ["p"]),
+        ("WITH x AS (SELECT password AS p FROM users) SELECT * FROM x", ["p"]),
+        (
+            "WITH x AS (SELECT password AS p FROM users) "
+            "SELECT x.*, status FROM x JOIN accounts a ON a.id = 1",
+            ["p", "status"],
+        ),
+        ("SELECT * FROM (SELECT * FROM (SELECT password AS p FROM users) a) b", ["p"]),
+        (
+            "SELECT * FROM orders o "
+            "JOIN (SELECT id, password AS p FROM users) u ON u.id = o.user_id",
+            ["id", "p"],
+        ),
+    ],
+)
+def test_star_over_aliased_sensitive_columns_is_masked(query, columns):
+    rows, masked = mask_result_rows(
+        query, columns, [["value"] * len(columns)], ("password",)
+    )
+
+    assert "p" in masked
+    assert rows[0][columns.index("p")] == MASKED_VALUE
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "WITH x AS (SELECT id, name FROM users) SELECT * FROM x",
+        "WITH x AS (SELECT COUNT(password) AS id, name FROM users) SELECT * FROM x",
+    ],
+)
+def test_star_over_safe_columns_stays_unmasked(query):
+    rows, masked = mask_result_rows(query, ["id", "name"], [[1, "a"]], ("password",))
+
+    assert masked == []
+    assert rows == [[1, "a"]]
+
+
 def test_output_column_patterns_mask_only_matching_columns():
     rows, masked = mask_result_rows(
         "SELECT 1",

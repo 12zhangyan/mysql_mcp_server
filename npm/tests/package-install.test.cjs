@@ -27,14 +27,23 @@ function checked(command, args, options = {}) {
   return result;
 }
 
+// `npm run` exports user config such as allow-scripts as npm_config_* variables;
+// npm 11 rejects that one as a flag in project installs. These use --ignore-scripts.
+const npmEnv = Object.fromEntries(
+  Object.entries(process.env).filter(
+    ([name]) => name.toLowerCase() !== "npm_config_allow_scripts",
+  ),
+);
+
 function runNpm(args, options = {}) {
+  const npmOptions = { env: npmEnv, ...options };
   return process.platform === "win32"
     ? checked(
         process.env.ComSpec || "cmd.exe",
         ["/d", "/s", "/c", "npm.cmd", ...args],
-        options,
+        npmOptions,
       )
-    : checked("npm", args, options);
+    : checked("npm", args, npmOptions);
 }
 
 test(

@@ -562,6 +562,24 @@ def _sync_resource_query(
             _release_connection(connection_object, discard=discard_connection)
 
 
+async def _run_admitted(profile: ConnectionProfile, work: Callable[[], Any]) -> Any:
+    """Run synchronous resource work under the profile's query admission.
+
+    Tool queries and resource reads share one per-profile capacity, which is
+    capped by pool_size, so resources cannot exhaust a non-blocking pool.
+    """
+    lease = await query_admission.acquire(profile)
+
+    def _admitted() -> Any:
+        with lease.run():
+            return work()
+
+    try:
+        return await anyio.to_thread.run_sync(_admitted)
+    finally:
+        lease.release_pending()
+
+
 @app.list_resources()
 async def list_resources() -> list[Resource]:
     """List connection, database, or table resources without policy bypasses."""
@@ -576,21 +594,7 @@ async def list_resources() -> list[Resource]:
         )
     )
 
-    def _sync_list():
-        registry = load_connection_registry()
-        if len(registry.profiles) > 1:
-            return [
-                Resource(
-                    uri=f"mysql://connection/{profile.name}",
-                    name=f"connection_{profile.name}",
-                    mimeType="text/plain",
-                    description=profile.description
-                    or f"MySQL connection: {profile.name}",
-                )
-                for profile in registry.profiles.values()
-            ]
-
-        profile = registry.get()
+    def _sync_list(profile: ConnectionProfile) -> list[Resource]:
         if not profile.database:
             _, rows = _sync_resource_query(
                 profile,
@@ -598,7 +602,7 @@ async def list_resources() -> list[Resource]:
             )
             return [
                 Resource(
-                    uri=f"mysql://database/{row[0]}",
+                    uri=AnyUrl(f"mysql://database/{row[0]}"),
                     name=f"database_{row[0]}",
                     mimeType="text/plain",
                     description=f"MySQL database: {row[0]}",
@@ -609,7 +613,7 @@ async def list_resources() -> list[Resource]:
         _, rows = _sync_resource_query(profile, "SHOW TABLES")
         return [
             Resource(
-                uri=f"mysql://{row[0]}/data",
+                uri=AnyUrl(f"mysql://{row[0]}/data"),
                 name=f"table_{row[0]}",
                 mimeType="text/plain",
                 description=f"Data in table: {row[0]}",
@@ -618,7 +622,20 @@ async def list_resources() -> list[Resource]:
         ]
 
     try:
-        return await anyio.to_thread.run_sync(_sync_list)
+        registry = load_connection_registry()
+        if len(registry.profiles) > 1:
+            return [
+                Resource(
+                    uri=AnyUrl(f"mysql://connection/{profile.name}"),
+                    name=f"connection_{profile.name}",
+                    mimeType="text/plain",
+                    description=profile.description
+                    or f"MySQL connection: {profile.name}",
+                )
+                for profile in registry.profiles.values()
+            ]
+        profile = registry.get()
+        return await _run_admitted(profile, lambda: _sync_list(profile))
     except Error as exc:
         logger.error("Failed to list resources (%s)", type(exc).__name__)
         return []
@@ -714,7 +731,7 @@ async def read_resource(uri: AnyUrl) -> str:
             ).render(profile.result_format)
 
         try:
-            return await anyio.to_thread.run_sync(_sync_read)
+            return await _run_admitted(profile, _sync_read)
         except Error as exc:
             errno = getattr(exc, "errno", None)
             suffix = f" (errno={errno})" if errno is not None else ""

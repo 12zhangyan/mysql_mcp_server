@@ -147,8 +147,11 @@ function sleep(milliseconds) {
   );
 }
 
-function acquireInstallLock(lockPath, markerPath) {
-  const deadline = Date.now() + 180_000;
+// Returns null when another process finished an installation that matches
+// this package. A stale marker alone is not enough: the lock holder may be
+// replacing that runtime right now.
+function acquireInstallLock(lockPath, isReady, { timeoutMs = 180_000 } = {}) {
+  const deadline = Date.now() + timeoutMs;
   while (true) {
     try {
       return fs.openSync(lockPath, "wx");
@@ -156,7 +159,7 @@ function acquireInstallLock(lockPath, markerPath) {
       if (!error || error.code !== "EEXIST") {
         throw error;
       }
-      if (fs.existsSync(markerPath)) {
+      if (isReady()) {
         return null;
       }
       const age = Date.now() - fs.statSync(lockPath).mtimeMs;
@@ -187,7 +190,9 @@ function ensureRuntime() {
   }
 
   fs.mkdirSync(runtimeRoot, { recursive: true });
-  const lockHandle = acquireInstallLock(lock, marker);
+  const lockHandle = acquireInstallLock(lock, () =>
+    runtimeIsReady(marker, runtimePython, fingerprint),
+  );
   if (lockHandle === null) {
     return runtimePython;
   }
@@ -284,6 +289,7 @@ async function main(argv = process.argv.slice(2)) {
 }
 
 module.exports = {
+  acquireInstallLock,
   bundledWheel,
   cacheBase,
   dependencyLock,

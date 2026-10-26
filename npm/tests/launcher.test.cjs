@@ -2,12 +2,14 @@
 
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const test = require("node:test");
 
 const manifest = require("../../package.json");
 const {
+  acquireInstallLock,
   cacheBase,
   dependencyLock,
   detectPython,
@@ -75,4 +77,25 @@ test("launcher version does not initialize Python", () => {
   );
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout.trim(), manifest.version);
+});
+
+test("install lock waits for a matching runtime, not a stale marker", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "mysql-mcp-lock-"));
+  const lock = path.join(directory, "install.lock");
+  try {
+    // Another process holds the lock while replacing an outdated runtime.
+    fs.writeFileSync(lock, "");
+    assert.throws(
+      () => acquireInstallLock(lock, () => false, { timeoutMs: 300 }),
+      /Timed out waiting for another runtime installation/,
+    );
+    assert.equal(acquireInstallLock(lock, () => true), null);
+
+    fs.rmSync(lock);
+    const handle = acquireInstallLock(lock, () => true);
+    assert.equal(typeof handle, "number");
+    fs.closeSync(handle);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
 });
