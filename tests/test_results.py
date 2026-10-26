@@ -1075,3 +1075,91 @@ def test_analysis_failure_on_nested_query_masks_every_column(monkeypatch):
 
     assert rows == [[MASKED_VALUE, MASKED_VALUE]]
     assert masked == ["a", "b"]
+
+
+# JSON values read by path are masked when a path key matches a bare pattern,
+# matching how keys inside returned JSON text are masked.
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SELECT id, JSON_EXTRACT(profile, '$.phone') AS p FROM users",
+        "SELECT id, profile->>'$.phone' AS p FROM users",
+        "SELECT id, profile->'$.contact.phone' AS p FROM users",
+        "SELECT id, profile->'$.phone.mobile' AS p FROM users",
+        "SELECT id, JSON_EXTRACT(profile, '$.items[0].phone') AS p FROM users",
+        "SELECT id, JSON_EXTRACT(profile, '$.\"phone\"') AS p FROM users",
+        "SELECT id, JSON_VALUE(profile, '$.phone') AS p FROM users",
+        # Every path of a multi-path extraction is checked.
+        "SELECT id, JSON_EXTRACT(profile, '$.a', '$.phone') AS p FROM users",
+        # Wildcards, recursive descent and computed paths may reach the key.
+        "SELECT id, JSON_EXTRACT(profile, '$.*') AS p FROM users",
+        "SELECT id, JSON_EXTRACT(profile, '$**.phone') AS p FROM users",
+        # Recursive descent also reads keys nested under a sensitive key.
+        "SELECT id, JSON_EXTRACT(profile, '$**.city') AS p FROM users",
+        "SELECT id, JSON_EXTRACT(profile, CONCAT('$.', k)) AS p FROM users",
+        "WITH x AS (SELECT id, profile->>'$.phone' AS p FROM users) SELECT * FROM x",
+        "SELECT t.id, t.p FROM (SELECT id, profile->>'$.phone' AS p FROM users) t",
+        "SELECT u.id, jt.p FROM users u, JSON_TABLE(u.profile, '$' COLUMNS "
+        "(p VARCHAR(20) PATH '$.phone', city VARCHAR(9) PATH '$.city')) jt",
+        "SELECT u.id, jt.p FROM users u, JSON_TABLE(u.profile, '$' COLUMNS "
+        "(NESTED PATH '$.phone[*]' COLUMNS (p VARCHAR(9) PATH '$.number'))) jt",
+        "SELECT u.id, jt.p FROM users u, "
+        "JSON_TABLE(u.profile, '$.phone' COLUMNS (p VARCHAR(9) PATH '$')) jt",
+    ],
+)
+def test_json_values_read_at_sensitive_keys_are_masked(query):
+    rows, masked = mask_result_rows(query, ["id", "p"], [[1, "value"]], ("phone",))
+
+    assert rows == [[1, MASKED_VALUE]]
+    assert masked == ["p"]
+
+
+@pytest.mark.parametrize(
+    ("query", "patterns"),
+    [
+        ("SELECT id, profile->>'$.city' AS p FROM users", ("phone",)),
+        (
+            "SELECT u.id, jt.p FROM users u, JSON_TABLE(u.profile, '$' COLUMNS "
+            "(phone VARCHAR(20) PATH '$.phone', p VARCHAR(9) PATH '$.city')) jt",
+            ("phone",),
+        ),
+        # Keys are matched by bare patterns, like keys in returned JSON text.
+        ("SELECT id, profile->>'$.phone' AS p FROM users", ("users.phone",)),
+        ("SELECT id, JSON_EXTRACT(profile, '$.*') AS p FROM users", ("users.phone",)),
+    ],
+)
+def test_json_values_at_other_keys_stay_visible(query, patterns):
+    rows, masked = mask_result_rows(query, ["id", "p"], [[1, "value"]], patterns)
+
+    assert rows == [[1, "value"]]
+    assert masked == []
+
+
+def test_json_path_filters_do_not_mask_selected_columns():
+    rows, masked = mask_result_rows(
+        "SELECT id FROM users WHERE profile->>'$.phone' = '1'",
+        ["id"],
+        [[1]],
+        ("phone",),
+    )
+
+    assert rows == [[1]]
+    assert masked == []
+
+
+def test_analysis_failure_still_masks_json_path_extraction(monkeypatch):
+    import mysql_mcp_server.results as results
+
+    def fail(*args, **kwargs):
+        raise ValueError("synthetic analysis failure")
+
+    monkeypatch.setattr(results, "_sensitive_outputs", fail)
+    rows, masked = mask_result_rows(
+        "SELECT id, profile->>'$.phone' AS p FROM users",
+        ["id", "p"],
+        [[1, "value"]],
+        ("phone",),
+    )
+
+    assert rows == [[1, MASKED_VALUE]]
+    assert masked == ["p"]

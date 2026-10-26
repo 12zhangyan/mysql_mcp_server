@@ -173,6 +173,10 @@ The MCP server includes built-in protection against SQL injection for administra
   masking from their inputs, while matching raw values and combined expressions
   remain masked. Values from WHERE, HAVING, EXISTS and IN subqueries never reach
   the result and do not mask other columns.
+- Values read from a JSON document by path (`JSON_EXTRACT`, `->`, `->>`,
+  `JSON_VALUE`, JSON_TABLE column paths) are masked when any key on the path
+  matches an unqualified pattern, consistent with key masking inside returned JSON
+  text. Wildcard, recursive (`**`) and computed paths are treated as sensitive.
 - Masking is designed to fail closed: a result column whose source cannot be
   determined (including unqualified names a subquery may resolve in the outer
   query) is treated as sensitive if it could come from a matching field, and

@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- Values read from a JSON document by path are masked when a key on the path matches
+  an unqualified mask pattern. `profile->>'$.phone'`, `JSON_EXTRACT(profile,
+  '$.contact.phone')`, `JSON_VALUE`, every path of a multi-path `JSON_EXTRACT`, and
+  JSON_TABLE columns (including root and `NESTED PATH` segments) previously returned
+  the value in plain text even though the same key was masked inside a returned
+  JSON document. Wildcard, recursive (`**`) and computed paths are treated as
+  sensitive; the fallback used when analysis fails applies the same rule.
+
+### Changed
+- CI now runs the opt-in MySQL acceptance tests against its MySQL 8.0 service,
+  seeding a commented table for the read-only metadata test; they were previously
+  skipped on every run.
+- CI tests against the declared minimum sqlglot (26.0.0) and the version locked into
+  the npm package, in addition to the newest release, because SQL safety and masking
+  analysis depend on sqlglot internals.
+
 ## [0.9.8] - 2026-10-25
 
 ### Security
