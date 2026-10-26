@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.9] - 2026-10-26
+
 ### Security
 - Values read from a JSON document by path are masked when a key on the path matches
   an unqualified mask pattern. `profile->>'$.phone'`, `JSON_EXTRACT(profile,
