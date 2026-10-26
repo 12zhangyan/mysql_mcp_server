@@ -573,3 +573,59 @@ def test_result_masking_is_opt_in_for_named_and_legacy_profiles(
         ]
     ]
     assert masked == (["harmless", "token_count"] if policy else [])
+
+
+@pytest.mark.parametrize(
+    "sql_mode",
+    ["NO_BACKSLASH_ESCAPES", "TRADITIONAL,ansi_quotes", "ANSI", "TRADITIONAL'"],
+)
+def test_sql_mode_that_breaks_guard_tokenizing_is_rejected(
+    sql_mode, tmp_path: Path, monkeypatch
+):
+    profiles_file = tmp_path / "connections.toml"
+    profiles_file.write_text(
+        f"""
+default = "good"
+
+[connections.good]
+host = "good-db"
+user = "reader"
+password = "secret"
+
+[connections.bad]
+host = "bad-db"
+user = "reader"
+password = "secret"
+sql_mode = {json.dumps(sql_mode)}
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MYSQL_PROFILES_FILE", str(profiles_file))
+
+    registry = load_connection_registry()
+
+    assert registry.get("good").sql_mode == "TRADITIONAL"
+    assert "sql_mode" in registry.errors["bad"]
+    with pytest.raises(ValueError, match="invalid"):
+        registry.get("bad")
+
+    monkeypatch.delenv("MYSQL_PROFILES_FILE")
+    monkeypatch.setenv("MYSQL_SQL_MODE", sql_mode)
+    with pytest.raises(ValueError, match="MYSQL_SQL_MODE"):
+        load_connection_registry()
+
+
+@pytest.mark.parametrize(
+    ("configured", "applied"),
+    [
+        ("strict_trans_tables, no_zero_date", "STRICT_TRANS_TABLES,NO_ZERO_DATE"),
+        ("", ""),
+    ],
+)
+def test_sql_mode_is_normalized_for_session_use(configured, applied, monkeypatch):
+    monkeypatch.setenv("MYSQL_SQL_MODE", configured)
+
+    profile = load_connection_registry().get()
+
+    assert profile.sql_mode == applied
+    assert build_connector_config(profile)["sql_mode"] == applied

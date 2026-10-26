@@ -241,18 +241,25 @@ def _supports_combined_session_setup(connection_object) -> bool:
     return tuple(int(part) for part in match.groups()) >= _COMBINED_SESSION_MIN_VERSION
 
 
-def _prepare_read_only_session(connection_object, cursor, timeout_ms: int) -> None:
-    """Apply the statement timeout and read-only session before any user SQL.
+def _prepare_read_only_session(
+    connection_object, cursor, timeout_ms: int, sql_mode: str
+) -> None:
+    """Apply sql_mode, the statement timeout and read-only session before user SQL.
 
-    MySQL accepts both session settings in one atomic SET, saving a round trip.
-    Other servers, and MySQL-compatible servers rejecting that statement, use
-    the original per-statement sequence with its MariaDB timeout fallback.
+    Connector/Python skips an empty sql_mode, which leaves the session on the
+    server's global mode, so the profile's validated sql_mode, which the SQL
+    guard's tokenizer relies on, is applied to every session. MySQL accepts all
+    session settings in one
+    atomic SET, saving round trips. Other servers, and MySQL-compatible servers
+    rejecting that statement, use the per-statement sequence with its MariaDB
+    timeout fallback.
     """
     if _supports_combined_session_setup(connection_object):
         try:
             cursor.execute(
                 f"SET SESSION MAX_EXECUTION_TIME = {timeout_ms}, "
-                "SESSION transaction_read_only = ON"
+                "SESSION transaction_read_only = ON, "
+                f"SESSION sql_mode = '{sql_mode}'"
             )
         except Error as exc:
             if getattr(exc, "errno", None) not in _SESSION_SYNTAX_ERRNOS:
@@ -260,6 +267,7 @@ def _prepare_read_only_session(connection_object, cursor, timeout_ms: int) -> No
         else:
             cursor.execute("START TRANSACTION READ ONLY")
             return
+    cursor.execute(f"SET SESSION sql_mode = '{sql_mode}'")
     _apply_server_query_timeout(cursor, timeout_ms)
     _start_read_only_transaction(cursor)
 
@@ -511,7 +519,10 @@ def _sync_resource_query(
             raise
         with connection_object.cursor() as cursor:
             _prepare_read_only_session(
-                connection_object, cursor, profile.query_timeout_ms
+                connection_object,
+                cursor,
+                profile.query_timeout_ms,
+                profile.sql_mode,
             )
             row_limit = min(max_rows, profile.max_rows)
             executed_query = _bounded_query_sql(
@@ -1579,7 +1590,7 @@ async def execute_query(
                 with connection_object.cursor() as cursor:
                     phase = "session_setup"
                     _prepare_read_only_session(
-                        connection_object, cursor, effective_timeout
+                        connection_object, cursor, effective_timeout, profile.sql_mode
                     )
                     phase = "execute"
                     cursor.execute(executed_query)
@@ -1778,18 +1789,23 @@ async def _load_table_dump_meta(
     names: list[str],
     *,
     connection: str | None,
-    database: str,
+    database: str | None,
+    catalog_database: str,
     timeout_ms: int | None,
     max_response_bytes: int | None,
 ) -> dict[str, dict]:
-    """Fetch allowlisted table rows for names already present on a column page."""
+    """Fetch allowlisted table rows for names already present on a column page.
+
+    ``connection``/``database`` are the caller's request, which may name a
+    logical route alias; ``catalog_database`` is its resolved physical schema.
+    """
     meta: dict[str, dict] = {}
     for start in range(0, len(names), MAX_TABLE_NAMES):
         chunk = names[start : start + MAX_TABLE_NAMES]
         result = await execute_query(
             _catalog_query(
                 "tables",
-                database,
+                catalog_database,
                 catalog_name_filter(table_names=chunk),
             ),
             connection=connection,
@@ -1845,7 +1861,8 @@ async def _dump_schema(
         table_meta = await _load_table_dump_meta(
             names,
             connection=connection,
-            database=target.database,
+            database=database,
+            catalog_database=target.database,
             timeout_ms=arguments.get("timeout_ms"),
             max_response_bytes=arguments.get("max_response_bytes"),
         )

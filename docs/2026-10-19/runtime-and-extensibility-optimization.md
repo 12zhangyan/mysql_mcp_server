@@ -155,6 +155,7 @@
 - S-4：在 E-13 的基础上，额外按配置的路径字符串缓存 `resolve()` 结果。实测这一步单次约 330µs，是开销最大的一项。轮转、fsync、写入失败即拒绝的语义都不变；目录被外部删除后，下次写入时会重建。
 - A-6：没有做"尝试写入被服务端拒绝"这一步，因为它需要执行 DDL/DML，与只读约束冲突。改为读回 `@@SESSION.transaction_read_only` 和 `@@SESSION.max_execution_time` 来验证。
 - A-10：快照比较改为比较序列化后的文本，从而把键顺序也固定下来。
+- E-6 后续变更（0.9.6，2026-10-25）：合并语句追加 `SESSION sql_mode = '<已校验的配置值>'`，即 `SET SESSION MAX_EXECUTION_TIME = n, SESSION transaction_read_only = ON, SESSION sql_mode = '...'`，仍是一条原子语句、不增加往返；其余服务器的降级序列在最前面多一条 `SET SESSION sql_mode = '...'`。原因：Connector/Python 遇到空 `sql_mode` 会跳过设置，会话会沿用服务器全局值；全局值若含 `ANSI_QUOTES` 或 `NO_BACKSLASH_ESCAPES`，只读 SQL 闸门对字符串边界的识别会与服务器不一致。连接池归还时的会话复位不受影响：驱动在复位后会重新应用 `sql_mode`（已在本机 MySQL 8.4 上实测）。
 
 ### 验收结果
 

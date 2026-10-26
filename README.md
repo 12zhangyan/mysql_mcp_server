@@ -256,6 +256,8 @@ MYSQL_USE_PURE=false
 MYSQL_RAISE_ON_WARNINGS=false
 ```
 
+`MYSQL_SQL_MODE` 与命名配置的 `sql_mode` 会在每次查询的会话中显式设置（空值即设为空模式）。会改变引号或反斜杠语义的模式会被拒绝：`ANSI_QUOTES`、`NO_BACKSLASH_ESCAPES`，以及包含它们的组合模式 `ANSI`、`DB2`、`MAXDB`、`MSSQL`、`ORACLE`、`POSTGRESQL`，因为只读 SQL 闸门按 MySQL 默认规则识别字符串边界。
+
 ### Streamable HTTP 传输（推荐）
 
 DeepSeek Harness 等新客户端可直接连接标准 MCP Streamable HTTP 端点：
@@ -599,7 +601,7 @@ npm test
 - **企业审计**：UTC JSONL 事件包含事件 ID、MCP 请求 ID、操作、调用方归因、策略决定、目标库、无字面量查询指纹、耗时、结果大小和结果状态；不记录 SQL 原文和结果数据
 - **两阶段审计**：失败关闭模式下，建立连接前先 fsync 写入 `started` 事件，随后记录终态事件
 - **默认加密**：数据库 TLS 默认 `REQUIRED`；生产配置建议使用 `VERIFY_CA` 或 `VERIFY_IDENTITY`
-- **解析器加固**：拒绝 MySQL `/*!...*/` 和 MariaDB `/*M!...*/` 可执行注释；未限定到允许数据库的全局 `SHOW` 被拦截
+- **解析器加固**：拒绝 MySQL `/*!...*/` 和 MariaDB `/*M!...*/` 可执行注释；未限定到允许数据库的全局 `SHOW` 被拦截；每次查询显式设置已校验的 `sql_mode`，不接受改变字符串边界的 `ANSI_QUOTES`、`NO_BACKSLASH_ESCAPES` 等模式
 - **诊断隐私**：连接诊断只公开不可逆账号指纹和权限摘要，不返回用户名、授权原文、配置路径或数据库错误原文
 - **SSE 安全边界**：默认仅绑定回环地址；非回环部署必须配置 Bearer 认证或由唯一入口的认证反向代理保护
 

@@ -39,6 +39,7 @@ async def test_call_tool_describe_formatting(mock_get_config, mock_connect):
     assert lines[3] == "extra,text,NULL"  # NULL should be converted to string "NULL"
     executed = [call.args[0] for call in mock_cursor.execute.call_args_list]
     assert executed == [
+        "SET SESSION sql_mode = 'TRADITIONAL'",
         "SET SESSION MAX_EXECUTION_TIME = 30000",
         "SET SESSION TRANSACTION READ ONLY",
         "START TRANSACTION READ ONLY",

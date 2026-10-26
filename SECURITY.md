@@ -144,6 +144,11 @@ The MCP server includes built-in protection against SQL injection for administra
   built-in or their reviewed name is explicitly listed in `allowed_functions`.
   Sequence advancement, lock functions and other known side-effecting functions
   remain blocked even inside `SELECT`.
+- The guard tokenizes strings with MySQL's default quote and backslash rules.
+  Profiles therefore reject `sql_mode` values that change them (`ANSI_QUOTES`,
+  `NO_BACKSLASH_ESCAPES`, and the combination modes `ANSI`, `DB2`, `MAXDB`,
+  `MSSQL`, `ORACLE`, `POSTGRESQL`), and every query session explicitly applies
+  the validated `sql_mode` instead of inheriting the server's global value.
 - All exposed SQL then runs inside a MySQL read-only transaction. Normal completion rolls back; cancellation or result truncation closes the socket, forcing rollback and stopping unread-row production.
 - Every MCP tool is advertised as read-only and non-destructive.
 - Named profiles can define `allowed_databases`; SQL table/function qualifiers and resource URIs are checked against it with a MySQL AST parser.
