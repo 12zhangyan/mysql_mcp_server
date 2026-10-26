@@ -340,9 +340,9 @@ class _SensitivityResolver:
         if not isinstance(scope.expression, exp.SetOperation):
             return [scope]
         # sqlglot renamed union_scopes to set_operation_scopes in 30.x.
-        children = getattr(scope, "set_operation_scopes", None)
-        if children is None:
-            children = getattr(scope, "union_scopes", ())
+        children: list[Scope] = getattr(
+            scope, "set_operation_scopes", None
+        ) or getattr(scope, "union_scopes", [])
         return [branch for child in children for branch in self.branches(child)]
 
     def scope_output(self, scope: Scope, name: str) -> bool:
