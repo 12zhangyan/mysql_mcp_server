@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.11] - 2026-10-27
+
 ### Security
 - `SHOW OPEN TABLES` must name a database (`SHOW OPEN TABLES FROM app`). Without
   `FROM`, MySQL lists open tables in every database, so the statement returned
