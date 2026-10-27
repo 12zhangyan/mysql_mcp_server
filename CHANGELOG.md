@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.10] - 2026-10-27
+
 ### Fixed
 - MCP paging now runs the query as written. It previously executed SQL regenerated
   by sqlglot, which can change results and column names: `7 DIV 2` ran as
