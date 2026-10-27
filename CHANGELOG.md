@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.12] - 2026-10-27
+
 ### Fixed
 - Pure MySQL built-ins that a supported sqlglot release does not model, such as
   `CRC32`, `CONV`, `ORD`, `FIND_IN_SET`, `BIT_XOR`, `REPLACE`, the `INET*`
