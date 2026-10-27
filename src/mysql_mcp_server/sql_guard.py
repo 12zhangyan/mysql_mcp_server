@@ -116,9 +116,67 @@ SCOPED_SHOW_KINDS = {
     "TRIGGERS",
 }
 
+# Pure MySQL built-ins that sqlglot does not model, so they parse as Anonymous
+# calls. None reads files, takes locks, waits, or changes session or server
+# state. Locking, waiting and file functions stay out (see BLOCKED_FUNCTIONS).
+BUILTIN_PURE_FUNCTIONS = {
+    # Checksums, base conversion and string comparison.
+    "CRC32",
+    "CONV",
+    "BIN",
+    "OCT",
+    "ORD",
+    "FIELD",
+    "FIND_IN_SET",
+    "STRCMP",
+    "MAKE_SET",
+    "EXPORT_SET",
+    "QUOTE",
+    "OCTET_LENGTH",
+    "MID",
+    "UNCOMPRESS",
+    "UNCOMPRESSED_LENGTH",
+    # IP address conversion.
+    "INET_ATON",
+    "INET_NTOA",
+    "INET6_ATON",
+    "INET6_NTOA",
+    "IS_IPV4",
+    "IS_IPV6",
+    # Read-only JSON and statistics.
+    "JSON_ARRAY",
+    "JSON_ARRAYAGG",
+    "JSON_CONTAINS",
+    "JSON_LENGTH",
+    "JSON_SEARCH",
+    "JSON_UNQUOTE",
+    "JSON_VALID",
+    "STD",
+    # Date and time arithmetic.
+    "ADDDATE",
+    "ADDTIME",
+    "FROM_DAYS",
+    "MAKEDATE",
+    "MICROSECOND",
+    "PERIOD_ADD",
+    "PERIOD_DIFF",
+    "SEC_TO_TIME",
+    "SUBDATE",
+    "SUBTIME",
+    "TIME_FORMAT",
+    "TIME_TO_SEC",
+    "TIMEDIFF",
+    "TO_SECONDS",
+    "UNIX_TIMESTAMP",
+    "WEEKDAY",
+    "YEARWEEK",
+}
+
 # sqlglot represents well-known functions with dedicated AST classes. Only
 # unresolved/Anonymous calls need an explicit allowlist because they may be a
 # stored function or UDF with effects outside transaction read-only controls.
+# An unqualified call to a built-in name always resolves to the built-in;
+# schema-qualified calls are checked separately in validate_function_safety.
 SAFE_ANONYMOUS_FUNCTIONS = {
     "CURDATE",
     "CURRENT_DATE",
@@ -140,7 +198,7 @@ SAFE_ANONYMOUS_FUNCTIONS = {
     "UUID_TO_BIN",
     "BIN_TO_UUID",
     "IS_UUID",
-}
+} | BUILTIN_PURE_FUNCTIONS
 
 
 class ReadOnlyViolation(ValueError):
@@ -519,6 +577,8 @@ def validate_function_safety(
         raise ReadOnlyViolation(
             "Stored, UDF, or unrecognized functions are blocked by default: "
             + ", ".join(unsafe)
-            + ". Add only reviewed deterministic functions to allowed_functions."
+            + ". If reviewed as deterministic and free of side effects, add them to "
+            "the connection's allowed_functions (MYSQL_ALLOWED_FUNCTIONS for the "
+            "single-connection environment setup)."
         )
     return anonymous

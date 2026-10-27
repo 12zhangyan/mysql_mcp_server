@@ -1588,7 +1588,8 @@ async def execute_query(
         if not 100 <= effective_timeout <= profile.query_timeout_ms:
             raise ValueError(
                 "timeout_ms must be at least 100 and cannot exceed the profile limit "
-                f"{profile.query_timeout_ms}"
+                f"{profile.query_timeout_ms} (query_timeout_ms of connection "
+                f"'{profile.name}'; the profile may raise it up to 300000)"
             )
         # Paging pushdown depends only on validated inputs; build it once, not per retry.
         bounded_query = (

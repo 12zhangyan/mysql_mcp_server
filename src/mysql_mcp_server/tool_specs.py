@@ -95,7 +95,8 @@ def tool_definitions() -> list[Tool]:
             "minimum": 100,
             "maximum": 300_000,
             "description": (
-                "Per-call timeout. It may lower but never exceed the profile limit."
+                "Per-call timeout. It may lower but never exceed the connection's "
+                "query_timeout_ms, which list_connections reports."
             ),
         },
     }
