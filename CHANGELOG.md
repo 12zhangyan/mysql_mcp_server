@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Pure MySQL built-ins that a supported sqlglot release does not model, such as
+  `CRC32`, `CONV`, `ORD`, `FIND_IN_SET`, `BIT_XOR`, `REPLACE`, the `INET*`
+  conversions and read-only JSON and date/time arithmetic functions, are no longer
+  blocked as stored functions or UDFs, so checksum comparisons work without
+  configuring `allowed_functions`. Which names sqlglot leaves unmodeled differs by
+  release (26.x also leaves `BIT_XOR` and `REPLACE`), so the list covers the whole
+  supported range. Unknown functions and schema-qualified calls (`app.crc32()`)
+  still need `allowed_functions`, and locking, waiting and file functions stay
+  blocked.
+
+### Changed
+- The unrecognized-function error names `allowed_functions` and
+  `MYSQL_ALLOWED_FUNCTIONS`. A `timeout_ms` above the connection limit now says the
+  limit is the connection's `query_timeout_ms`, and the `timeout_ms` tool
+  description points to `list_connections`. Limits and defaults are unchanged.
+
 ## [0.9.11] - 2026-10-27
 
 ### Security

@@ -1,6 +1,8 @@
 import pytest
 
 from mysql_mcp_server.sql_guard import (
+    BLOCKED_FUNCTIONS,
+    BUILTIN_PURE_FUNCTIONS,
     ReadOnlyViolation,
     query_fingerprint,
     query_type,
@@ -341,3 +343,77 @@ def test_schema_qualified_calls_need_an_explicitly_reviewed_function():
     assert validate_function_safety(
         "SELECT app.now()", allowed_functions=("NOW",)
     ) == {"NOW"}
+
+
+def test_checksum_over_built_in_pure_functions_needs_no_allowlist():
+    query = "SELECT BIT_XOR(CRC32(CONCAT_WS('|', a, b))), SUM(CRC32(a)) FROM t"
+
+    # Older sqlglot releases also report BIT_XOR as an unmodeled call.
+    assert {"CRC32"} <= validate_function_safety(validate_read_only_query(query))
+    assert validate_function_safety(
+        "SELECT CONV(a, 10, 16), ORD(a), FIND_IN_SET(a, b) FROM t"
+    ) == {"CONV", "ORD", "FIND_IN_SET"}
+
+
+def test_built_in_names_do_not_make_unknown_or_qualified_calls_safe():
+    with pytest.raises(ReadOnlyViolation, match="CUSTOM_CRC"):
+        validate_function_safety("SELECT crc32(a), custom_crc(a) FROM t")
+    with pytest.raises(ReadOnlyViolation, match="CRC32"):
+        validate_function_safety("SELECT app.crc32(a) FROM t")
+    assert validate_function_safety(
+        "SELECT app.crc32(a) FROM t", allowed_functions=("CRC32",)
+    ) == {"CRC32"}
+
+
+def test_replace_function_is_allowed_but_replace_statements_are_not():
+    assert validate_read_only_query("SELECT REPLACE(a, 'x', 'y') FROM t")
+    for query in (
+        "REPLACE INTO t VALUES (1)",
+        "EXPLAIN REPLACE INTO t VALUES (1)",
+        "WITH x AS (SELECT 1) REPLACE INTO t SELECT * FROM x",
+    ):
+        with pytest.raises(ReadOnlyViolation):
+            validate_read_only_query(query)
+
+
+# Calls whose arity is not the default single argument.
+_SAMPLE_ARGUMENTS = {
+    "ATAN2": "a, b",
+    "ELT": "a, b",
+    "PI": "",
+    "REGEXP_INSTR": "a, b",
+    "REGEXP_SUBSTR": "a, b",
+    "REPLACE": "a, b, c",
+    "SUBSTRING_INDEX": "a, b, 1",
+    "VERSION": "",
+}
+
+
+@pytest.mark.parametrize("name", sorted(BUILTIN_PURE_FUNCTIONS))
+def test_built_in_pure_functions_pass_without_an_allowlist(name):
+    # Whether sqlglot models a name depends on its release; the call passes
+    # either way, and no listed name may be a blocked function.
+    assert name not in BLOCKED_FUNCTIONS
+    arguments = _SAMPLE_ARGUMENTS.get(name, "a")
+    query = validate_read_only_query(f"SELECT {name}({arguments}) FROM t")
+    validate_function_safety(query)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["SLEEP", "BENCHMARK", "GET_LOCK", "LOAD_FILE", "RELEASE_LOCK", "SYS_EXEC"],
+)
+def test_side_effect_functions_stay_blocked(name):
+    assert name not in BUILTIN_PURE_FUNCTIONS
+    with pytest.raises(ReadOnlyViolation, match=name):
+        validate_read_only_query(f"SELECT {name}(1)")
+
+
+def test_unrecognized_function_error_names_the_config_keys():
+    with pytest.raises(ReadOnlyViolation) as exc:
+        validate_function_safety("SELECT custom_func(secret_literal) FROM t")
+
+    message = str(exc.value)
+    assert "CUSTOM_FUNC" in message
+    assert "allowed_functions" in message
+    assert "MYSQL_ALLOWED_FUNCTIONS" in message

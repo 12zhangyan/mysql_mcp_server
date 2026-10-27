@@ -371,7 +371,7 @@ Claude Desktop、Codex 等宿主通常从自己的目录启动 MCP 服务，未�
 - 可选参数：`connection`、`database`、`max_rows`、`offset`、`timeout_ms`、`max_response_bytes`、`result_format`、`audit_context`
 - 允许：`SELECT`、`WITH`、受数据库范围约束的 `SHOW`（包括 `SHOW CREATE TABLE/VIEW`）、`DESCRIBE`、`DESC`、`EXPLAIN`、`TABLE`
 - 始终拦截：DML、DDL、`USE`、事务控制、锁、`SELECT ... INTO`、会话变量赋值、MySQL 可执行注释和多语句；禁止 `SET_VAR`、`MAX_EXECUTION_TIME`、`RESOURCE_GROUP` 优化器提示覆盖连接策略，需要缩短超时时使用 `timeout_ms`
-- 函数策略：默认拦截无法识别的存储函数/UDF；只有 `allowed_functions` 中经过审核的确定性函数可放行
+- 函数策略：常见的纯内置函数（如 `CRC32`、`CONV`、`FIND_IN_SET`）直接放行；无法识别的存储函数/UDF 和带库名前缀的调用默认拦截，只有 `allowed_functions` 中经过审核的确定性函数可放行
 - 纵深防御：连接前先校验；随后在 `START TRANSACTION READ ONLY` 中执行并回滚
 - 分页：对适用的 `SELECT`/CTE/UNION 下推 `LIMIT max_rows+1 OFFSET offset`，完整消费该有界结果后再回滚；JSON 结果返回 `truncated` 和 `next_offset`
 - 跨库：使用 `database` 参数或 `database.table` 全限定名
@@ -481,6 +481,16 @@ Claude Desktop、Codex 等宿主通常从自己的目录启动 MCP 服务，未�
 ```
 
 上例用于 `list_tables`；取得真实表名后，可用 `get_schema_info` 的 `table_names` 和 `detail=true` 批量查看结构。
+
+### 常见问题
+
+- 提示 `auto mode classifier gave no verdict`：来自 Claude Code 的权限分类器，不是 SQL 错误，也不是本服务返回的。原样重试即可；常用的只读工具可在客户端权限设置里放行。
+- 查询 `information_schema` 被拒：设计如此，请改用 `get_schema_info`、`inspect_catalog` 或 `list_tables`。
+- `timeout_ms` 被拒：它不能超过该连接的 `query_timeout_ms`（`list_connections` 可查，配置上限 300000）。需要更长时间时由部署方调整对应连接。
+- 某个库查不到：先看 `list_connections` 的 `allowed_databases` 和 `database_routes`，库不在连接的范围内就不能访问。
+- 函数被拒：内置的纯函数已放行；被拒的多为存储函数、UDF 或带库名前缀的调用，审核确认无副作用后加入该连接的 `allowed_functions`。
+- 字段注释显示乱码：先在 MySQL 客户端对照同一列；若客户端也乱码，是库里存储的编码问题，与本服务的读取无关。
+- 其他 MCP 服务（如 `ssh-mcp-server`）连接失败：与本服务无关，检查它自己的启动配置。
 
 ## 可用提示词
 

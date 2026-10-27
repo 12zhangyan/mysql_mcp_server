@@ -679,6 +679,21 @@ async def test_offset_discards_rows_before_returning_page():
 
 
 @pytest.mark.asyncio
+async def test_timeout_above_profile_limit_names_the_setting_and_never_connects():
+    with patch("mysql_mcp_server.server._open_connection") as connector:
+        response = await call_tool(
+            "execute_sql",
+            {"query": "SELECT 1", "database": "app", "timeout_ms": 60_000},
+        )
+
+    assert response.isError
+    text = response[0].text
+    assert "query_timeout_ms" in text
+    assert "300000" in text
+    connector.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_query_timeout_closes_socket_and_returns_explicit_error():
     query_started = threading.Event()
     released = threading.Event()
