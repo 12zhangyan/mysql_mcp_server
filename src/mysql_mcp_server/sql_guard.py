@@ -498,12 +498,23 @@ def validate_function_safety(
     configured = {name.upper() for name in allowed_functions}
     # sqlglot also models optimizer hints such as NO_MERGE as Anonymous nodes;
     # they are not callable functions. Policy-changing hints are rejected earlier.
-    anonymous = {
-        function.name.upper()
+    calls = [
+        function
         for function in statement.find_all(exp.Anonymous)
         if function.name and function.find_ancestor(exp.Hint) is None
+    ]
+    anonymous = {function.name.upper() for function in calls}
+    # A schema-qualified call (app.now()) always runs a stored function, even
+    # when its name matches a built-in, so only configured names may be called.
+    qualified = {
+        function.name.upper()
+        for function in calls
+        if isinstance(function.parent, exp.Dot)
     }
-    unsafe = sorted(anonymous - SAFE_ANONYMOUS_FUNCTIONS - configured)
+    unsafe = sorted(
+        (anonymous - qualified - SAFE_ANONYMOUS_FUNCTIONS - configured)
+        | (qualified - configured)
+    )
     if unsafe:
         raise ReadOnlyViolation(
             "Stored, UDF, or unrecognized functions are blocked by default: "

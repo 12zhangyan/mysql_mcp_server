@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `SHOW OPEN TABLES` must name a database (`SHOW OPEN TABLES FROM app`). Without
   `FROM`, MySQL lists open tables in every database, so the statement returned
   database and table names outside `allowed_databases`, including system schemas.
+- Schema-qualified function calls such as `app.now()` must be listed in
+  `allowed_functions`. MySQL resolves them as stored functions even when the name
+  matches a built-in, but the guard exempted them through its built-in safe list,
+  so a stored function named `now` or `uuid` ran without review and could call
+  functions the guard blocks, such as `SLEEP` or `GET_LOCK`.
 
 ### Fixed
 - Read-only SQL that spells a blocked statement keyword is no longer rejected:

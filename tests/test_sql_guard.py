@@ -316,3 +316,28 @@ def test_show_open_tables_from_allowed_database_is_scoped():
             allowed_databases=("app",),
             allow_system_databases=False,
         )
+
+
+@pytest.mark.parametrize(
+    ("query", "name"),
+    [
+        ("SELECT app.now()", "NOW"),
+        ("SELECT app.uuid() FROM users", "UUID"),
+        ("SELECT `app`.`current_timestamp`()", "CURRENT_TIMESTAMP"),
+        ("SELECT id FROM users WHERE id = app.connection_id()", "CONNECTION_ID"),
+    ],
+)
+def test_schema_qualified_calls_do_not_inherit_built_in_safety(query, name):
+    # app.now() runs a stored function named now, not the built-in NOW().
+    with pytest.raises(ReadOnlyViolation, match=name):
+        validate_function_safety(query)
+
+
+def test_schema_qualified_calls_need_an_explicitly_reviewed_function():
+    assert validate_function_safety(
+        "SELECT app.reviewed_metric(id), NOW() FROM users",
+        allowed_functions=("REVIEWED_METRIC",),
+    ) == {"REVIEWED_METRIC", "NOW"}
+    assert validate_function_safety(
+        "SELECT app.now()", allowed_functions=("NOW",)
+    ) == {"NOW"}
