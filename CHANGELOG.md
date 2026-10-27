@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- `SHOW OPEN TABLES` must name a database (`SHOW OPEN TABLES FROM app`). Without
+  `FROM`, MySQL lists open tables in every database, so the statement returned
+  database and table names outside `allowed_databases`, including system schemas.
+
+### Fixed
+- Read-only SQL that spells a blocked statement keyword is no longer rejected:
+  the `REPLACE()`, `INSERT()` and `TRUNCATE()` functions, `CHARACTER SET` /
+  `CHAR SET` in `CAST`, `USE INDEX` / `USE KEY` hints, and unquoted identifiers
+  named after non-reserved statement words such as `start`, `begin` or `commit`.
+  Reserved statement keywords remain blocked everywhere else, and statement words
+  are still rejected where a statement begins.
+
 ## [0.9.10] - 2026-10-27
 
 ### Fixed
