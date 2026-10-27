@@ -23,7 +23,10 @@ ALLOWED_FIRST_KEYWORDS = {
     "TABLE",
 }
 
-BLOCKED_KEYWORDS = {
+# Reserved MySQL words: they cannot be unquoted identifiers, so any other
+# occurrence is rejected except the read-only forms in _is_read_only_keyword_use.
+# INSERT, UPDATE, DELETE and REPLACE can follow WITH or EXPLAIN.
+RESERVED_BLOCKED_KEYWORDS = {
     "INSERT",
     "UPDATE",
     "DELETE",
@@ -31,33 +34,44 @@ BLOCKED_KEYWORDS = {
     "CREATE",
     "ALTER",
     "DROP",
-    "TRUNCATE",
     "RENAME",
     "GRANT",
     "REVOKE",
     "SET",
     "USE",
     "CALL",
-    "DO",
     "LOAD",
-    "HANDLER",
     "LOCK",
     "UNLOCK",
+    "RELEASE",
+    "ANALYZE",
+    "OPTIMIZE",
+    "KILL",
+    "PURGE",
+}
+
+# Non-reserved words that only begin statements; elsewhere MySQL reads them as
+# identifiers (a `start` column). One statement cannot contain another, so they
+# are blocked as the first keyword, which ALLOWED_FIRST_KEYWORDS already does.
+STATEMENT_ONLY_KEYWORDS = {
+    "TRUNCATE",
+    "DO",
+    "HANDLER",
     "START",
     "BEGIN",
     "COMMIT",
     "ROLLBACK",
     "SAVEPOINT",
-    "RELEASE",
-    "ANALYZE",
-    "OPTIMIZE",
     "REPAIR",
     "INSTALL",
     "UNINSTALL",
-    "KILL",
     "RESET",
-    "PURGE",
 }
+
+BLOCKED_KEYWORDS = RESERVED_BLOCKED_KEYWORDS | STATEMENT_ONLY_KEYWORDS
+
+# String functions spelled like statements; no statement puts `(` after them.
+_KEYWORD_FUNCTIONS = {"INSERT", "REPLACE"}
 
 BLOCKED_FUNCTIONS = {
     "GET_LOCK",
@@ -131,6 +145,27 @@ SAFE_ANONYMOUS_FUNCTIONS = {
 
 class ReadOnlyViolation(ValueError):
     """Raised when a statement is not provably read-only."""
+
+
+def _is_read_only_keyword_use(
+    sanitized: str, tokens: list[re.Match[str]], index: int
+) -> bool:
+    """Recognize the read-only constructs that spell a reserved blocked word."""
+    word = tokens[index].group(0).upper()
+    following = sanitized[tokens[index].end() :]
+    previous = tokens[index - 1].group(0).upper() if index else ""
+    following_word = (
+        tokens[index + 1].group(0).upper() if index + 1 < len(tokens) else ""
+    )
+    if word in _KEYWORD_FUNCTIONS:
+        return re.match(r"\s*\(", following) is not None
+    if word == "SET":
+        # CHARACTER SET / CHAR SET name a character set in CAST, CONVERT, ...
+        return previous in {"CHAR", "CHARACTER"}
+    if word == "USE":
+        # Index hint: USE INDEX (...) / USE KEY (...).
+        return following_word in {"INDEX", "KEY"}
+    return False
 
 
 def _sanitize_sql(sql: str) -> tuple[str, list[int]]:
@@ -241,10 +276,8 @@ def validate_read_only_query(sql: str) -> str:
     if ":=" in sanitized_trimmed:
         raise ReadOnlyViolation("Session variable assignment is not allowed")
 
-    tokens = [
-        token.upper()
-        for token in re.findall(r"[A-Za-z_][A-Za-z0-9_$]*", sanitized_trimmed)
-    ]
+    token_matches = list(re.finditer(r"[A-Za-z_][A-Za-z0-9_$]*", sanitized_trimmed))
+    tokens = [match.group(0).upper() for match in token_matches]
     if not tokens:
         raise ReadOnlyViolation("Query does not contain a SQL statement")
     if tokens[0] not in ALLOWED_FIRST_KEYWORDS:
@@ -275,8 +308,10 @@ def validate_read_only_query(sql: str) -> str:
     blocked = next(
         (
             token
-            for token in tokens
-            if token in BLOCKED_KEYWORDS and not (show_create and token == "CREATE")
+            for index, token in enumerate(tokens)
+            if token in RESERVED_BLOCKED_KEYWORDS
+            and not (show_create and token == "CREATE")
+            and not _is_read_only_keyword_use(sanitized_trimmed, token_matches, index)
         ),
         None,
     )
@@ -398,6 +433,12 @@ def validate_database_access(
                 f"Server-wide SHOW {show_kind or 'statement'} is blocked; "
                 "use the dedicated metadata tools"
             )
+        # Unlike SHOW TABLES, OPEN TABLES without FROM lists every database.
+        if not internal and show_kind == "OPEN TABLES" and show_database is None:
+            raise ReadOnlyViolation(
+                "SHOW OPEN TABLES must name an allowed database: "
+                "SHOW OPEN TABLES FROM <database>"
+            )
     for table in statement.find_all(exp.Table):
         database = table.db
         if database:
@@ -457,12 +498,23 @@ def validate_function_safety(
     configured = {name.upper() for name in allowed_functions}
     # sqlglot also models optimizer hints such as NO_MERGE as Anonymous nodes;
     # they are not callable functions. Policy-changing hints are rejected earlier.
-    anonymous = {
-        function.name.upper()
+    calls = [
+        function
         for function in statement.find_all(exp.Anonymous)
         if function.name and function.find_ancestor(exp.Hint) is None
+    ]
+    anonymous = {function.name.upper() for function in calls}
+    # A schema-qualified call (app.now()) always runs a stored function, even
+    # when its name matches a built-in, so only configured names may be called.
+    qualified = {
+        function.name.upper()
+        for function in calls
+        if isinstance(function.parent, exp.Dot)
     }
-    unsafe = sorted(anonymous - SAFE_ANONYMOUS_FUNCTIONS - configured)
+    unsafe = sorted(
+        (anonymous - qualified - SAFE_ANONYMOUS_FUNCTIONS - configured)
+        | (qualified - configured)
+    )
     if unsafe:
         raise ReadOnlyViolation(
             "Stored, UDF, or unrecognized functions are blocked by default: "

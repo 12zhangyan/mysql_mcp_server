@@ -239,3 +239,105 @@ def test_blocked_function_reports_first_match_case_insensitively(query, name):
 )
 def test_blocked_function_names_require_a_real_call(query):
     assert validate_read_only_query(query) == query
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SELECT REPLACE(name, 'a', 'b') FROM users",
+        "SELECT replace (name, 'a', 'b') FROM users",
+        "SELECT TRUNCATE(price, 2) FROM orders",
+        "SELECT INSERT(code, 1, 2, 'XX') FROM orders",
+        "SELECT CAST(name AS CHAR CHARACTER SET utf8mb4) FROM users",
+        "SELECT CONVERT(name, CHAR(10) CHAR SET utf8mb4) FROM users",
+        "SELECT id FROM users USE INDEX (idx_name) WHERE name = 'x'",
+        "SELECT id FROM users u USE KEY FOR ORDER BY (idx_name) ORDER BY name",
+        # Non-reserved statement words are ordinary identifiers in MySQL.
+        "SELECT start, begin, commit, reset, handler, do FROM schedule",
+        "SELECT s.start FROM schedule s ORDER BY start",
+        "DESCRIBE start",
+    ],
+)
+def test_read_only_uses_of_statement_keywords_are_allowed(query):
+    assert validate_read_only_query(query) == query
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "START TRANSACTION",
+        "TRUNCATE TABLE users",
+        "REPLACE INTO users (id) VALUES (1)",
+        "INSERT INTO users (id) VALUES (1)",
+        "EXPLAIN REPLACE INTO users (id) VALUES (1)",
+        "EXPLAIN INSERT INTO users (id) VALUES (1)",
+        "WITH x AS (SELECT 1) UPDATE users SET name = REPLACE(name, 'a', 'b')",
+        "WITH x AS (SELECT 1) DELETE FROM users",
+        "SELECT 1 FROM users UNION SELECT 1 FROM t FOR UPDATE",
+        "SELECT * FROM users LOCK IN SHARE MODE",
+        "SELECT REPLACE INTO",
+        "SELECT name FROM users SET",
+        "SELECT USE FROM users",
+        "SELECT 1; START TRANSACTION",
+        "SELECT 1; TRUNCATE users",
+    ],
+)
+def test_write_uses_of_statement_keywords_remain_blocked(query):
+    with pytest.raises(ReadOnlyViolation):
+        validate_read_only_query(query)
+
+
+@pytest.mark.parametrize(
+    "query",
+    ["SHOW OPEN TABLES", "SHOW OPEN TABLES WHERE `Database` = 'secret'"],
+)
+def test_show_open_tables_requires_a_database(query):
+    with pytest.raises(ReadOnlyViolation, match="SHOW OPEN TABLES FROM"):
+        validate_database_access(
+            query,
+            selected_database="app",
+            allowed_databases=("app",),
+            allow_system_databases=False,
+        )
+
+
+def test_show_open_tables_from_allowed_database_is_scoped():
+    for query in ("SHOW OPEN TABLES FROM app", "SHOW OPEN TABLES FROM app LIKE 'o%'"):
+        assert validate_database_access(
+            query,
+            selected_database="app",
+            allowed_databases=("app",),
+            allow_system_databases=False,
+        ) == {"app"}
+    with pytest.raises(ReadOnlyViolation, match="outside allowed_databases"):
+        validate_database_access(
+            "SHOW OPEN TABLES FROM secret",
+            selected_database="app",
+            allowed_databases=("app",),
+            allow_system_databases=False,
+        )
+
+
+@pytest.mark.parametrize(
+    ("query", "name"),
+    [
+        ("SELECT app.now()", "NOW"),
+        ("SELECT app.uuid() FROM users", "UUID"),
+        ("SELECT `app`.`current_timestamp`()", "CURRENT_TIMESTAMP"),
+        ("SELECT id FROM users WHERE id = app.connection_id()", "CONNECTION_ID"),
+    ],
+)
+def test_schema_qualified_calls_do_not_inherit_built_in_safety(query, name):
+    # app.now() runs a stored function named now, not the built-in NOW().
+    with pytest.raises(ReadOnlyViolation, match=name):
+        validate_function_safety(query)
+
+
+def test_schema_qualified_calls_need_an_explicitly_reviewed_function():
+    assert validate_function_safety(
+        "SELECT app.reviewed_metric(id), NOW() FROM users",
+        allowed_functions=("REVIEWED_METRIC",),
+    ) == {"REVIEWED_METRIC", "NOW"}
+    assert validate_function_safety(
+        "SELECT app.now()", allowed_functions=("NOW",)
+    ) == {"NOW"}
