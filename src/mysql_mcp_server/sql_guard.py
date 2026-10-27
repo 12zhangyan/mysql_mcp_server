@@ -116,9 +116,12 @@ SCOPED_SHOW_KINDS = {
     "TRIGGERS",
 }
 
-# Pure MySQL built-ins that sqlglot does not model, so they parse as Anonymous
-# calls. None reads files, takes locks, waits, or changes session or server
-# state. Locking, waiting and file functions stay out (see BLOCKED_FUNCTIONS).
+# Pure MySQL built-ins that some supported sqlglot release does not model, so
+# they parse as Anonymous calls there. Which names those are differs between
+# releases (BIT_XOR and REPLACE are unmodeled in 26.x), so listing a name a
+# newer release models is harmless. None reads files, takes locks, waits, or
+# changes session or server state. Locking, waiting and file functions stay out
+# (see BLOCKED_FUNCTIONS).
 BUILTIN_PURE_FUNCTIONS = {
     # Checksums, base conversion and string comparison.
     "CRC32",
@@ -143,29 +146,70 @@ BUILTIN_PURE_FUNCTIONS = {
     "INET6_NTOA",
     "IS_IPV4",
     "IS_IPV6",
-    # Read-only JSON and statistics.
+    "ASCII",
+    "BIT_LENGTH",
+    "ELT",
+    "REGEXP_INSTR",
+    "REGEXP_SUBSTR",
+    "REPLACE",
+    "REVERSE",
+    "SOUNDEX",
+    "SPACE",
+    "SUBSTRING_INDEX",
+    "TRUNCATE",
+    # Bit aggregates and counting.
+    "BIT_AND",
+    "BIT_COUNT",
+    "BIT_OR",
+    "BIT_XOR",
+    # Math.
+    "ACOS",
+    "ASIN",
+    "ATAN",
+    "ATAN2",
+    "COS",
+    "COT",
+    "DEGREES",
+    "PI",
+    "RADIANS",
+    "SIN",
+    "TAN",
+    # Read-only JSON, XML and statistics.
+    "EXTRACTVALUE",
     "JSON_ARRAY",
     "JSON_ARRAYAGG",
     "JSON_CONTAINS",
+    "JSON_KEYS",
     "JSON_LENGTH",
     "JSON_SEARCH",
+    "JSON_TYPE",
     "JSON_UNQUOTE",
     "JSON_VALID",
     "STD",
+    # Session and collation introspection.
+    "COERCIBILITY",
+    "COLLATION",
+    "DATABASE",
+    "VERSION",
     # Date and time arithmetic.
     "ADDDATE",
     "ADDTIME",
+    "DAYNAME",
     "FROM_DAYS",
+    "HOUR",
     "MAKEDATE",
     "MICROSECOND",
+    "MINUTE",
     "PERIOD_ADD",
     "PERIOD_DIFF",
     "SEC_TO_TIME",
+    "SECOND",
     "SUBDATE",
     "SUBTIME",
     "TIME_FORMAT",
     "TIME_TO_SEC",
     "TIMEDIFF",
+    "TIMESTAMPADD",
     "TO_SECONDS",
     "UNIX_TIMESTAMP",
     "WEEKDAY",
