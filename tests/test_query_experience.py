@@ -109,7 +109,8 @@ async def test_metadata_batch_and_paging_reach_execution(tool, extra):
     payload = json.loads(result[0].text)
     assert payload["next_offset"] == 6 and len(payload["rows"]) == 2
     sql = cursor.execute.call_args.args[0]
-    assert "'items', 'orders'" in sql and "LIMIT 3 OFFSET 4" in sql
+    # The generated SQL runs as written; paging only replaces its LIMIT.
+    assert "('items','orders')" in sql and sql.endswith(" LIMIT 3 OFFSET 4")
     if extra.get("detail"):
         assert (
             "STATISTICS" in sql and "KEY_COLUMN_USAGE" in sql and "COLUMN_TYPE" in sql

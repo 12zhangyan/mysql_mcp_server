@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- MCP paging now runs the query as written. It previously executed SQL regenerated
+  by sqlglot, which can change results and column names: `7 DIV 2` ran as
+  `CAST(7 / 2 AS SIGNED)` and returned 4 instead of 3, and `IFNULL(x, 0)` came back
+  as a `COALESCE(x, 0)` column. Only the trailing top-level `LIMIT` is appended or
+  replaced; a query whose `LIMIT` cannot be located exactly is paged while reading.
+- `SHOW`, `DESCRIBE`, `EXPLAIN` and other results without a pushed-down `LIMIT`
+  are truncated at `max_rows` with a `next_offset` instead of failing with
+  `InternalError` ("Unread result found"). The failed cleanup also returned the
+  connection to the pool with its result unread, so every later query on that
+  pool failed until the MCP server restarted. The remaining rows are now read and
+  discarded before the cursor closes.
+
 ## [0.9.9] - 2026-10-26
 
 ### Security

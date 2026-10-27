@@ -3,10 +3,10 @@ import hashlib
 import json
 import logging
 import threading
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
-from mysql.connector import Error, InterfaceError
+from mysql.connector import Error, InterfaceError, InternalError
 from pydantic import AnyUrl
 
 from mysql_mcp_server.config import load_connection_registry
@@ -15,6 +15,7 @@ from mysql_mcp_server.results import QueryResult
 from mysql_mcp_server.server import (
     _apply_server_query_timeout,
     _assess_grants,
+    _bounded_query_sql,
     _open_connection,
     _sync_resource_query,
     _verify_connection_transport,
@@ -35,7 +36,7 @@ def fake_connection(rows, columns):
     return connection, cursor
 
 
-def test_unbounded_resource_query_stops_reading_after_row_limit():
+def test_unbounded_resource_query_drains_rows_after_row_limit():
     connection, cursor = fake_connection(
         [("a",), ("b",), ("c",)],
         ["Tables_in_app"],
@@ -55,8 +56,9 @@ def test_unbounded_resource_query_stops_reading_after_row_limit():
     assert columns == ["Tables_in_app"]
     assert rows == [("a",), ("b",)]
     cursor.fetchall.assert_not_called()
-    connection.shutdown.assert_called_once_with()
-    connection.rollback.assert_not_called()
+    connection.consume_results.assert_called_once_with()
+    connection.shutdown.assert_not_called()
+    connection.rollback.assert_called_once_with()
     connection.close.assert_called_once_with()
 
 
@@ -126,6 +128,73 @@ async def test_mcp_pagination_fully_consumes_server_bounded_result():
     assert result.truncated is True
     connection.rollback.assert_called_once_with()
     connection.shutdown.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "query,offset,expected",
+    [
+        # sqlglot would regenerate these as CAST(7 / 2 AS SIGNED), which MySQL
+        # rounds to 4, and as COALESCE, which renames the result column.
+        (
+            "SELECT 7 DIV 2 AS d, IFNULL(a, 0) FROM t",
+            0,
+            "SELECT 7 DIV 2 AS d, IFNULL(a, 0) FROM t LIMIT 3",
+        ),
+        ("SELECT a || b FROM t", 2, "SELECT a || b FROM t LIMIT 3 OFFSET 2"),
+        ("SELECT a FROM t LIMIT 5, 3", 1, "SELECT a FROM t LIMIT 2 OFFSET 6"),
+        ("SELECT a FROM t -- note", 0, "SELECT a FROM t -- note\nLIMIT 3"),
+        (
+            "SELECT a FROM t UNION SELECT b FROM u LIMIT 5",
+            0,
+            "SELECT a FROM t UNION SELECT b FROM u LIMIT 3",
+        ),
+    ],
+)
+def test_paging_pushdown_executes_the_original_sql_text(query, offset, expected):
+    assert _bounded_query_sql(query, row_limit=2, page_offset=offset) == expected
+
+
+@pytest.mark.asyncio
+async def test_truncated_unbounded_result_closes_like_connector_python():
+    """Connector/Python refuses to close a cursor over an unread result."""
+    state = {"unread": False}
+    connection, cursor = fake_connection(
+        [("a",), ("b",), ("c",)], ["Tables_in_app"]
+    )
+
+    def execute(sql, *args):
+        state["unread"] = sql == "SHOW TABLES"
+
+    def close_cursor(*exc_info):
+        if state["unread"]:
+            raise InternalError("Unread result found")
+        return False
+
+    cursor.execute.side_effect = execute
+    type(connection).unread_result = PropertyMock(
+        side_effect=lambda: state["unread"]
+    )
+    connection.consume_results.side_effect = lambda: state.update(unread=False)
+    connection.cursor.return_value.__exit__.side_effect = close_cursor
+    with patch(
+        "mysql_mcp_server.server._open_connection",
+        return_value=(connection, {"database": "app"}),
+    ):
+        response = await call_tool(
+            "execute_sql",
+            {
+                "query": "SHOW TABLES",
+                "database": "app",
+                "max_rows": 2,
+                "result_format": "json",
+            },
+        )
+
+    payload = json.loads(response[0].text)
+    assert payload["rows"] == [["a"], ["b"]]
+    assert payload["truncated"] is True and payload["next_offset"] == 2
+    connection.consume_results.assert_called_once_with()
+    connection.rollback.assert_called_once_with()
 
 
 @pytest.mark.asyncio

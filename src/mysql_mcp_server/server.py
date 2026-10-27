@@ -49,6 +49,7 @@ from .transport import (  # noqa: F401  (helpers re-exported for callers/tests)
     run_streamable_http,
 )
 from .sql_guard import (
+    _sanitize_sql,
     build_explain_query,
     parse_mysql_query,
     query_fingerprint,
@@ -118,6 +119,13 @@ def _metadata_name_filter(arguments: dict, *, table: str | None = None) -> str:
     )
 
 
+# A top-level LIMIT is the statement's last clause: the locking and INTO
+# clauses MySQL allows after it are rejected by the SQL guard.
+_TRAILING_LIMIT = re.compile(
+    r"\bLIMIT\s+(\d+)(?:\s*,\s*(\d+)|\s+OFFSET\s+(\d+))?\s*$", re.IGNORECASE
+)
+
+
 def _bounded_query_sql(
     query: str,
     *,
@@ -125,13 +133,17 @@ def _bounded_query_sql(
     page_offset: int,
     parsed: exp.Expression | None = None,
 ) -> str | None:
-    """Push MCP paging into an outer query when it can be preserved exactly.
+    """Push MCP paging into the query's top-level LIMIT when it is exact.
 
-    ``parsed`` is an already parsed AST of ``query``. It is consumed: its LIMIT
-    and OFFSET may be rewritten in place, so callers must not reuse it.
+    Only the trailing LIMIT clause of the original text is replaced or
+    appended. The SQL is never regenerated from the AST: sqlglot's MySQL output
+    can change results (``a DIV b`` becomes a rounding CAST) and the column
+    names MySQL derives from the query text. ``parsed`` is an already parsed AST
+    of ``query``; it is only inspected.
     """
     try:
         statement = sqlglot.parse_one(query, read="mysql") if parsed is None else parsed
+        sanitized, _ = _sanitize_sql(query)
     except Exception:
         return None
     if not isinstance(statement, exp.Query):
@@ -151,26 +163,38 @@ def _bounded_query_sql(
                 return None
         return None
 
-    original_offset = integer_value(existing_offset)
-    if original_offset is None:
-        return None
-    if existing_limit is None:
+    # The sanitizer keeps positions, so a match locates the clause in `query`.
+    match = _TRAILING_LIMIT.search(sanitized.rstrip())
+    if match is None:
+        if existing_limit is not None or existing_offset is not None:
+            return None
+        original_offset = 0
         fetch_limit = row_limit + 1
+        # A trailing line comment would swallow a clause appended on its line.
+        tail = query[len(sanitized.rstrip()) :]
+        separator = "\n" if "#" in tail or "--" in tail else " "
+        prefix, suffix = query + separator, ""
     else:
-        original_limit = integer_value(existing_limit)
-        if original_limit is None:
+        if match.group(2) is not None:
+            original_offset, original_limit = int(match.group(1)), int(match.group(2))
+        else:
+            original_limit = int(match.group(1))
+            original_offset = int(match.group(3) or 0)
+        # Paging is exact only when the parser places this clause at top level.
+        if (
+            existing_limit is None
+            or integer_value(existing_limit) != original_limit
+            or integer_value(existing_offset) != original_offset
+        ):
             return None
         fetch_limit = min(row_limit + 1, max(original_limit - page_offset, 0))
+        prefix, suffix = query[: match.start()], query[match.end() :]
 
-    # Literal nodes avoid sqlglot re-parsing "LIMIT n" / "OFFSET n" fragments.
-    statement = statement.limit(exp.Literal.number(fetch_limit), copy=False)
     effective_offset = original_offset + page_offset
-    if effective_offset:
-        statement = statement.offset(exp.Literal.number(effective_offset), copy=False)
-    else:
-        statement.set("offset", None)
-    # The AST is owned here, so the generator need not copy it first.
-    return statement.sql(dialect="mysql", copy=False)
+    clause = f"LIMIT {fetch_limit}" + (
+        f" OFFSET {effective_offset}" if effective_offset else ""
+    )
+    return prefix + clause + suffix
 
 
 def get_db_config(
@@ -460,8 +484,20 @@ def _enforce_query_policy(
     return statement
 
 
+def _drain_unread_result(connection_object) -> None:
+    """Read and drop the rows left after a truncated page of an unbounded result.
+
+    Connector/Python refuses to close a cursor, or to reset a pooled session,
+    over an unread result, and its C extension cannot shut the socket down
+    instead. Only statements without a pushed-down LIMIT (SHOW, DESCRIBE,
+    EXPLAIN, ...) leave rows unread; the query deadline still bounds the read.
+    """
+    if connection_object.unread_result:
+        connection_object.consume_results()
+
+
 def _release_connection(connection_object, *, discard: bool) -> None:
-    """Return a connection: shut down an unread/timed-out socket, else roll back."""
+    """Return a connection: shut down a timed-out socket, else roll back."""
     if discard:
         try:
             connection_object.shutdown()
@@ -489,7 +525,6 @@ def _sync_resource_query(
     selected_database = database or profile.database
     policy_allowed = False
     connection_object = None
-    discard_connection = False
     try:
         password = _ready_password(profile)
         query = validate_read_only_query(query)
@@ -532,7 +567,8 @@ def _sync_resource_query(
             columns = [str(item[0]) for item in cursor.description]
             raw_rows = list(cursor.fetchmany(size=row_limit + 1))
             truncated = len(raw_rows) > row_limit
-            discard_connection = truncated and executed_query is None
+            if truncated and executed_query is None:
+                _drain_unread_result(connection_object)
             rows = raw_rows[:row_limit]
             _write_audit_event(
                 profile,
@@ -559,7 +595,7 @@ def _sync_resource_query(
         raise
     finally:
         if connection_object is not None:
-            _release_connection(connection_object, discard=discard_connection)
+            _release_connection(connection_object, discard=False)
 
 
 async def _run_admitted(profile: ConnectionProfile, work: Callable[[], Any]) -> Any:
@@ -1620,7 +1656,7 @@ async def execute_query(
                     phase = "fetch"
                     remaining = (
                         page_offset
-                        if executed_query == query and plan_output != "chunks"
+                        if bounded_query is None and plan_output != "chunks"
                         else 0
                     )
                     while remaining:
@@ -1636,15 +1672,14 @@ async def execute_query(
                         raw_rows = list(cursor.fetchmany(size=2))
                     elif bounded_result:
                         raw_rows = list(cursor.fetchall())
-                    elif executed_query != query:
+                    elif bounded_query is not None:
                         raw_rows = list(cursor.fetchall())
                     else:
                         raw_rows = list(cursor.fetchmany(size=row_limit + 1))
                     fetch_limit = 1 if plan_output == "chunks" else row_limit
                     truncated = len(raw_rows) > fetch_limit
-                    discard_connection = (
-                        truncated and not bounded_result and executed_query == query
-                    )
+                    if truncated and not bounded_result and bounded_query is None:
+                        _drain_unread_result(connection_object)
                     raw_rows = raw_rows[:fetch_limit]
                     # Masking builds new rows when it changes anything.
                     rows, masked_columns = mask_result_rows(
