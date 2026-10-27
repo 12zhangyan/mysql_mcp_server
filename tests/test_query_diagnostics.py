@@ -99,7 +99,9 @@ async def test_explain_paginates_plan_without_rewriting_original_query():
     assert cursor.execute.call_args.args == ("EXPLAIN " + query,)
     assert [call.kwargs["size"] for call in cursor.fetchmany.call_args_list] == [1, 2]
     cursor.fetchall.assert_not_called()
-    connection.shutdown.assert_called_once_with()
+    # Unread plan rows are drained so the cursor and pooled session close cleanly.
+    connection.consume_results.assert_called_once_with()
+    connection.shutdown.assert_not_called()
     connection.close.assert_called_once_with()
 
 
@@ -675,7 +677,8 @@ async def test_chunk_mode_does_not_accept_an_unexpected_multirow_plan():
         response.isError
         and response.structuredContent["code"] == "PLAN_FORMAT_UNSUPPORTED"
     )
-    connection.shutdown.assert_called_once_with()
+    connection.consume_results.assert_called_once_with()
+    connection.shutdown.assert_not_called()
 
 
 async def test_regular_query_still_applies_cell_length_limit():
