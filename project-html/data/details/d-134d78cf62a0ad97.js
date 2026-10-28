@@ -3,7 +3,7 @@ window.BOARD_DETAILS["d-134d78cf62a0ad97"] = {
   "delivery": {
     "plan": {
       "status": "Draft",
-      "summary": "一次跨库对账任务暴露了 7 个使用问题。逐条核对后，只有“内置函数被当成 UDF 拦截”和“超时超限提示不清”需要改本仓库；其余属于设计如此、连接配置，或发生在客户端和另一个服务。",
+      "summary": "已实施并发布 0.9.12：纯内置函数不再被当作 UDF 拦截，函数被拦和 timeout_ms 超限的报错说明了配置项；README 增加常见问题。",
       "background": "对账时想用 CRC32 做两边数据的校验和，被函数白名单拒绝，只能退回行数、合计、长度。所有连接的 allowed_functions 都是空的。REPLACE 被拦的问题已在今天发布的 0.9.11 修复，推测当时用的是旧版本。",
       "goals": [
         "常见的纯内置函数（CRC32、CONV、ORD、FIND_IN_SET 等）在不配置 allowed_functions 时可用",
@@ -24,7 +24,8 @@ window.BOARD_DETAILS["d-134d78cf62a0ad97"] = {
       "decisions": [
         "不静默截断超限的 timeout_ms：调用方会误以为用了 60 秒",
         "不关闭函数检查：写权限账号会越过只读边界",
-        "不只靠用户逐个连接填 allowed_functions：9 个连接都要改，且把内置函数当成待审 UDF"
+        "不只靠用户逐个连接填 allowed_functions：9 个连接都要改，且把内置函数当成待审 UDF",
+        "已在 MySQL 8.4.0 上验证：同名存储函数 crc32 可创建，但不带前缀的 CRC32() 仍执行内置函数，所以放行内置名不会放过存储函数"
       ],
       "acceptance": [
         "空 allowed_functions 下，BIT_XOR(CRC32(CONCAT_WS(...))) 可通过校验",
@@ -34,14 +35,13 @@ window.BOARD_DETAILS["d-134d78cf62a0ad97"] = {
       ],
       "assumptions": [
         "反馈 2 里“REPLACE 被拦”来自 0.9.11 之前的版本；升级后仍复现则按新缺陷处理",
-        "不带 schema 前缀的内置函数名总是解析到内置函数；若在 MySQL 8.4 上被推翻，则取消名单扩充，只保留报错文案",
         "UBP 注释乱码是库里的数据编码问题，不是 MCP 读取链路问题"
       ],
       "openQuestions": [
         "是否给 honglian-prd 增加 WMS、UBP 库的可见范围（配置层面，由你和 DBA 决定）",
         "是否把测试类连接的 query_timeout_ms 调到 60000 以上（配置层面）"
       ],
-      "next": "评审方案；Q-1、Q-2 是配置建议，不阻塞实施。认可后可按 S-1、S-2、S-3 实施。"
+      "next": "重启 Claude Code 或在 /mcp 重连 mysql-readonly 以使用 0.9.12；Q-1、Q-2 仍是配置层面的建议，由你决定。"
     }
   }
 };

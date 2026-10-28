@@ -30,7 +30,7 @@
 | E-2 | `REPLACE(...)` 作为函数调用已在 0.9.11 放行，`REPLACE INTO` 仍拦。反馈 2 的“REPLACE 被拦”应来自旧版本构建 | `src/mysql_mcp_server/sql_guard.py:74`、`src/mysql_mcp_server/sql_guard.py:160`、`CHANGELOG.md:21`；HEAD 上探测 `SELECT REPLACE(a,'x','y') FROM t` 放行 | 已证实（HEAD）；假设：用户当时运行的是 0.9.10 或更早（推翻条件：升级到 0.9.11 后仍复现，则按新缺陷处理） |
 | E-3 | `CRC32`、`CONV`、`ORD`、`FIND_IN_SET`、`UNCOMPRESS`、`STD`、`INET_ATON` 等内置函数在 sqlglot 里解析为未识别函数（Anonymous），被当成可能的存储函数/UDF 拦截；`allowed_functions` 在全部 9 个连接中为空 | `src/mysql_mcp_server/sql_guard.py:122`（安全名单只有时间、用户、UUID 类 20 个）、`src/mysql_mcp_server/sql_guard.py:482`；HEAD 探测 `SELECT BIT_XOR(CRC32(CONCAT_WS('|',a,b)))` 被拒；sqlglot 30.14.0 | 已证实 |
 | E-4 | 决策：在 `SAFE_ANONYMOUS_FUNCTIONS` 里补一批“纯内置、无副作用”的函数，归类为哈希/校验与进制转换、字符串与比较、IP 转换、只读 JSON、时间运算。初始候选以 E-3 探测为准，实施时逐个核对：sqlglot 下确为 Anonymous、MySQL 8.4 手册里无副作用、不在 `BLOCKED_FUNCTIONS`；任一不满足就剔除。明确不纳入：`LOAD_FILE`、`BENCHMARK`、锁与等待类（`IS_FREE_LOCK`、`IS_USED_LOCK`、`*_POS_WAIT`）、`NAME_CONST`、`UUID_SHORT`、`RANDOM_BYTES`、`FOUND_ROWS`、`ROW_COUNT`、`AES_*`，以及 `CHECKSUM`（不是 MySQL 函数） | 本方案；该名单与现有时间/UUID 类安全名单同一理由 | Agent 代决（错了的代价：名单漏项只是继续要求配置 `allowed_functions`；误放入有副作用的函数则破坏只读边界，所以每个名字都要有单测，见 A-3） |
-| E-5 | 不能放开的前提：不带 schema 前缀的内置函数名总是解析到内置函数；带前缀的调用（`app.crc32()`）解析为存储函数，0.9.11 已要求显式配置，本方案不动 | `src/mysql_mcp_server/sql_guard.py:507`、`CHANGELOG.md:14` | 假设（依据 MySQL 手册对内置函数与存储函数同名的说明；推翻条件：在 MySQL 8.4 上创建同名存储函数后，不带前缀调用执行的是存储函数。此时 E-4 取消，改为只在文档里指导配置 `allowed_functions`） |
+| E-5 | 不能放开的前提：不带 schema 前缀的内置函数名总是解析到内置函数；带前缀的调用（`app.crc32()`）解析为存储函数，0.9.11 已要求显式配置，本方案不动 | `src/mysql_mcp_server/sql_guard.py:507`、`CHANGELOG.md:14`；2026-10-27 在本机 MySQL 8.4.0 的临时库验证（已删除）：创建同名存储函数 `crc32` 成功，不带前缀的 `CRC32('a')` 返回内置结果 3904355907，`库名.crc32('a')` 返回存储函数结果，`IGNORE_SPACE` 模式下结果相同；`replace`、`bit_xor` 因是保留字无法创建同名存储函数 | 已证实（MySQL 8.4.0） |
 | E-6 | 被否决的替代 A：关闭函数检查或默认放行所有未知函数。理由：失去对 UDF 和存储函数的拦截，写权限账号会越过只读边界。会推翻它的前提：部署方确认所有账号都无 EXECUTE 以外的写能力且无 UDF | `src/mysql_mcp_server/sql_guard.py:488` | 已否决替代 |
 | E-7 | 被否决的替代 B：只让用户在每个连接里手工填 `allowed_functions`。理由：9 个连接都要改，且把内置函数当成“需审核的 UDF”，配置语义被稀释。保留为兜底，仍有效 | `mysql-connections.example.toml`（`allowed_functions` 注释） | 已否决替代 |
 | E-8 | 超时上限：`timeout_ms` 超过连接的 `query_timeout_ms` 时直接抛 `ValueError`，错误信息只写数值，没写配置项名；工具描述只说“不能超过连接上限”，没说上限在 `list_connections` 的 `query_timeout_ms`；JSON schema 的 `maximum` 是 300000，所以 60000 能通过 schema 在运行时才被拒。决策：保持“超限即拒”，不静默截断（截断会让调用方以为用了 60 秒） | `src/mysql_mcp_server/server.py:1588`、`src/mysql_mcp_server/tool_specs.py:93`、`src/mysql_mcp_server/config.py:93`；各连接 `query_timeout_ms` 均为 30000 | 已证实；截断替代被否决（推翻前提：调用方明确希望“不超过上限就尽量大”） |
@@ -92,7 +92,7 @@
 - 兼容：只会让原来被拒的内置函数调用变为放行，已放行的调用不受影响；报错文案和工具描述变化可能影响依赖精确文本的客户端，快照测试覆盖前者，后者见 A-7。
 - 风险：名单若误含有副作用的函数会削弱只读边界，靠 E-4 的逐项核对和 A-3 兜底；E-5 若被推翻，需撤回 S-1 的名单部分，只保留报错文案。
 - 回滚：S-1、S-2 互相独立，可分别回退；不涉及数据、配置格式或发布流程。
-- 未覆盖：E-2、E-9 未在用户环境复现。
+- 未覆盖：E-2、E-9 未在用户环境复现；E-5 只在 MySQL 8.4.0 上验证，其他版本未测。
 
 ## 待裁决
 
