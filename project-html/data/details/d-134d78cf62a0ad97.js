@@ -37,11 +37,8 @@ window.BOARD_DETAILS["d-134d78cf62a0ad97"] = {
         "反馈 2 里“REPLACE 被拦”来自 0.9.11 之前的版本；升级后仍复现则按新缺陷处理",
         "UBP 注释乱码是库里的数据编码问题，不是 MCP 读取链路问题"
       ],
-      "openQuestions": [
-        "是否给 honglian-prd 增加 WMS、UBP 库的可见范围（配置层面，由你和 DBA 决定）",
-        "是否把测试类连接的 query_timeout_ms 调到 60000 以上（配置层面）"
-      ],
-      "next": "重启 Claude Code 或在 /mcp 重连 mysql-readonly 以使用 0.9.12；Q-1、Q-2 仍是配置层面的建议，由你决定。"
+      "openQuestions": [],
+      "next": "重启 Claude Code 或在 /mcp 重连 mysql-readonly 以使用 0.9.12。连接配置保持现状，不做调整。"
     }
   }
 };
