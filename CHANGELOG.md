@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- SHOW forms that sqlglot cannot model, such as `SHOW EXTENDED COLUMNS`,
+  `SHOW KEYS IN t IN db`, `SHOW INDEXES FROM t FROM db` and `SHOW BINARY LOG STATUS`,
+  were parsed as an opaque command and skipped the database allowlist, the system
+  database block and the SHOW kind check. User SQL in such a form is now rejected.
+- The system database block compared names case-sensitively, so
+  `INFORMATION_SCHEMA.PROCESSLIST`, or `MYSQL.user` on servers with
+  `lower_case_table_names` 1 or 2, was readable when `allowed_databases` was empty.
+  System databases are now matched in any lettercase, in SQL and in the `database`
+  argument.
+
 ## [0.9.12] - 2026-10-27
 
 ### Fixed

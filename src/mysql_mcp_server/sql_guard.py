@@ -98,6 +98,12 @@ _BLOCKED_FUNCTION_PATTERN = re.compile(
 
 SYSTEM_DATABASES = {"information_schema", "mysql", "performance_schema", "sys"}
 
+
+def is_system_database(name: str | None) -> bool:
+    """Match system schemas in any lettercase, as MySQL may resolve them."""
+    return name is not None and name.lower() in SYSTEM_DATABASES
+
+
 # SHOW statements are parsed separately from ordinary table expressions by
 # sqlglot. Only schema-scoped metadata forms are safe for user-supplied SQL;
 # server-wide forms (DATABASES, PROCESSLIST, GRANTS, BINARY LOGS, ...) can leak
@@ -518,6 +524,15 @@ def validate_database_access(
     if statement is None:
         statement = parse_mysql_query(sql)
 
+    # sqlglot falls back to an opaque Command for syntax it does not model
+    # (SHOW EXTENDED COLUMNS, SHOW KEYS IN t IN db, ...). Neither its tables nor
+    # its SHOW kind can be checked, so user SQL in that form fails closed.
+    if not internal and isinstance(statement, exp.Command):
+        raise ReadOnlyViolation(
+            "This statement form could not be validated safely; use a supported "
+            "SHOW form or the dedicated metadata tools"
+        )
+
     accessed: set[str] = set()
     if selected_database:
         accessed.add(selected_database)
@@ -552,12 +567,19 @@ def validate_database_access(
             accessed.add(dotted.this.name)
 
     if not internal and not allow_system_databases:
-        blocked_system = sorted(accessed & SYSTEM_DATABASES)
+        # INFORMATION_SCHEMA matches in any lettercase, and the other system
+        # schemas do when lower_case_table_names is 1 or 2.
+        blocked_system = sorted(
+            database for database in accessed if is_system_database(database)
+        )
         if blocked_system:
             guidance = (
                 "; use inspect_catalog, get_schema_info, or list_tables for "
                 "controlled metadata access"
-                if "information_schema" in blocked_system
+                if any(
+                    database.lower() == "information_schema"
+                    for database in blocked_system
+                )
                 else ""
             )
             raise ReadOnlyViolation(
@@ -571,7 +593,7 @@ def validate_database_access(
             database
             for database in accessed
             if database not in allowed_databases
-            and not (internal and database in SYSTEM_DATABASES)
+            and not (internal and is_system_database(database))
         )
         if disallowed:
             raise ReadOnlyViolation(
