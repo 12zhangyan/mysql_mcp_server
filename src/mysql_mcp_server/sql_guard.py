@@ -11,7 +11,7 @@ import sqlglot
 from sqlglot import exp
 from sqlglot.errors import ParseError, TokenError
 
-from .errors import QueryFailure
+from .errors import QueryFailure, echo_names
 
 ALLOWED_FIRST_KEYWORDS = {
     "SELECT",
@@ -598,7 +598,7 @@ def validate_database_access(
         if disallowed:
             raise ReadOnlyViolation(
                 "Query references databases outside allowed_databases: "
-                + ", ".join(disallowed)
+                + echo_names(disallowed)
             )
     return accessed
 
@@ -642,7 +642,7 @@ def validate_function_safety(
     if unsafe:
         raise ReadOnlyViolation(
             "Stored, UDF, or unrecognized functions are blocked by default: "
-            + ", ".join(unsafe)
+            + echo_names(unsafe)
             + ". If reviewed as deterministic and free of side effects, add them to "
             "the connection's allowed_functions (MYSQL_ALLOWED_FUNCTIONS for the "
             "single-connection environment setup)."
