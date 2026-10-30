@@ -14,6 +14,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   0.9.13 lettercase check used Python's `lower()`, which keeps a combining dot, so
   that spelling read `information_schema` when `allowed_databases` was empty.
 
+### Changed
+- The `execute_sql` description now says that `TABLE` takes only a bare table
+  name and points to `SELECT * FROM db.table` for a qualified name, `ORDER BY` or
+  `LIMIT`, which the SQL parser cannot validate in `TABLE` form and rejects. The
+  tool list snapshot changes only in this description; the SQL guard is unchanged.
+- `docs/TOOLS.md` lists the SHOW forms rejected since 0.9.13 because the parser
+  cannot validate them (`SHOW INDEXES`, `SHOW KEYS`, `SHOW FIELDS`,
+  `SHOW EXTENDED ...`) and their supported replacements.
+
 ## [0.9.15] - 2026-10-30
 
 ### Security
