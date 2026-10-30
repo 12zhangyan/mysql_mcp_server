@@ -916,6 +916,30 @@ database = "app"
         await read_resource(AnyUrl("mysql://database/mysql"))
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [
+        (
+            "execute_sql",
+            {"query": "SELECT * FROM PROCESSLIST", "database": "INFORMATION_SCHEMA"},
+        ),
+        ("list_tables", {"database": "MySQL"}),
+        ("get_schema_info", {"database": "Performance_Schema"}),
+        ("get_schema_info", {"table_name": "SYS.processlist"}),
+    ],
+)
+async def test_system_database_argument_is_blocked_in_any_lettercase(
+    tool, arguments
+):
+    with patch("mysql_mcp_server.server._open_connection") as connector:
+        response = await call_tool(tool, arguments)
+
+    assert response.isError
+    assert "System database" in response[0].text
+    connector.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "server_info", ["8.4.6", "8.0.36-28", "5.7.20-log", "9.1.0-commercial"]
 )
