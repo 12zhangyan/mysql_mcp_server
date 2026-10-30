@@ -440,6 +440,9 @@ _SAMPLE_ARGUMENTS = {
     "REGEXP_SUBSTR": "a, b",
     "REPLACE": "a, b, c",
     "SUBSTRING_INDEX": "a, b, 1",
+    # sqlglot 30.26 models TIMESTAMPADD and rejects calls without all three
+    # arguments MySQL requires.
+    "TIMESTAMPADD": "MINUTE, 1, a",
     "VERSION": "",
 }
 
