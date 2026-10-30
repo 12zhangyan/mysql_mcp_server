@@ -65,6 +65,36 @@ async def test_call_tool_invalid_name():
 
 
 @pytest.mark.asyncio
+async def test_call_tool_does_not_echo_unsafe_tool_or_connection_names():
+    response = await call_tool("<b>x</b>\nforged", {})
+    assert response.isError is True
+    assert response[0].text == "Error calling tool: Unknown tool"
+
+    response = await call_tool(
+        "execute_sql", {"query": "SELECT 1", "connection": "<img src=x>"}
+    )
+    assert response.isError is True
+    assert "Unknown connection." in response[0].text
+    assert "<img" not in response[0].text
+
+
+@pytest.mark.asyncio
+async def test_call_tool_still_names_safe_unknown_connections():
+    response = await call_tool(
+        "execute_sql", {"query": "SELECT 1", "connection": "prod-eu.v2"}
+    )
+    assert "Unknown connection 'prod-eu.v2'" in response[0].text
+
+
+@pytest.mark.asyncio
+async def test_unknown_prompt_and_resource_uri_are_not_echoed():
+    with pytest.raises(ValueError, match=r"^Unknown prompt$"):
+        await get_prompt("<script>", {})
+    with pytest.raises(ValueError, match=r"^Invalid URI scheme: expected mysql://$"):
+        await read_resource(AnyUrl("https://example.com/<b>"))
+
+
+@pytest.mark.asyncio
 async def test_call_tool_escapes_control_characters_in_operational_logs(caplog):
     forged_name = "unknown\nforged-entry"
     forged_connection = "missing\nforged-connection"

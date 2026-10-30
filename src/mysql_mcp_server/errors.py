@@ -2,9 +2,31 @@
 
 from __future__ import annotations
 
-from typing import Any
+import re
+from typing import Any, Iterable
 
 from mysql.connector.errors import InterfaceError, ReadTimeoutError, WriteTimeoutError
+
+# Caller-supplied names are echoed in errors only when they cannot carry
+# markup, quotes or line breaks into the tool result.
+_ECHO_SAFE_NAME = re.compile(r"[A-Za-z0-9_.$-]{1,64}")
+
+
+def echo_name(value: object) -> str | None:
+    """Return a caller-supplied name if it is safe to echo, else None."""
+    if isinstance(value, str) and _ECHO_SAFE_NAME.fullmatch(value):
+        return value
+    return None
+
+
+def echo_names(values: Iterable[str]) -> str:
+    """Join echo-safe names, counting the rest instead of echoing them."""
+    values = list(values)
+    shown = [value for value in values if echo_name(value)]
+    hidden = len(values) - len(shown)
+    if hidden:
+        shown.append(f"{hidden} more with names that are not echoed")
+    return ", ".join(shown)
 
 class QueryFailure(RuntimeError):
     def __init__(

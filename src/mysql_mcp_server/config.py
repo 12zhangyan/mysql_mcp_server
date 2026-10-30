@@ -14,6 +14,7 @@ from typing import Any, Callable
 
 from .credential_store import (credential_cache, get_keyring_password,
                                run_credential_command)
+from .errors import echo_name
 
 PROFILE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_$]+$")
@@ -322,9 +323,9 @@ class ConnectionRegistry:
                     f"Connection '{selected}' is invalid: {self.errors[selected]}"
                 ) from exc
             available = ", ".join(sorted(self.profiles)) or "(none)"
-            raise ValueError(
-                f"Unknown connection '{selected}'. Available connections: {available}"
-            ) from exc
+            shown = echo_name(selected)
+            unknown = f"Unknown connection '{shown}'" if shown else "Unknown connection"
+            raise ValueError(f"{unknown}. Available connections: {available}") from exc
 
     def resolve(
         self, name: str | None = None, database: str | None = None

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- Tool errors no longer echo caller-supplied names that could carry markup,
+  quotes or line breaks: unknown tool, connection and prompt names, resource URIs,
+  and quoted function or database names from user SQL in policy errors. Names made
+  only of letters, digits, `_`, `.`, `$` and `-` (up to 64 characters) are still
+  named so typos stay easy to spot; other names are counted instead.
+
 ## [0.9.14] - 2026-10-30
 
 ### Fixed

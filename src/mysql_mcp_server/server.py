@@ -26,7 +26,8 @@ from .audit import (AuditWriteError, audit_sink, build_audit_context,
                     set_audit_context, validate_required_audit_context)
 from .config import (ConnectionProfile, build_connector_config,
                      ensure_database_allowed, load_connection_registry)
-from .errors import QueryFailure, database_failure, retryable_connector_read
+from .errors import (QueryFailure, database_failure, echo_name,
+                     retryable_connector_read)
 from .metadata import (MAX_TABLE_NAMES, catalog_name_filter,
                        detailed_schema_sql, group_schema_dump,
                        parse_dump_schema_kinds, search_tables_sql,
@@ -704,7 +705,7 @@ async def read_resource(uri: AnyUrl) -> str:
     uri_str = str(uri)
     try:
         if not uri_str.startswith("mysql://"):
-            raise ValueError(f"Invalid URI scheme: {uri_str}")
+            raise ValueError("Invalid URI scheme: expected mysql://")
         parts = uri_str[8:].split("/")
         connection = parts[1] if len(parts) == 2 and parts[0] == "connection" else None
         profile = load_connection_registry().get(connection)
@@ -734,7 +735,7 @@ async def read_resource(uri: AnyUrl) -> str:
                 )
 
             if len(parts) != 2 or parts[1] != "data":
-                raise ValueError(f"Invalid MySQL resource URI: {uri_str}")
+                raise ValueError("Invalid MySQL resource URI")
             table = validate_identifier(parts[0])
             columns, rows = _sync_resource_query(
                 profile,
@@ -1185,6 +1186,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
     arguments = arguments or {}
     connection = arguments.get("connection")
     database = arguments.get("database")
+    shown_name = echo_name(name)
     audit_token = None
     try:
         request_id, client_name, client_version = _request_identity()
@@ -1208,7 +1210,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
 
         handler = _TOOL_HANDLERS.get(name)
         if handler is None:
-            raise ValueError(f"Unknown tool: {name}")
+            raise ValueError(
+                f"Unknown tool: {shown_name}" if shown_name else "Unknown tool"
+            )
         return await handler(name, arguments, connection, database)
     except Exception as exc:
         logger.error("Error in call_tool %r (%s)", name, type(exc).__name__)
@@ -1227,7 +1231,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
             )
         return ToolErrorResult(
             content=[
-                TextContent(type="text", text=f"Error calling tool {name}: {str(exc)}")
+                TextContent(
+                    type="text",
+                    text=(
+                        f"Error calling tool {shown_name}: {exc}"
+                        if shown_name
+                        else f"Error calling tool: {exc}"
+                    ),
+                )
             ],
             isError=True,
         )
@@ -1359,7 +1370,10 @@ async def get_prompt(name: str, arguments: dict | None) -> GetPromptResult:
             ],
         )
     else:
-        raise ValueError(f"Unknown prompt: {name}")
+        shown_prompt = echo_name(name)
+        raise ValueError(
+            f"Unknown prompt: {shown_prompt}" if shown_prompt else "Unknown prompt"
+        )
 
 
 def _write_audit_event(

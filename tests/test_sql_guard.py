@@ -185,6 +185,24 @@ def test_system_database_selected_in_any_lettercase_is_blocked():
         )
 
 
+def test_quoted_names_from_sql_are_not_echoed_in_policy_errors():
+    with pytest.raises(ReadOnlyViolation) as functions:
+        validate_function_safety("SELECT `<b>x</b>`(1), custom_fn(2) FROM t")
+    assert "CUSTOM_FN, 1 more with names that are not echoed" in str(functions.value)
+    assert "<B>" not in str(functions.value)
+
+    with pytest.raises(ReadOnlyViolation) as databases:
+        validate_database_access(
+            "SELECT * FROM `<i>db</i>`.t JOIN other.u",
+            selected_database="app",
+            allowed_databases=("app",),
+            allow_system_databases=False,
+        )
+    assert str(databases.value).endswith(
+        "allowed_databases: other, 1 more with names that are not echoed"
+    )
+
+
 def test_schema_scoped_show_and_internal_grants_remain_available():
     assert validate_database_access(
         "SHOW TABLES FROM app",
