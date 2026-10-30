@@ -1,6 +1,6 @@
 {
   "name": "@yanzhang123/readonly-db-mcp",
-  "version": "0.9.12",
+  "version": "0.9.13",
   "description": "Enterprise-auditable, strictly read-only MySQL MCP server with multi-environment profiles.",
   "license": "MIT",
   "type": "commonjs",
