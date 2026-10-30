@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.16] - 2026-10-30
+
 ### Security
 - System databases are matched after case folding, compatibility normalization
   and removal of combining marks. MySQL 8.4 with `lower_case_table_names=1`
