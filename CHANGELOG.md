@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.14] - 2026-10-30
+
 ### Fixed
 - `use_pure` is passed to Connector/Python only when `MYSQL_USE_PURE` or a
   profile's `use_pure` is set. It was always sent as `false`, which makes the
