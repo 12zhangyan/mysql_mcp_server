@@ -40,6 +40,14 @@ const htmlChangelog = [
     "date": "2026-10-27",
     "desc": "用户裁决：配置层面的 Q-1、Q-2 不处理，待裁决问题清空"
   },
+  {
+    "date": "2026-10-27",
+    "desc": "新增方案：参考 benborla/mcp-server-mysql 的优化（文档重组、CLAUDE.md、CI 加 MySQL 8.4）"
+  },
+  {
+    "date": "2026-10-27",
+    "desc": "参考 benborla/mcp-server-mysql 的优化已实施：PR #31 待合并，CI 全绿"
+  },
   // ─── 在此行上方追加变更日志 ───
 ];
 
@@ -79,6 +87,21 @@ const changes = [
     "detailPath": "data/details/d-134d78cf62a0ad97.js",
     "summary": "MCP 使用反馈优化",
     "searchText": "MCP 使用反馈优化 mysql_mcp_server sql_guard / server MCP 使用反馈优化 Draft 已实施并发布 0.9.12：纯内置函数不再被当作 UDF 拦截，函数被拦和 timeout_ms 超限的报错说明了配置项；README 增加常见问题。 对账时想用 CRC32 做两边数据的校验和，被函数白名单拒绝，只能退回行数、合计、长度。所有连接的 allowed_functions 都是空的。REPLACE 被拦的问题已在今天发布的 0.9.11 修复，推测当时用的是旧版本。 常见的纯内置函数（CRC32、CONV、ORD、FIND_IN_SET 等）在不配置 allowed_functions 时可用 函数被拦或 timeout_ms 超限时，报错直接说明改哪个配置项 sql_guard 的内置安全函数名单与报错文案 timeout_ms 超限报错与工具描述 README 增加常见问题小节 不放开 information_schema 直查，继续用 get_schema_info / inspect_catalog 不提高任何连接的超时上限，不改生产连接 honglian-prd 的库范围 不处理 Claude Code 权限分类器无结果、ssh-mcp-server 连接失败 不做数据库适配层，不做 MariaDB 实库验证"
+  },
+  {
+    "updatedAt": "2026-10-27",
+    "service": "mysql_mcp_server",
+    "module": "docs / ci",
+    "title": "参考 benborla/mcp-server-mysql 的优化",
+    "date": "2026-10-27",
+    "status": "进行中",
+    "docPath": "docs/2026-10-27/benborla-reference-optimization.md",
+    "deliveryId": "DLV-A71A7A353F",
+    "currentGate": "submit",
+    "detailId": "d-a71a7a353f144a78",
+    "detailPath": "data/details/d-a71a7a353f144a78.js",
+    "summary": "S-1 至 S-3 已实施，PR #31 待合并：README 精简并拆出 docs，新增 CLAUDE.md，CI 增加 MySQL 8.4 且全部通过。",
+    "searchText": "参考 benborla/mcp-server-mysql 的优化 mysql_mcp_server docs / ci S-1 至 S-3 已实施，PR #31 待合并：README 精简并拆出 docs，新增 CLAUDE.md，CI 增加 MySQL 8.4 且全部通过。 Draft S-1 至 S-3 已实施，PR #31 待合并：README 从 650 行精简到约 160 行，配置、工具、排障、测试拆到 docs，新增 CLAUDE.md，CI 增加 MySQL 8.4。没有改动任何运行代码。 参考项目只有一个查询工具，写操作按环境变量开关。当前项目有 12 个工具、命名连接与路由、审计、凭据库、Bearer 鉴权和 AST 级脱敏。但当前 README 有 650 多行，配置、工具、测试、安全混在一起，没有 Claude Cod 新用户首屏就能跑通：Claude Code 一行安装加最小配置 配置、工具、排障、测试各有独立文档，README 变短 贡献者和 Agent 有一份可直接执行的构建、测试、发版指引 CI 的真实库验收覆盖用户实际使用的 MySQL 8.4 README 拆分，新增 docs 下的配置、工具、排障、测试文档 新增 CLAUDE.md CI 矩阵增加 MySQL 8.4 不开放写操作，不加缓存、限流、查询复杂度评分，不拒绝 SELECT * 不做 "
   },
   // ─── 在此行上方追加新记录 ───
 ];
