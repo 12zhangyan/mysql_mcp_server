@@ -69,7 +69,7 @@ def catalog_name_filter(
     if table is not None:
         if not isinstance(table, str) or not BARE_TABLE_NAME.fullmatch(table):
             raise ValueError(
-                f"Invalid identifier '{table}': only alphanumeric, underscore, and $ are allowed"
+                "Invalid identifier: only alphanumeric, underscore, and $ are allowed"
             )
         return f" AND TABLE_NAME = '{table}'"
     if table_names is not None:
