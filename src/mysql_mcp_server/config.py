@@ -47,6 +47,14 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _optional_env_bool(name: str) -> bool | None:
+    """Read a boolean that stays None, not False, when the variable is unset."""
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return None
+    return _env_bool(name)
+
+
 def _as_bool(value: Any, default: bool = False) -> bool:
     if value is None:
         return default
@@ -134,7 +142,8 @@ def _limited_ints(
 
 def _validate_identifier(name: str, *, label: str) -> str:
     if not IDENTIFIER_PATTERN.fullmatch(name):
-        raise ValueError(f"Invalid {label} '{name}': use letters, numbers, '_' or '$'")
+        # Tool arguments reach this check; the rejected value is not echoed.
+        raise ValueError(f"Invalid {label}: use letters, numbers, '_' or '$'")
     return name
 
 
@@ -208,7 +217,10 @@ class ConnectionProfile:
     audit_fail_closed: bool = False
     audit_fsync: bool = False
     auth_plugin: str | None = None
-    use_pure: bool = False
+    # None leaves the choice to Connector/Python, which falls back to its pure
+    # Python implementation when the C extension cannot load. An explicit False
+    # makes connect() raise ImportError in that case instead.
+    use_pure: bool | None = None
     raise_on_warnings: bool = False
     ssl_mode: str = "REQUIRED"
     ssl_ca: str | None = None
@@ -645,7 +657,9 @@ def _profile_from_toml(name: str, values: dict[str, Any]) -> ConnectionProfile:
         audit_fail_closed=audit_fail_closed,
         audit_fsync=_as_bool(values.get("audit_fsync")),
         auth_plugin=(str(values["auth_plugin"]) if values.get("auth_plugin") else None),
-        use_pure=_as_bool(values.get("use_pure")),
+        use_pure=(
+            None if values.get("use_pure") is None else _as_bool(values["use_pure"])
+        ),
         raise_on_warnings=_as_bool(values.get("raise_on_warnings")),
         ssl_mode=ssl_mode,
         ssl_ca=ssl_ca,
@@ -799,7 +813,7 @@ def _legacy_profile() -> ConnectionProfile:
         audit_fail_closed=audit_fail_closed,
         audit_fsync=_env_bool("MYSQL_AUDIT_FSYNC"),
         auth_plugin=os.getenv("MYSQL_AUTH_PLUGIN") or None,
-        use_pure=_env_bool("MYSQL_USE_PURE"),
+        use_pure=_optional_env_bool("MYSQL_USE_PURE"),
         raise_on_warnings=_env_bool("MYSQL_RAISE_ON_WARNINGS"),
         ssl_mode=ssl_mode,
         ssl_ca=ssl_ca,

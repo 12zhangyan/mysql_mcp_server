@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.14] - 2026-10-30
+
+### Fixed
+- `use_pure` is passed to Connector/Python only when `MYSQL_USE_PURE` or a
+  profile's `use_pure` is set. It was always sent as `false`, which makes the
+  connector raise `ImportError` instead of falling back to its pure Python
+  implementation when the C extension cannot load. The README and `.env.example`
+  no longer set it.
+
+### Security
+- Identifier checks use a full match, so a trailing newline no longer passes
+  `validate_identifier`, and rejected identifiers are no longer echoed in tool
+  errors.
+
+## [0.9.13] - 2026-10-29
+
+### Security
+- SHOW forms that sqlglot cannot model, such as `SHOW EXTENDED COLUMNS`,
+  `SHOW KEYS IN t IN db`, `SHOW INDEXES FROM t FROM db` and `SHOW BINARY LOG STATUS`,
+  were parsed as an opaque command and skipped the database allowlist, the system
+  database block and the SHOW kind check. User SQL in such a form is now rejected.
+- The system database block compared names case-sensitively, so
+  `INFORMATION_SCHEMA.PROCESSLIST`, or `MYSQL.user` on servers with
+  `lower_case_table_names` 1 or 2, was readable when `allowed_databases` was empty.
+  System databases are now matched in any lettercase, in SQL and in the `database`
+  argument.
+
 ## [0.9.12] - 2026-10-27
 
 ### Fixed

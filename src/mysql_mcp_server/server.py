@@ -51,6 +51,7 @@ from .transport import (  # noqa: F401  (helpers re-exported for callers/tests)
 from .sql_guard import (
     _sanitize_sql,
     build_explain_query,
+    is_system_database,
     parse_mysql_query,
     query_fingerprint,
     query_type,
@@ -70,18 +71,17 @@ logging.basicConfig(
 logger = logging.getLogger("mysql_mcp_server")
 audit_logger = logging.getLogger("mysql_mcp_server.audit")
 
-# System databases that are typically filtered out from resource listings.
-SYSTEM_DATABASES = {"information_schema", "mysql", "performance_schema", "sys"}
-
 
 def validate_identifier(name: str) -> str:
     """
     Validate a MySQL identifier (table or database name) to prevent SQL injection.
     Only allows alphanumeric characters, underscores, and dollar signs.
     """
-    if not re.match(r"^[a-zA-Z0-9_$]+$", name):
+    # fullmatch: "$" in re.match also matches before a trailing newline. The
+    # rejected value is not echoed, so it cannot inject text into the result.
+    if not isinstance(name, str) or not re.fullmatch(r"[a-zA-Z0-9_$]+", name):
         raise ValueError(
-            f"Invalid identifier '{name}': only alphanumeric, underscore, and $ are allowed"
+            "Invalid identifier: only alphanumeric, underscore, and $ are allowed"
         )
     return name
 
@@ -464,7 +464,7 @@ def _enforce_query_policy(
     internal: bool,
 ) -> exp.Expression:
     """Apply schema and function policy to read-only-validated SQL; return its AST."""
-    if selected_database in SYSTEM_DATABASES and not profile.allow_system_databases:
+    if is_system_database(selected_database) and not profile.allow_system_databases:
         raise ValueError(
             f"System database '{selected_database}' is blocked for connection "
             f"'{profile.name}'"
@@ -1068,7 +1068,7 @@ async def _tool_get_schema_info(
     selected_database = table_database or database
     target = load_connection_registry().resolve(connection, selected_database)
     if (
-        target.database in SYSTEM_DATABASES
+        is_system_database(target.database)
         and not target.profile.allow_system_databases
     ):
         raise ValueError("System database access is blocked")

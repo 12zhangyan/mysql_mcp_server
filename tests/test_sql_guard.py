@@ -130,6 +130,61 @@ def test_show_statements_cannot_bypass_database_scope(query):
         )
 
 
+# sqlglot parses these as an opaque Command in every supported release; a
+# release that models them still has to pass the SHOW scope checks.
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SHOW EXTENDED COLUMNS FROM secret.users",
+        "SHOW EXTENDED FULL COLUMNS FROM mysql.user",
+        "SHOW EXTENDED INDEX FROM secret.users",
+        "SHOW KEYS IN users IN secret",
+        "SHOW INDEXES FROM users FROM secret",
+        "SHOW EXTENDED TABLES FROM mysql",
+        "SHOW BINARY LOG STATUS",
+    ],
+)
+def test_unmodeled_show_forms_fail_closed(query):
+    with pytest.raises(ReadOnlyViolation):
+        validate_database_access(
+            query,
+            selected_database="app",
+            allowed_databases=("app",),
+            allow_system_databases=False,
+        )
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SELECT * FROM INFORMATION_SCHEMA.PROCESSLIST",
+        "SELECT * FROM Information_Schema.USER_PRIVILEGES",
+        "SELECT * FROM MYSQL.user",
+        "SELECT * FROM Performance_Schema.threads",
+        "SELECT * FROM SYS.processlist",
+        "SHOW TABLES FROM MySQL",
+    ],
+)
+def test_system_database_block_ignores_lettercase(query):
+    with pytest.raises(ReadOnlyViolation, match="System database"):
+        validate_database_access(
+            query,
+            selected_database=None,
+            allowed_databases=(),
+            allow_system_databases=False,
+        )
+
+
+def test_system_database_selected_in_any_lettercase_is_blocked():
+    with pytest.raises(ReadOnlyViolation, match="INFORMATION_SCHEMA"):
+        validate_database_access(
+            "SELECT * FROM PROCESSLIST",
+            selected_database="INFORMATION_SCHEMA",
+            allowed_databases=(),
+            allow_system_databases=False,
+        )
+
+
 def test_schema_scoped_show_and_internal_grants_remain_available():
     assert validate_database_access(
         "SHOW TABLES FROM app",
@@ -385,6 +440,9 @@ _SAMPLE_ARGUMENTS = {
     "REGEXP_SUBSTR": "a, b",
     "REPLACE": "a, b, c",
     "SUBSTRING_INDEX": "a, b, 1",
+    # sqlglot 30.26 models TIMESTAMPADD and rejects calls without all three
+    # arguments MySQL requires.
+    "TIMESTAMPADD": "MINUTE, 1, a",
     "VERSION": "",
 }
 
