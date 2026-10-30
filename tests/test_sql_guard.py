@@ -203,6 +203,19 @@ def test_quoted_names_from_sql_are_not_echoed_in_policy_errors():
     )
 
 
+@pytest.mark.parametrize("query", ["TABLE users", "TABLE `users`"])
+def test_bare_table_statement_passes_policy(query):
+    # execute_sql documents TABLE with a bare name as accepted.
+    validated = validate_read_only_query(query)
+    validate_database_access(
+        validated,
+        selected_database="app",
+        allowed_databases=("app",),
+        allow_system_databases=False,
+    )
+    validate_function_safety(validated)
+
+
 def test_schema_scoped_show_and_internal_grants_remain_available():
     assert validate_database_access(
         "SHOW TABLES FROM app",

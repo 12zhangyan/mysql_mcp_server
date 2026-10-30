@@ -227,7 +227,9 @@ def tool_definitions() -> list[Tool]:
             name="execute_sql",
             description=(
                 "Execute one strictly read-only SQL statement. Only SELECT, WITH, "
-                "SHOW, DESCRIBE, DESC, EXPLAIN, and TABLE are accepted. Writes, "
+                "SHOW, DESCRIBE, DESC, EXPLAIN, and TABLE are accepted; TABLE "
+                "takes only a bare table name, so use SELECT * FROM db.table for a "
+                "qualified name, ORDER BY, or LIMIT. Writes, "
                 "DDL, transaction commands, locking reads, SELECT INTO, and "
                 "multiple statements are rejected before connecting. "
                 "When table or column names are unknown, first use list_tables and get_schema_info; "

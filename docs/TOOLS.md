@@ -41,6 +41,8 @@
 - 必填参数：`query`
 - 可选参数：`connection`、`database`、`max_rows`、`offset`、`timeout_ms`、`max_response_bytes`、`result_format`、`audit_context`
 - 允许：`SELECT`、`WITH`、受数据库范围约束的 `SHOW`（包括 `SHOW CREATE TABLE/VIEW`）、`DESCRIBE`、`DESC`、`EXPLAIN`、`TABLE`
+- `SHOW` 写法：SQL 解析器无法逐项校验的写法一律拒绝，包括 `SHOW INDEXES`、`SHOW KEYS`、`SHOW FIELDS`、`SHOW EXTENDED ...` 和 `SHOW KEYS IN t IN db`。请改用 `SHOW INDEX FROM t`、`SHOW [FULL] COLUMNS FROM t`，或使用 `inspect_catalog`
+- `TABLE` 只接受裸表名（如 `TABLE orders`）；带库名、`ORDER BY` 或 `LIMIT` 时请改用 `SELECT * FROM db.table ...`
 - 始终拦截：DML、DDL、`USE`、事务控制、锁、`SELECT ... INTO`、会话变量赋值、MySQL 可执行注释和多语句；禁止 `SET_VAR`、`MAX_EXECUTION_TIME`、`RESOURCE_GROUP` 优化器提示覆盖连接策略，需要缩短超时时使用 `timeout_ms`
 - 函数策略：常见的纯内置函数（如 `CRC32`、`CONV`、`FIND_IN_SET`）直接放行；无法识别的存储函数/UDF 和带库名前缀的调用默认拦截，只有 `allowed_functions` 中经过审核的确定性函数可放行
 - 纵深防御：连接前先校验；随后在 `START TRANSACTION READ ONLY` 中执行并回滚
