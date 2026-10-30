@@ -109,6 +109,16 @@ def test_validate_identifier_invalid():
         validate_identifier("users`inject")
 
 
+@pytest.mark.parametrize("name", ["users\n", "users\r\n", "<b>users</b>"])
+def test_validate_identifier_rejects_without_echoing_input(name):
+    # re.match with "$" accepted a trailing newline; the value is not echoed.
+    with pytest.raises(ValueError, match="Invalid identifier") as exc:
+        validate_identifier(name)
+    assert name.strip() not in str(exc.value)
+    with pytest.raises(ValueError, match="Invalid identifier"):
+        parse_table_arg(f"app.{name}")
+
+
 def test_get_db_config_optional_database(monkeypatch):
     """Test that MYSQL_DATABASE is optional."""
     monkeypatch.setenv("MYSQL_USER", "testuser")
@@ -341,6 +351,18 @@ async def test_inspect_catalog_rejects_injected_table_before_query(monkeypatch):
             {"kind": "columns", "database": "app", "table_name": "x' OR 1=1"},
         )
     assert "Invalid identifier" in response[0].text
+    assert "OR 1=1" not in response[0].text
+    runner.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_rejected_database_argument_is_not_echoed():
+    with patch("mysql_mcp_server.server.run_query") as runner:
+        response = await call_tool(
+            "execute_sql", {"query": "SELECT 1", "database": "app<script>"}
+        )
+    assert response.isError
+    assert "<script>" not in response[0].text
     runner.assert_not_called()
 
 

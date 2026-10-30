@@ -287,6 +287,46 @@ query_timeout_ms = 1500
     assert config["write_timeout"] == 2
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"), [(None, None), ("", None), ("true", True), ("false", False)]
+)
+def test_legacy_use_pure_is_passed_only_when_configured(monkeypatch, value, expected):
+    # An explicit use_pure=False makes Connector/Python raise ImportError
+    # instead of falling back to pure Python when the C extension cannot load.
+    if value is None:
+        monkeypatch.delenv("MYSQL_USE_PURE", raising=False)
+    else:
+        monkeypatch.setenv("MYSQL_USE_PURE", value)
+
+    config = build_connector_config(load_connection_registry().get())
+
+    assert config.get("use_pure", "unset") == ("unset" if expected is None else expected)
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"), [("", None), ("use_pure = true", True), ("use_pure = false", False)]
+)
+def test_profile_use_pure_is_passed_only_when_configured(
+    tmp_path: Path, monkeypatch, line, expected
+):
+    profiles_file = tmp_path / "connections.toml"
+    profiles_file.write_text(
+        f"""
+[connections.dev]
+host = "dev"
+user = "reader"
+password = "secret"
+{line}
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MYSQL_PROFILES_FILE", str(profiles_file))
+
+    config = build_connector_config(load_connection_registry().get())
+
+    assert config.get("use_pure", "unset") == ("unset" if expected is None else expected)
+
+
 def test_legacy_safety_limits_are_validated(monkeypatch):
     monkeypatch.setenv("MYSQL_MAX_ROWS", "1001")
 

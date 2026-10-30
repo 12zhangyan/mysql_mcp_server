@@ -77,9 +77,11 @@ def validate_identifier(name: str) -> str:
     Validate a MySQL identifier (table or database name) to prevent SQL injection.
     Only allows alphanumeric characters, underscores, and dollar signs.
     """
-    if not re.match(r"^[a-zA-Z0-9_$]+$", name):
+    # fullmatch: "$" in re.match also matches before a trailing newline. The
+    # rejected value is not echoed, so it cannot inject text into the result.
+    if not isinstance(name, str) or not re.fullmatch(r"[a-zA-Z0-9_$]+", name):
         raise ValueError(
-            f"Invalid identifier '{name}': only alphanumeric, underscore, and $ are allowed"
+            "Invalid identifier: only alphanumeric, underscore, and $ are allowed"
         )
     return name
 

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `use_pure` is passed to Connector/Python only when `MYSQL_USE_PURE` or a
+  profile's `use_pure` is set. It was always sent as `false`, which makes the
+  connector raise `ImportError` instead of falling back to its pure Python
+  implementation when the C extension cannot load. The README and `.env.example`
+  no longer set it.
+
+### Security
+- Identifier checks use a full match, so a trailing newline no longer passes
+  `validate_identifier`, and rejected identifiers are no longer echoed in tool
+  errors.
+
 ## [0.9.13] - 2026-10-29
 
 ### Security

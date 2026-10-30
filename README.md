@@ -258,9 +258,11 @@ MYSQL_POOL_SIZE=0
 MYSQL_SQL_MODE=TRADITIONAL
 MYSQL_CHARSET=utf8mb4
 MYSQL_COLLATION=utf8mb4_unicode_ci
-MYSQL_USE_PURE=false
+# MYSQL_USE_PURE=true            # 默认不设置
 MYSQL_RAISE_ON_WARNINGS=false
 ```
+
+`MYSQL_USE_PURE`（命名配置中为 `use_pure`）默认不设置：Connector/Python 优先使用 C 扩展，加载失败时自动退回纯 Python 实现。只有明确需要时才设置；设为 `false` 会强制要求 C 扩展，扩展不可用时连接直接失败。
 
 `MYSQL_SQL_MODE` 与命名配置的 `sql_mode` 会在每次查询的会话中显式设置（空值即设为空模式）。会改变引号或反斜杠语义的模式会被拒绝：`ANSI_QUOTES`、`NO_BACKSLASH_ESCAPES`，以及包含它们的组合模式 `ANSI`、`DB2`、`MAXDB`、`MSSQL`、`ORACLE`、`POSTGRESQL`，因为只读 SQL 闸门按 MySQL 默认规则识别字符串边界。
 
