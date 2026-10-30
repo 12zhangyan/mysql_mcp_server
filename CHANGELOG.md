@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.13] - 2026-10-29
+
 ### Security
 - SHOW forms that sqlglot cannot model, such as `SHOW EXTENDED COLUMNS`,
   `SHOW KEYS IN t IN db`, `SHOW INDEXES FROM t FROM db` and `SHOW BINARY LOG STATUS`,
