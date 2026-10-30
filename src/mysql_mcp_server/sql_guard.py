@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import unicodedata
 from functools import lru_cache
 from typing import Any, cast
 
@@ -99,9 +100,20 @@ _BLOCKED_FUNCTION_PATTERN = re.compile(
 SYSTEM_DATABASES = {"information_schema", "mysql", "performance_schema", "sys"}
 
 
+def _schema_skeleton(name: str) -> str:
+    """Fold a schema name wider than MySQL's case mapping, to fail closed.
+
+    MySQL resolves `İnformation_schema` (U+0130) to information_schema, while
+    Python's lower() keeps a combining dot, so case and compatibility forms are
+    folded and combining marks dropped before comparing.
+    """
+    folded = unicodedata.normalize("NFKD", name.casefold())
+    return "".join(char for char in folded if not unicodedata.combining(char))
+
+
 def is_system_database(name: str | None) -> bool:
-    """Match system schemas in any lettercase, as MySQL may resolve them."""
-    return name is not None and name.lower() in SYSTEM_DATABASES
+    """Match system schemas in any spelling MySQL may resolve to them."""
+    return name is not None and _schema_skeleton(name) in SYSTEM_DATABASES
 
 
 # SHOW statements are parsed separately from ordinary table expressions by
@@ -577,14 +589,14 @@ def validate_database_access(
                 "; use inspect_catalog, get_schema_info, or list_tables for "
                 "controlled metadata access"
                 if any(
-                    database.lower() == "information_schema"
+                    _schema_skeleton(database) == "information_schema"
                     for database in blocked_system
                 )
                 else ""
             )
             raise ReadOnlyViolation(
                 "System database access is blocked: "
-                + ", ".join(blocked_system)
+                + echo_names(blocked_system)
                 + guidance
             )
 
