@@ -927,6 +927,14 @@ database = "app"
         ("list_tables", {"database": "MySQL"}),
         ("get_schema_info", {"database": "Performance_Schema"}),
         ("get_schema_info", {"table_name": "SYS.processlist"}),
+        ("inspect_catalog", {"kind": "tables", "database": "MySQL"}),
+        ("inspect_catalog", {"kind": "columns", "database": "Information_Schema"}),
+        ("dump_schema", {"database": "Sys"}),
+        ("dump_schema", {"database": "MYSQL", "kinds": ["tables"]}),
+        ("get_table_sample", {"table_name": "MYSQL.user"}),
+        ("get_table_sample", {"table_name": "user", "database": "Mysql"}),
+        ("explain_sql", {"query": "SELECT * FROM MYSQL.user"}),
+        ("check_connection", {"database": "Performance_Schema"}),
     ],
 )
 async def test_system_database_argument_is_blocked_in_any_lettercase(
@@ -937,6 +945,31 @@ async def test_system_database_argument_is_blocked_in_any_lettercase(
 
     assert response.isError
     assert "System database" in response[0].text
+    connector.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("uri", ["mysql://database/MYSQL", "mysql://database/Sys"])
+async def test_resource_uri_blocks_system_database_in_any_lettercase(
+    tmp_path, monkeypatch, uri
+):
+    profiles_file = tmp_path / "connections.toml"
+    profiles_file.write_text(
+        """
+[connections.prod]
+host = "prod"
+user = "reader"
+password = "secret"
+database = "app"
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MYSQL_PROFILES_FILE", str(profiles_file))
+
+    with patch("mysql_mcp_server.server._open_connection") as connector:
+        with pytest.raises(ValueError, match="System database"):
+            await read_resource(AnyUrl(uri))
+
     connector.assert_not_called()
 
 
