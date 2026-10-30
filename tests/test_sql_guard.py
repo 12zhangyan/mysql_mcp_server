@@ -163,6 +163,12 @@ def test_unmodeled_show_forms_fail_closed(query):
         "SELECT * FROM Performance_Schema.threads",
         "SELECT * FROM SYS.processlist",
         "SHOW TABLES FROM MySQL",
+        # MySQL 8.4 with lower_case_table_names=1 resolves U+0130 to
+        # information_schema; Python's lower() alone keeps a combining dot.
+        "SELECT * FROM `İnformation_schema`.SCHEMATA",
+        "SELECT * FROM `İNFORMATION_SCHEMA`.PROCESSLIST",
+        "SELECT * FROM `myſql`.user",
+        "SELECT * FROM `ｍｙｓｑｌ`.user",
     ],
 )
 def test_system_database_block_ignores_lettercase(query):
@@ -173,6 +179,28 @@ def test_system_database_block_ignores_lettercase(query):
             allowed_databases=(),
             allow_system_databases=False,
         )
+
+
+def test_non_ascii_user_database_is_not_mistaken_for_a_system_database():
+    assert validate_database_access(
+        "SELECT * FROM `中文库`.orders",
+        selected_database=None,
+        allowed_databases=(),
+        allow_system_databases=False,
+    ) == {"中文库"}
+
+
+def test_unicode_system_database_spelling_is_not_echoed():
+    with pytest.raises(ReadOnlyViolation) as exc:
+        validate_database_access(
+            "SELECT * FROM `İnformation_schema`.SCHEMATA",
+            selected_database=None,
+            allowed_databases=(),
+            allow_system_databases=False,
+        )
+    assert "İ" not in str(exc.value)
+    assert "1 more with names that are not echoed" in str(exc.value)
+    assert "inspect_catalog" in str(exc.value)
 
 
 def test_system_database_selected_in_any_lettercase_is_blocked():

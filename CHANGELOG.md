@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- System databases are matched after case folding, compatibility normalization
+  and removal of combining marks. MySQL 8.4 with `lower_case_table_names=1`
+  resolves `` `İnformation_schema` `` (U+0130) to `information_schema`, but the
+  0.9.13 lettercase check used Python's `lower()`, which keeps a combining dot, so
+  that spelling read `information_schema` when `allowed_databases` was empty.
+
 ### Changed
 - The `execute_sql` description now says that `TABLE` takes only a bare table
   name and points to `SELECT * FROM db.table` for a qualified name, `ORDER BY` or
