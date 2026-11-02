@@ -1,6 +1,6 @@
 # 连接池复用与 SSH 隧道隔离 开发方案
 
-> 状态：草稿·实施中（Q-1 至 Q-3 已于 2026-11-01 裁决）
+> 状态：已实施（PR #45 已合并，34a5e5f；Q-1 至 Q-3 已于 2026-11-01 裁决）
 > 日期：2026-11-01 ｜ 基线：main@097a591 ｜ 来源：本会话代码审查 IM-1、MI-1、IM-2 及修正方案讨论
 > 实施范围：`src/mysql_mcp_server/runtime.py`、`src/mysql_mcp_server/server.py`（连接释放路径）、`src/mysql_mcp_server/config.py`（连接参数与旧单连接默认值）、`tests/`、`docs/CONFIGURATION.md`、`CHANGELOG.md`；不改工具列表（`tests/snapshots/list_tools.json` 不得变化）
 
