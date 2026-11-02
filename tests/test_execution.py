@@ -456,6 +456,7 @@ async def test_query_is_parsed_once_across_validation_paging_and_retry():
                 (successful_connection, {"database": "app"}),
             ],
         ),
+        patch("sqlglot.parse", wraps=sqlglot.parse) as parse,
         patch("sqlglot.parse_one", wraps=sqlglot.parse_one) as parse_one,
     ):
         response = await call_tool(
@@ -469,7 +470,7 @@ async def test_query_is_parsed_once_across_validation_paging_and_retry():
             },
         )
 
-    assert parse_one.call_count == 1
+    assert parse.call_count + parse_one.call_count == 1
     failed_cursor.execute.assert_any_call(pushed_down)
     successful_cursor.execute.assert_any_call(pushed_down)
     assert json.loads(response[0].text)["retry_count"] == 1

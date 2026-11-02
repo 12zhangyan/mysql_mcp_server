@@ -3,6 +3,7 @@ import json
 from unittest.mock import patch
 
 import pytest
+from mysql.connector.constants import ClientFlag
 
 from mysql_mcp_server.config import (
     build_connector_config,
@@ -65,6 +66,8 @@ database = "app_dev"
     config = build_connector_config(profile, database="audit")
 
     assert config["autocommit"] is False
+    # The server must reject a second statement the SQL guard never validated.
+    assert config["client_flags"] == [-ClientFlag.MULTI_STATEMENTS]
     assert config["database"] == "audit"
     assert config["ssl_disabled"] is False
     assert profile.ssl_mode == "REQUIRED"

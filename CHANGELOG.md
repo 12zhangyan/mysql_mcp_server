@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- `--` comments now follow MySQL's rule. MySQL starts a comment when the second
+  dash is followed by whitespace or a control character, but the SQL guard only
+  accepted whitespace, so a quote after `--\x01` hid the statements on the next
+  line, including `COMMIT` and `SET SESSION transaction_read_only = OFF`. A `--`
+  followed by any other character, which MySQL reads as double negation while
+  sqlglot reads a comment that hid subqueries such as `SELECT 1 --(SELECT ...
+  FROM mysql.user)` from the database policy, is now rejected; write `- -`.
+- The parser policy rejects several parsed statements. sqlglot 26.x
+  `parse_one` returned only the first, leaving the rest unchecked.
+- Connections clear Connector/Python's default `MULTI_STATEMENTS` client flag,
+  so MySQL rejects a second statement the guard did not validate.
+
 ## [0.9.16] - 2026-10-30
 
 ### Security

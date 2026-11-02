@@ -61,6 +61,56 @@ def test_allows_one_trailing_semicolon():
     assert validate_read_only_query("SELECT 1;") == "SELECT 1"
 
 
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SELECT 1 --",
+        "SELECT 1 -- note",
+        "SELECT 1 --\tnote",
+        # MySQL also starts a comment when a control character follows `--`.
+        "SELECT 1 --\x01 note",
+        "SELECT 1 - -1",
+    ],
+)
+def test_dash_comments_mysql_recognizes_are_allowed(query):
+    assert validate_read_only_query(query)
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        # MySQL reads `--\x01` as a comment; the quote in it must not hide the
+        # statements on the next line.
+        "SELECT 1 --\x01 '\n; DELETE FROM users #'",
+        "SELECT 1 --\x01 '\n; COMMIT; SET SESSION transaction_read_only = OFF #'",
+        # MySQL reads these `--` as double negation, sqlglot as a comment that
+        # would hide the subquery from the database policy.
+        "SELECT 1 --(SELECT authentication_string FROM mysql.user LIMIT 1)",
+        "SELECT 1 --1",
+        "SELECT 1 --　note",
+    ],
+)
+def test_dash_comments_mysql_and_sqlglot_read_differently_are_blocked(query):
+    with pytest.raises(ReadOnlyViolation):
+        validate_read_only_query(query)
+
+
+@pytest.mark.parametrize(
+    "query",
+    ["SELECT 1; SELECT 2", "SELECT 1; SET SESSION transaction_read_only = OFF"],
+)
+def test_ast_policy_rejects_multiple_statements(query):
+    # Defense in depth behind the text guard: sqlglot 26.x parse_one would
+    # return only the first statement and leave the second unchecked.
+    with pytest.raises(ReadOnlyViolation, match="one SQL statement"):
+        validate_database_access(
+            query,
+            selected_database="app",
+            allowed_databases=("app",),
+            allow_system_databases=False,
+        )
+
+
 def test_database_allowlist_uses_ast_not_alias_regex():
     accessed = validate_database_access(
         "SELECT u.id FROM app.users AS u",

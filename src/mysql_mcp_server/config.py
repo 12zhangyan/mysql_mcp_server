@@ -12,6 +12,8 @@ from pathlib import Path
 from stat import S_ISREG
 from typing import Any, Callable
 
+from mysql.connector.constants import ClientFlag
+
 from .credential_store import (credential_cache, get_keyring_password,
                                run_credential_command)
 from .errors import echo_name
@@ -1021,6 +1023,9 @@ def build_connector_config(
         "auth_plugin": profile.auth_plugin,
         "use_pure": profile.use_pure,
         "raise_on_warnings": profile.raise_on_warnings,
+        # Connector/Python enables multi-statement packets by default; the SQL
+        # guard validates one statement, so the server must not run a second.
+        "client_flags": [-ClientFlag.MULTI_STATEMENTS],
     }
     if selected_database:
         config["database"] = selected_database

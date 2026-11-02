@@ -431,7 +431,7 @@ async def test_parser_exception_context_is_never_copied_to_response(
         )
     )
     with (
-        patch("mysql_mcp_server.sql_guard.sqlglot.parse_one", side_effect=error),
+        patch("mysql_mcp_server.sql_guard.sqlglot.parse", side_effect=error),
         patch("mysql_mcp_server.server._open_connection") as opened,
         caplog.at_level(logging.INFO),
     ):
