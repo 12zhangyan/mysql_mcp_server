@@ -2,11 +2,13 @@ from dataclasses import replace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from mysql.connector.errors import PoolError
 
 from mysql_mcp_server.config import ConnectionProfile, SshConfig
 from mysql_mcp_server.runtime import (
     ConnectionPoolManager,
     QueryControl,
+    ReadOnlyConnectionPool,
     SshTunnelManager,
     TunnelEndpoint,
     close_runtime_resources,
@@ -424,23 +426,168 @@ def test_switching_databases_reuses_one_pool_per_database():
     assert len(manager._pools) == 2
 
 
+def raw_connections():
+    """connect_factory for ReadOnlyConnectionPool that records raw connections."""
+    opened = []
+
+    def connect_factory(**config):
+        connection = MagicMock()
+        connection.is_connected.return_value = True
+        connection.config = config
+        opened.append(connection)
+        return connection
+
+    return opened, connect_factory
+
+
 def test_borrowed_connection_of_an_evicted_pool_is_closed_on_release():
-    RecordingPool.created = []
-    manager = ConnectionPoolManager(pool_factory=RecordingPool)
+    opened, connect_factory = raw_connections()
+    manager = ConnectionPoolManager(
+        pool_factory=lambda **kwargs: ReadOnlyConnectionPool(
+            connect_factory=connect_factory, **kwargs
+        )
+    )
     profile = pooled_profile(max_database_pools=1)
     endpoint = TunnelEndpoint("db", 3306)
     borrowed = manager.get_connection(profile, endpoint, {"database": "a"})
     current = manager.get_connection(profile, endpoint, {"database": "b"})
-    evicted, active = RecordingPool.created
 
     manager.release(borrowed)
     manager.release(current)
 
-    borrowed.close.assert_called_once_with()
-    # The evicted pool closes its idle connections again, now including the
-    # returned one; the active pool keeps its connection.
-    assert evicted.disposals == 2
-    assert active.disposals == 0
+    evicted, active = opened
+    assert evicted.config == {"database": "a"}
+    evicted.close.assert_called_once_with()
+    # The active pool keeps its connection for the next borrow.
+    active.close.assert_not_called()
+    assert manager.get_connection(profile, endpoint, {"database": "b"})._cnx is active
+
+
+def test_pools_default_to_the_pool_that_connects_outside_shared_locks():
+    # Connector/Python's MySQLConnectionPool connects and pings under one
+    # process-wide lock, so one unreachable server would stall every pool.
+    assert ConnectionPoolManager()._pool_factory is ReadOnlyConnectionPool
+
+
+def test_pool_opens_connections_on_demand_up_to_pool_size():
+    opened, connect_factory = raw_connections()
+    pool = ReadOnlyConnectionPool(
+        pool_name="p", pool_size=2, connect_factory=connect_factory, host="db"
+    )
+    assert opened == []
+
+    first = pool.get_connection()
+    first.close()
+    again = pool.get_connection()
+    second = pool.get_connection()
+
+    assert len(opened) == 2
+    assert again._cnx is opened[0]
+    with pytest.raises(PoolError, match="exhausted"):
+        pool.get_connection()
+    # Returning resets the session before the next borrow.
+    opened[0].reset_session.assert_called_once_with()
+    second.close()
+    second.close()
+    assert pool.get_connection()._cnx is opened[1]
+
+
+def test_pool_replaces_dead_and_unresettable_connections():
+    opened, connect_factory = raw_connections()
+    pool = ReadOnlyConnectionPool(
+        pool_name="p", pool_size=1, connect_factory=connect_factory
+    )
+    borrowed = pool.get_connection()
+    opened[0].reset_session.side_effect = RuntimeError("socket was shut down")
+    borrowed.close()
+    opened[0].close.assert_called_once_with()
+
+    pool.get_connection().close()
+    opened[1].is_connected.return_value = False
+    replacement = pool.get_connection()
+
+    assert replacement._cnx is opened[2]
+    opened[1].close.assert_called_once_with()
+
+
+def test_failed_connect_frees_its_pool_slot():
+    attempts = []
+
+    def connect_factory(**config):
+        attempts.append(config)
+        raise OSError("unreachable")
+
+    pool = ReadOnlyConnectionPool(
+        pool_name="p", pool_size=1, connect_factory=connect_factory
+    )
+    for _ in range(2):
+        with pytest.raises(OSError):
+            pool.get_connection()
+    assert len(attempts) == 2
+
+
+def test_retired_pool_serves_a_late_borrow_and_closes_it_on_return():
+    opened, connect_factory = raw_connections()
+    pool = ReadOnlyConnectionPool(
+        pool_name="p", pool_size=1, connect_factory=connect_factory
+    )
+    pool.close()
+
+    late = pool.get_connection()
+    late.close()
+
+    opened[0].close.assert_called_once_with()
+    assert pool.get_connection()._cnx is opened[1]
+
+
+def test_unreachable_pool_does_not_block_other_profiles():
+    import threading
+
+    connecting = threading.Event()
+    release = threading.Event()
+    opened, healthy_connect = raw_connections()
+
+    def stalled_connect(**config):
+        connecting.set()
+        release.wait(5)
+        raise OSError("unreachable")
+
+    def pool_factory(**kwargs):
+        stalled = kwargs.get("host") == "down"
+        return ReadOnlyConnectionPool(
+            connect_factory=stalled_connect if stalled else healthy_connect,
+            **kwargs,
+        )
+
+    manager = ConnectionPoolManager(pool_factory=pool_factory)
+    healthy = pooled_profile(name="healthy")
+    endpoint = TunnelEndpoint("db", 3306)
+    idle = manager.get_connection(healthy, endpoint, {"host": "db"})
+    stuck = threading.Thread(
+        target=lambda: pytest.raises(
+            OSError,
+            manager.get_connection,
+            pooled_profile(name="down"),
+            TunnelEndpoint("down", 3306),
+            {"host": "down"},
+        )
+    )
+    stuck.start()
+    try:
+        assert connecting.wait(5)
+        finished = threading.Event()
+
+        def borrow_and_return():
+            manager.release(idle)
+            manager.release(manager.get_connection(healthy, endpoint, {"host": "db"}))
+            finished.set()
+
+        threading.Thread(target=borrow_and_return).start()
+        assert finished.wait(1)
+    finally:
+        release.set()
+        stuck.join(5)
+    manager.clear()
 
 
 def test_release_closes_a_direct_connection():

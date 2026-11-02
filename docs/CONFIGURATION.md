@@ -50,7 +50,7 @@ result_format = "json"
 # 默认不脱敏；需要时在列表中填写字段名或模式。
 mask_columns = []
 pool_size = 3
-# 按库保留的连接池个数（1-16，默认 3），每个池建满 pool_size 条连接
+# 按库保留的连接池个数（1-16，默认 3），每个池最多 pool_size 条连接
 max_database_pools = 3
 audit_enabled = true
 
@@ -98,7 +98,7 @@ MYSQL_ALLOWED_DATABASES=app,reporting
 MYSQL_ALLOWED_FUNCTIONS=        # 可选，经过审核的函数名
 ```
 
-启用连接池（`pool_size` 大于 0）时，同一连接为每个用到的库（包括未指定库）各保留一个池，最多 `max_database_pools` 个，超出时关闭最久未用的池。每个池会建满 `pool_size` 条连接，空闲连接最多 `max_database_pools × pool_size` 条，注意数据库账号的 `max_user_connections`。同一连接同时执行的查询数仍受 `max_concurrent_queries` 与 `pool_size` 中较小值的限制。
+启用连接池（`pool_size` 大于 0）时，同一连接为每个用到的库（包括未指定库）各保留一个池，最多 `max_database_pools` 个，超出时关闭最久未用的池。每个池按需建立连接，最多 `pool_size` 条，空闲连接合计最多 `max_database_pools × pool_size` 条，注意数据库账号的 `max_user_connections`。同一连接同时执行的查询数仍受 `max_concurrent_queries` 与 `pool_size` 中较小值的限制。
 
 连接的 socket 读写超时固定按 `query_timeout_ms` 设置。调用时传入更短的 `timeout_ms`，客户端仍会按时收到超时，SELECT 也会被服务器的 `MAX_EXECUTION_TIME` 终止；SHOW、DESCRIBE 等语句不受 `MAX_EXECUTION_TIME` 约束，超时后后台连接最长要到 `query_timeout_ms` 才释放。
 
