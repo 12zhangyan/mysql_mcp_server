@@ -2035,17 +2035,26 @@ async def run_query(
 
 READ_ONLY_GRANT_PRIVILEGES = {"SELECT", "SHOW VIEW", "USAGE"}
 
+# A column-level grant lists quoted columns, which may contain commas, after
+# its privilege: GRANT SELECT (`id`, `name`), INSERT (`note`) ON ...
+_GRANT_COLUMN_LIST = r"\((?:[^`)]|`[^`]*`)*\)"
+_GRANT_PRIVILEGES = re.compile(
+    rf"^\s*GRANT\s+((?:[^`(]|`[^`]*`|{_GRANT_COLUMN_LIST})+?)\s+ON\s+",
+    re.IGNORECASE,
+)
+
 
 def _assess_grants(grants: list[str], global_read_only: object) -> dict[str, object]:
     """Identify database privileges that weaken defense in depth."""
     non_read_privileges: set[str] = set()
     for grant in grants:
-        match = re.match(r"^\s*GRANT\s+(.+?)\s+ON\s+", grant, re.IGNORECASE)
+        match = _GRANT_PRIVILEGES.match(grant)
         if not match:
             non_read_privileges.add("UNPARSED_GRANT")
             continue
+        privilege_list = re.sub(rf"\s*{_GRANT_COLUMN_LIST}", "", match.group(1))
         privileges = {
-            privilege.strip().upper() for privilege in match.group(1).split(",")
+            privilege.strip().upper() for privilege in privilege_list.split(",")
         }
         non_read_privileges.update(privileges - READ_ONLY_GRANT_PRIVILEGES)
 
