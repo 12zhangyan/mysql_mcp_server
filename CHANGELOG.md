@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.17] - 2026-11-02
+
 ### Security
 - `--` comments now follow MySQL's rule. MySQL starts a comment when the second
   dash is followed by whitespace or a control character, but the SQL guard only
