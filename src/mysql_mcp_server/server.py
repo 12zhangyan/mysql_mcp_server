@@ -323,6 +323,36 @@ def _open_connection(
     return connection, config
 
 
+def _session_killer(connection_object, config: dict) -> Callable[[], None] | None:
+    """End a cancelled session over a new connection with the same account.
+
+    The C extension cannot shut its socket down, and closing it while the
+    worker thread waits on it corrupts the heap. KILL CONNECTION, unlike KILL
+    QUERY, also stops a query sent after the kill arrives. Any account may
+    kill its own sessions.
+    """
+    connection_id = getattr(connection_object, "connection_id", None)
+    if type(connection_id) is not int:
+        return None
+
+    def kill() -> None:
+        killer = None
+        try:
+            killer = connect(**config)
+            with killer.cursor() as cursor:
+                cursor.execute(f"KILL CONNECTION {connection_id}")
+        except Exception:
+            logger.debug("Killing a cancelled session failed")
+        finally:
+            if killer is not None:
+                try:
+                    killer.close()
+                except Exception:
+                    logger.debug("Closing the kill connection failed")
+
+    return kill
+
+
 def _verify_connection_transport(profile: ConnectionProfile, connection_object) -> None:
     """Fail closed when a profile requiring TLS negotiated a plaintext session."""
     if profile.ssl_mode == "DISABLED":
@@ -1649,7 +1679,9 @@ async def execute_query(
                     database=selected_database,
                     password=password,
                 )
-                control.bind(connection_object)
+                control.bind(
+                    connection_object, _session_killer(connection_object, config)
+                )
                 with connection_object.cursor() as cursor:
                     phase = "session_setup"
                     _prepare_read_only_session(
@@ -1776,9 +1808,11 @@ async def execute_query(
                     exc, phase=phase, **scope.failure_context(query=query)
                 ) from exc
             finally:
+                # Unbind first: it waits for a kill in progress, which must not
+                # reach the session after another request borrows it.
+                control.unbind()
                 if connection_object is not None:
                     _release_connection(connection_object, discard=discard_connection)
-                control.unbind()
         raise RuntimeError("Connector retry loop exited unexpectedly")
 
     def _sync_execute() -> QueryResult:

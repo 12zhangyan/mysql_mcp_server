@@ -541,3 +541,86 @@ async def test_real_combined_session_setup_enforces_read_only_and_timeout(local_
     payload = json.loads(result[0].text)
     assert decisions == [True]
     assert payload["rows"] == [[1, 4321]]
+
+
+DIGITS = " UNION ALL ".join(
+    f"SELECT {n} AS d" if n == 1 else f"SELECT {n}" for n in range(1, 11)
+)
+# A billion-row cross join outlives any timeout used here.
+SLOW_QUERY = "SELECT COUNT(*) AS total FROM " + ", ".join(
+    f"({DIGITS}) AS t{i}" for i in range(9)
+)
+
+
+@pytest.mark.parametrize("pool_size", ["0", "2"])
+@pytest.mark.parametrize("use_pure", [None, "true"], ids=["default", "pure"])
+async def test_real_query_timeout_leaves_the_server_usable(
+    local_db, monkeypatch, pool_size, use_pure
+):
+    """Cancelling a C extension session from another thread crashed the process."""
+    from mysql_mcp_server.errors import QueryFailure
+    from mysql_mcp_server.runtime import connection_pool_manager
+    from mysql_mcp_server.server import execute_query
+
+    monkeypatch.setenv("MYSQL_POOL_SIZE", pool_size)
+    if use_pure is None:
+        monkeypatch.delenv("MYSQL_USE_PURE", raising=False)
+    else:
+        monkeypatch.setenv("MYSQL_USE_PURE", use_pure)
+    try:
+        for _ in range(2):
+            with pytest.raises(QueryFailure) as failure:
+                await execute_query(SLOW_QUERY, timeout_ms=500)
+            assert failure.value.payload["code"] == "QUERY_TIMEOUT"
+        result = await execute_query("SELECT 1 AS ok")
+        assert result.rows == [[1]]
+    finally:
+        connection_pool_manager.clear()
+
+
+@pytest.mark.parametrize("use_pure", [None, True], ids=["default", "pure"])
+def test_real_cancel_stops_a_query_the_server_does_not_time_out(local_db, use_pure):
+    """SHOW and other statements ignore MAX_EXECUTION_TIME; cancel must stop them."""
+    import threading
+    import time
+    from dataclasses import replace
+
+    from mysql_mcp_server.config import load_connection_registry
+    from mysql_mcp_server.runtime import QueryControl
+    from mysql_mcp_server.server import (
+        _open_connection,
+        _release_connection,
+        _session_killer,
+    )
+
+    profile = replace(load_connection_registry().get(), use_pure=use_pure)
+    connection, config = _open_connection(profile, database=None)
+    control = QueryControl()
+    control.bind(connection, _session_killer(connection, config))
+    outcome: dict[str, float | str] = {}
+
+    def run():
+        started = time.monotonic()
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT SLEEP(10)")
+                cursor.fetchall()
+            outcome["result"] = "finished"
+        except mysql.connector.Error as exc:
+            outcome["result"] = type(exc).__name__
+        outcome["seconds"] = time.monotonic() - started
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    time.sleep(0.5)
+    cancelled_at = time.monotonic()
+    control.cancel()
+    # cancel() runs on the event loop in the server and must not wait for MySQL.
+    assert time.monotonic() - cancelled_at < 0.5
+    worker.join(8)
+    control.unbind()
+    _release_connection(connection, discard=False)
+
+    assert not worker.is_alive()
+    assert outcome["result"] != "finished"
+    assert float(outcome["seconds"]) < 5

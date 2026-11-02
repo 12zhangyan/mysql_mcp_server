@@ -17,6 +17,7 @@ from mysql_mcp_server.server import (
     _assess_grants,
     _bounded_query_sql,
     _open_connection,
+    _session_killer,
     _sync_resource_query,
     _verify_connection_transport,
     call_tool,
@@ -1144,3 +1145,30 @@ async def test_run_query_renders_the_format_execute_query_fitted():
     assert json.loads(result[0].text)["rows"] == [[1], [2]]
     # One registry lookup in execute_query; rendering reuses its fitted format.
     assert registry.call_count == 1
+
+
+def test_session_killer_kills_the_session_over_a_new_connection():
+    session = MagicMock()
+    session.connection_id = 42
+    killer_connection, killer_cursor = fake_connection([], [])
+    config = {"host": "db", "user": "reader", "password": "secret"}
+
+    with patch(
+        "mysql_mcp_server.server.connect", return_value=killer_connection
+    ) as connector:
+        kill = _session_killer(session, config)
+        assert kill is not None
+        kill()
+
+    connector.assert_called_once_with(**config)
+    killer_cursor.execute.assert_called_once_with("KILL CONNECTION 42")
+    killer_connection.close.assert_called_once_with()
+    session.close.assert_not_called()
+
+
+def test_session_killer_needs_a_connection_id_and_swallows_failures():
+    assert _session_killer(MagicMock(connection_id=None), {}) is None
+    with patch("mysql_mcp_server.server.connect", side_effect=OSError("down")):
+        kill = _session_killer(MagicMock(connection_id=7), {"host": "db"})
+        assert kill is not None
+        kill()

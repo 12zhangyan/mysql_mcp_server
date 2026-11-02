@@ -313,6 +313,51 @@ def test_query_control_shutdowns_bound_connection():
     connection.shutdown.assert_called_once_with()
 
 
+def test_query_control_kills_a_c_extension_session_without_touching_it():
+    import threading
+
+    connection = MagicMock()
+    connection.shutdown.side_effect = NotImplementedError
+    kill_started = threading.Event()
+    finish_kill = threading.Event()
+    kill_threads = []
+
+    def kill():
+        kill_threads.append(threading.current_thread())
+        kill_started.set()
+        finish_kill.wait(5)
+
+    control = QueryControl()
+    control.bind(connection, kill)
+    control.cancel()
+    control.cancel()
+
+    assert kill_started.wait(5)
+    assert kill_threads == [kill_threads[0]]
+    assert kill_threads[0] is not threading.current_thread()
+    # Closing would hand the connection back while the worker still uses it.
+    connection.close.assert_not_called()
+    unbound = threading.Event()
+    threading.Thread(target=lambda: (control.unbind(), unbound.set())).start()
+    assert not unbound.wait(0.2)
+    finish_kill.set()
+    assert unbound.wait(5)
+
+
+def test_query_control_refuses_to_bind_after_cancel():
+    connection = MagicMock()
+    kill = MagicMock()
+    control = QueryControl()
+    control.cancel()
+
+    with pytest.raises(RuntimeError, match="cancelled before execution"):
+        control.bind(connection, kill)
+
+    control.unbind()
+    connection.shutdown.assert_not_called()
+    kill.assert_not_called()
+
+
 def test_runtime_cleanup_closes_pools_before_ssh_tunnels():
     calls = []
     with (
