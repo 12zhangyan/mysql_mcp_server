@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.19] - 2026-11-02
+
 ### Fixed
 - A query that exceeded `timeout_ms`, or a cancelled request, no longer crashes
   the server process with the Connector/Python C extension, the default when
