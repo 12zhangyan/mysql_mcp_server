@@ -48,6 +48,14 @@ const htmlChangelog = [
     "date": "2026-10-27",
     "desc": "参考 benborla/mcp-server-mysql 的优化已实施：PR #31 待合并，CI 全绿"
   },
+  {
+    "date": "2026-11-01",
+    "desc": "新增方案：连接池复用与 SSH 隧道隔离（Q-1 至 Q-3 待裁决）"
+  },
+  {
+    "date": "2026-11-01",
+    "desc": "Q-1 至 Q-3 已裁决（新增 max_database_pools、接受超时语义变化、旧模式端口保持 3330）；S-1 至 S-3 已实施，未提交"
+  },
   // ─── 在此行上方追加变更日志 ───
 ];
 
@@ -102,6 +110,21 @@ const changes = [
     "detailPath": "data/details/d-a71a7a353f144a78.js",
     "summary": "S-1 至 S-3 已实施，PR #31 待合并：README 精简并拆出 docs，新增 CLAUDE.md，CI 增加 MySQL 8.4 且全部通过。",
     "searchText": "参考 benborla/mcp-server-mysql 的优化 mysql_mcp_server docs / ci S-1 至 S-3 已实施，PR #31 待合并：README 精简并拆出 docs，新增 CLAUDE.md，CI 增加 MySQL 8.4 且全部通过。 Draft S-1 至 S-3 已实施，PR #31 待合并：README 从 650 行精简到约 160 行，配置、工具、排障、测试拆到 docs，新增 CLAUDE.md，CI 增加 MySQL 8.4。没有改动任何运行代码。 参考项目只有一个查询工具，写操作按环境变量开关。当前项目有 12 个工具、命名连接与路由、审计、凭据库、Bearer 鉴权和 AST 级脱敏。但当前 README 有 650 多行，配置、工具、测试、安全混在一起，没有 Claude Cod 新用户首屏就能跑通：Claude Code 一行安装加最小配置 配置、工具、排障、测试各有独立文档，README 变短 贡献者和 Agent 有一份可直接执行的构建、测试、发版指引 CI 的真实库验收覆盖用户实际使用的 MySQL 8.4 README 拆分，新增 docs 下的配置、工具、排障、测试文档 新增 CLAUDE.md CI 矩阵增加 MySQL 8.4 不开放写操作，不加缓存、限流、查询复杂度评分，不拒绝 SELECT * 不做 "
+  },
+  {
+    "updatedAt": "2026-11-01",
+    "service": "mysql_mcp_server",
+    "module": "runtime / config",
+    "title": "连接池复用与 SSH 隧道隔离",
+    "date": "2026-11-01",
+    "status": "进行中",
+    "docPath": "docs/2026-11-01/connection-pool-and-ssh-tunnel.md",
+    "deliveryId": "DLV-B52E16F0A7",
+    "currentGate": "plan",
+    "detailId": "d-b52e16f0a71f2167",
+    "detailPath": "data/details/d-b52e16f0a71f2167.js",
+    "summary": "已实施未提交：跨库或换超时复用连接池（新增 max_database_pools），SSH 隧道启动互不阻塞，隧道端口被占用时报错。",
+    "searchText": "连接池复用与 SSH 隧道隔离 mysql_mcp_server runtime / config 已实施未提交：跨库或换超时复用连接池（新增 max_database_pools），SSH 隧道启动互不阻塞，隧道端口被占用时报错。 Draft 方案已生成，未实施：修复审查发现的 IM-1（连接池随库和超时反复重建）、MI-1（SSH 全局锁阻塞所有连接）、IM-2（隧道就绪检查不确认端口归属）。 连接池的 key 包含库名和单次调用的超时。Agent 每切换一次库或传一次不同的 timeout_ms，旧池就被销毁，新池一次建满 pool_size 条连接（默认 5 条）；正在用的连接还会被丢给已销毁的旧池，要等垃圾回收才释放。 SSH 隧道管理器所有连接共用一把锁，一个跳板机连不上，最长 60 秒内其他连接（包括直连的）都打不开。就绪检查只看本地端口能否连通，端口被别的程序占用时可能连到错误的服务器。 同一连接跨库、变超时调用时复用连接池 SSH 隧道启动互不阻塞 隧道端口被占用或 ssh 提前退出时明确报错 连接池按库保留多个池，超过上限时淘汰最久未用的池 池 key 去掉超时，socket 超时统一按连接上限 被淘汰池里正在用的连接，归还时直接关闭 SSH 锁按连接拆分，端口预检和进程存活确认 不改变每次查询的只读会话设置 不自研连接池，不新增依赖 不改工具列表"
   },
   // ─── 在此行上方追加新记录 ───
 ];

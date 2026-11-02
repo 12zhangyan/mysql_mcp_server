@@ -50,6 +50,8 @@ result_format = "json"
 # 默认不脱敏；需要时在列表中填写字段名或模式。
 mask_columns = []
 pool_size = 3
+# 按库保留的连接池个数（1-16，默认 3），每个池建满 pool_size 条连接
+max_database_pools = 3
 audit_enabled = true
 
 [connections.prod]
@@ -91,9 +93,14 @@ MYSQL_QUERY_TIMEOUT_MS=30000    # 整次调用超时，100-300000 毫秒
 MYSQL_MAX_CELL_LENGTH=20000     # 超长单元格截断长度
 MYSQL_RESULT_FORMAT=json        # json 或 csv
 MYSQL_POOL_SIZE=0               # 旧单连接模式；命名配置默认 5
+MYSQL_MAX_DATABASE_POOLS=3      # 按库保留的连接池个数，1-16，默认 3
 MYSQL_ALLOWED_DATABASES=app,reporting
 MYSQL_ALLOWED_FUNCTIONS=        # 可选，经过审核的函数名
 ```
+
+启用连接池（`pool_size` 大于 0）时，同一连接为每个用到的库（包括未指定库）各保留一个池，最多 `max_database_pools` 个，超出时关闭最久未用的池。每个池会建满 `pool_size` 条连接，空闲连接最多 `max_database_pools × pool_size` 条，注意数据库账号的 `max_user_connections`。同一连接同时执行的查询数仍受 `max_concurrent_queries` 与 `pool_size` 中较小值的限制。
+
+连接的 socket 读写超时固定按 `query_timeout_ms` 设置。调用时传入更短的 `timeout_ms`，客户端仍会按时收到超时，SELECT 也会被服务器的 `MAX_EXECUTION_TIME` 终止；SHOW、DESCRIBE 等语句不受 `MAX_EXECUTION_TIME` 约束，超时后后台连接最长要到 `query_timeout_ms` 才释放。
 
 推荐使用 `password_env`。本地环境也支持 `password` 字段，但 `mysql-connections.toml` 已加入 `.gitignore`，因为它可能包含敏感信息。桌面 MCP 客户端的工作目录不固定，因此 `MYSQL_PROFILES_FILE` 必须使用绝对路径。
 
@@ -232,7 +239,7 @@ MYSQL_SSH_USER=
 MYSQL_SSH_KEY_PATH=
 MYSQL_SSH_REMOTE_HOST=localhost
 MYSQL_SSH_REMOTE_PORT=3306
-MYSQL_LOCAL_PORT=0              # 0 表示自动选择端口，隧道会复用
+MYSQL_LOCAL_PORT=3330           # 旧单连接模式默认 3330；0 表示自动选择端口。端口已被占用时启动报错
 ```
 
 ### `.env` 文件

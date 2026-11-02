@@ -203,7 +203,6 @@ def get_db_config(
     port=None,
     connection: str | None = None,
     database: str | None = None,
-    query_timeout_ms: int | None = None,
 ):
     """
     Construct mysql-connector settings for a named profile.
@@ -219,7 +218,6 @@ def get_db_config(
         database=database,
         host=host,
         port=port,
-        query_timeout_ms=query_timeout_ms,
     )
 
 
@@ -301,7 +299,6 @@ def _open_connection(
     profile: ConnectionProfile,
     *,
     database: str | None,
-    query_timeout_ms: int,
     password: str | None = None,
 ):
     endpoint = ssh_tunnel_manager.endpoint(profile)
@@ -310,7 +307,6 @@ def _open_connection(
         database=database,
         host=endpoint.host,
         port=endpoint.port,
-        query_timeout_ms=query_timeout_ms,
         password=password,
     )
     connection = connection_pool_manager.get_connection(
@@ -510,7 +506,7 @@ def _release_connection(connection_object, *, discard: bool) -> None:
         except Exception:
             logger.debug("Rollback failed during connection cleanup")
     try:
-        connection_object.close()
+        connection_pool_manager.release(connection_object)
     except Exception:
         logger.debug("Connection close failed during cleanup")
 
@@ -547,7 +543,6 @@ def _sync_resource_query(
             connection_object, _ = _open_connection(
                 profile,
                 database=selected_database,
-                query_timeout_ms=profile.query_timeout_ms,
                 password=password,
             )
         except Error as exc:
@@ -1652,7 +1647,6 @@ async def execute_query(
                 connection_object, config = _open_connection(
                     profile,
                     database=selected_database,
-                    query_timeout_ms=effective_timeout,
                     password=password,
                 )
                 control.bind(connection_object)

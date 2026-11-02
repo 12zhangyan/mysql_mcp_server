@@ -109,6 +109,7 @@ _INT_LIMITS: dict[str, tuple[int, int, int]] = {
     "max_queued_queries": (16, 0, 128),
     "queue_timeout_ms": (1000, 1, 300000),
     "pool_size": (5, 0, 32),
+    "max_database_pools": (3, 1, 16),
     "audit_log_max_bytes": (10_000_000, 10_000, 1_000_000_000),
     "audit_log_backup_count": (10, 1, 100),
 }
@@ -211,6 +212,8 @@ class ConnectionProfile:
     mask_columns: tuple[str, ...] = DEFAULT_MASK_COLUMNS
     result_format: str = "csv"
     pool_size: int = 5
+    # Pools kept per profile, one per selected database; each holds pool_size.
+    max_database_pools: int = 3
     audit_enabled: bool = True
     audit_log_file: str | None = None
     audit_log_max_bytes: int = 10_000_000
@@ -998,16 +1001,18 @@ def build_connector_config(
     database: str | None = None,
     host: str | None = None,
     port: int | None = None,
-    query_timeout_ms: int | None = None,
     password: str | None = None,
 ) -> dict[str, Any]:
     """Build mysql-connector arguments without exposing profile-only metadata.
 
     Pass ``password`` when the caller already resolved it for this request.
+    Socket timeouts use the profile limit, not a call's shorter timeout_ms:
+    they are part of the pool key, and the C extension cannot change them on
+    an open connection. MAX_EXECUTION_TIME and the call deadline apply the
+    shorter limit per query.
     """
     selected_database = ensure_database_allowed(profile, database)
-    timeout_ms = query_timeout_ms or profile.query_timeout_ms
-    socket_timeout = max(1, math.ceil(timeout_ms / 1000))
+    socket_timeout = max(1, math.ceil(profile.query_timeout_ms / 1000))
     config: dict[str, Any] = {
         "host": host or profile.host,
         "port": port or profile.port,

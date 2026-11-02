@@ -25,6 +25,8 @@ mask_columns = []
 # To opt in, replace the empty list with your schema-specific rules, for example:
 # mask_columns = ["password", "access_token", "users.phone"]
 pool_size = 3
+# Pools kept per database used (1-16, default 3); each holds pool_size connections.
+max_database_pools = 3
 audit_enabled = true
 audit_log_file = "C:/var/log/mysql-mcp/dev-audit.jsonl"
 audit_log_max_bytes = 10000000
