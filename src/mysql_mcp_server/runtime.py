@@ -484,44 +484,73 @@ class ConnectionPoolManager:
 
 
 class QueryControl:
-    """Cross-thread handle used to close a connector socket on cancellation."""
+    """Cross-thread handle that stops a running query on cancellation.
+
+    The pure-Python connector shuts its socket down. The C extension cannot,
+    and closing a connection while the worker thread uses it corrupts the
+    process heap, so its session is killed over a separate connection.
+    """
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._connection: Any | None = None
+        self._kill: Callable[[], None] | None = None
+        self._killer: threading.Thread | None = None
         self._cancelled = False
 
-    def bind(self, connection: Any) -> None:
+    def bind(
+        self, connection: Any, kill: Callable[[], None] | None = None
+    ) -> None:
+        """Track a connection; ``kill`` ends its session from another connection."""
         with self._lock:
-            self._connection = connection
             if self._cancelled:
-                self._shutdown(connection)
                 raise RuntimeError("Query was cancelled before execution")
+            self._connection = connection
+            self._kill = kill
 
     def unbind(self) -> None:
+        """Stop tracking the connection; call before returning it to a pool.
+
+        Waits for a kill in progress, so it cannot reach the session after
+        another request borrows the connection.
+        """
         with self._lock:
             self._connection = None
+            self._kill = None
+            killer = self._killer
+        if killer is not None:
+            killer.join()
 
     def cancel(self) -> None:
         with self._lock:
             self._cancelled = True
             if self._connection is not None:
-                self._shutdown(self._connection)
+                self._interrupt(self._connection)
 
     @property
     def cancelled(self) -> bool:
         with self._lock:
             return self._cancelled
 
-    @staticmethod
-    def _shutdown(connection: Any) -> None:
+    def _interrupt(self, connection: Any) -> None:
         try:
             connection.shutdown()
+            return
+        except NotImplementedError:
+            pass
         except Exception:
             try:
                 connection.close()
             except Exception:
                 pass
+            return
+        if self._kill is not None and self._killer is None:
+            # Connecting may take connect_timeout; keep it off the caller's
+            # thread, which is usually the event loop.
+            self._killer = threading.Thread(
+                target=self._kill, name="mysql-mcp-kill", daemon=True
+            )
+            self._killer.start()
 
 
 # Safety net only: waiters are woken by release(); this bounds a missed wake-up.

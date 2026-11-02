@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- A query that exceeded `timeout_ms`, or a cancelled request, no longer crashes
+  the server process with the Connector/Python C extension, the default when
+  it loads. Cancellation fell back to closing the connection from the event
+  loop while the worker thread was still reading from it, which corrupted the
+  heap (Windows `0xc0000374`), with or without pooling. C extension sessions
+  are now ended with `KILL CONNECTION` over a separate connection of the same
+  account, which every account may run on its own sessions, and the worker
+  returns the connection only after that kill completes. The pure-Python
+  connector still shuts its socket down. Cancelling no longer blocks the event
+  loop while the query runs.
 - A MySQL server that does not answer no longer stalls every other pooled
   connection. Connector/Python's `MySQLConnectionPool` connects, pings and
   reconnects under one process-wide lock, so creating a pool for an unreachable
