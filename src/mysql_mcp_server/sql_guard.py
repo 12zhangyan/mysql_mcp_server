@@ -359,9 +359,15 @@ def _sanitize_sql(sql: str) -> tuple[str, list[int]]:
             blank(start, index)
             continue
 
-        if sql.startswith("--", index) and (
-            index + 2 == length or sql[index + 2].isspace()
-        ):
+        if sql.startswith("--", index):
+            # MySQL starts a comment only when the second dash is followed by
+            # whitespace or a control character, while sqlglot reads every
+            # `--` as one; reject the forms the two would read differently.
+            if index + 2 < length and sql[index + 2] > " " and sql[index + 2] != "\x7f":
+                raise ReadOnlyViolation(
+                    "'--' starts a comment only when followed by a space; "
+                    "write '- -' for double negation"
+                )
             start = index
             end = sql.find("\n", index + 2)
             index = length if end < 0 else end
@@ -450,9 +456,19 @@ def validate_read_only_query(sql: str) -> str:
 
 
 def parse_mysql_query(sql: str) -> exp.Expression:
-    """Expose parser coordinates, never its SQL-bearing diagnostic text."""
+    """Expose parser coordinates, never its SQL-bearing diagnostic text.
+
+    The text guard admits one statement, so several parsed statements mean the
+    two disagree about where statements end. sqlglot 26.x parse_one silently
+    returns only the first and later releases wrap them in a Block; parse()
+    lists them in every supported release.
+    """
     try:
-        return cast(exp.Expression, sqlglot.parse_one(sql, read="mysql"))
+        statements = [
+            statement
+            for statement in sqlglot.parse(sql, read="mysql")
+            if statement is not None
+        ]
     except (ParseError, TokenError) as exc:
         position: dict[str, Any] = {}
         if isinstance(exc, ParseError) and exc.errors:
@@ -470,6 +486,11 @@ def parse_mysql_query(sql: str) -> exp.Expression:
             query_id=query_fingerprint(sql),
             **position,
         ) from None
+    if not statements:
+        raise ReadOnlyViolation("Query does not contain a SQL statement")
+    if len(statements) > 1:
+        raise ReadOnlyViolation("Only one SQL statement is allowed")
+    return cast(exp.Expression, statements[0])
 
 
 def build_explain_query(sql: str, *, json_plan: bool = False) -> str:
