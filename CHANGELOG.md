@@ -18,6 +18,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   returns the connection only after that kill completes. The pure-Python
   connector still shuts its socket down. Cancelling no longer blocks the event
   loop while the query runs.
+- A MySQL server that does not answer no longer stalls every other pooled
+  connection. Connector/Python's `MySQLConnectionPool` connects, pings and
+  reconnects under one process-wide lock, so creating a pool for an unreachable
+  host (up to `connect_timeout`) or pinging a silently dropped idle connection
+  (up to `query_timeout_ms`) blocked borrowing and returning connections on all
+  profiles. Pools now hold their own lock only for bookkeeping and do network
+  work outside it; the pool manager's lock no longer covers opening any
+  connection.
+- `check_connection` no longer reports column-level grants such as
+  ``GRANT SELECT (`id`, `name`) ON ...`` as non-read privileges.
+
+### Changed
+- Pools open connections on demand, up to `pool_size`, instead of opening
+  `pool_size` connections when created. A connection whose session cannot be
+  reset when returned, such as one closed after a timeout, is dropped and
+  replaced on a later borrow instead of being reconnected from the pool.
 
 ## [0.9.18] - 2026-11-02
 

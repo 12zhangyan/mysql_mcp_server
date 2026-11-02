@@ -212,7 +212,7 @@ class ConnectionProfile:
     mask_columns: tuple[str, ...] = DEFAULT_MASK_COLUMNS
     result_format: str = "csv"
     pool_size: int = 5
-    # Pools kept per profile, one per selected database; each holds pool_size.
+    # Pools kept per profile, one per selected database; each holds up to pool_size.
     max_database_pools: int = 3
     audit_enabled: bool = True
     audit_log_file: str | None = None

@@ -11,14 +11,13 @@ import subprocess
 import threading
 import time
 import uuid
-import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 import anyio
 from mysql.connector import connect
-from mysql.connector.pooling import MySQLConnectionPool
+from mysql.connector.errors import PoolError
 
 from .config import ConnectionProfile
 from .credential_store import credential_cache
@@ -235,15 +234,127 @@ class SshTunnelManager:
                     self._stop(managed)
 
 
+def _close_quietly(connection: Any) -> None:
+    try:
+        connection.close()
+    except Exception:
+        pass
+
+
+class PooledConnection:
+    """A borrowed connection; close() hands it back to its pool."""
+
+    def __init__(self, pool: ReadOnlyConnectionPool, connection: Any) -> None:
+        self._cnx_pool = pool
+        self._cnx: Any | None = connection
+        # Cancellation may close from another thread; return the connection once.
+        self._close_lock = threading.Lock()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._cnx, name)
+
+    def close(self) -> None:
+        with self._close_lock:
+            connection, self._cnx = self._cnx, None
+        if connection is not None:
+            self._cnx_pool.add_connection(connection)
+
+
+class ReadOnlyConnectionPool:
+    """Bounded pool that connects, pings and resets outside any shared lock.
+
+    Connector/Python's MySQLConnectionPool connects, pings and reconnects under
+    one module-wide lock, so a pool whose server does not answer stalls every
+    other pool in the process. Connections here are opened on demand, up to
+    pool_size, and only this pool's lock guards its bookkeeping.
+    """
+
+    def __init__(
+        self,
+        *,
+        pool_name: str,
+        pool_size: int,
+        pool_reset_session: bool = True,
+        connect_factory: Callable[..., Any] = connect,
+        **config: Any,
+    ) -> None:
+        self.pool_name = pool_name
+        self.pool_size = pool_size
+        self._reset_session = pool_reset_session
+        self._connect = connect_factory
+        self._config = config
+        self._lock = threading.Lock()
+        self._idle: list[Any] = []
+        # Idle plus borrowed connections, including ones being opened.
+        self._count = 0
+        self._closed = False
+
+    def get_connection(self) -> PooledConnection:
+        # A pool retired after the manager handed it out still serves the
+        # request; add_connection closes the connection when it comes back.
+        with self._lock:
+            if self._idle:
+                connection = self._idle.pop()
+            elif self._count < self.pool_size:
+                connection = None
+                self._count += 1
+            else:
+                raise PoolError("Failed getting connection; pool exhausted")
+        try:
+            if connection is not None and not connection.is_connected():
+                _close_quietly(connection)
+                connection = None
+            if connection is None:
+                connection = self._connect(**self._config)
+        except BaseException:
+            if connection is not None:
+                _close_quietly(connection)
+            self._forget()
+            raise
+        return PooledConnection(self, connection)
+
+    def add_connection(self, connection: Any) -> None:
+        """Take back a borrowed connection; drop it when its session cannot reset."""
+        if self._reset_session:
+            try:
+                connection.reset_session()
+            except Exception:
+                _close_quietly(connection)
+                self._forget()
+                return
+        with self._lock:
+            if not self._closed:
+                self._idle.append(connection)
+                return
+        _close_quietly(connection)
+        self._forget()
+
+    def close(self) -> None:
+        """Close idle connections; borrowed ones are closed when returned."""
+        with self._lock:
+            self._closed = True
+            idle, self._idle = self._idle, []
+            self._count -= len(idle)
+        for connection in idle:
+            _close_quietly(connection)
+
+    def _forget(self) -> None:
+        with self._lock:
+            self._count -= 1
+
+
 class ConnectionPoolManager:
-    """Cache classic Connector/Python pools per profile and selected database.
+    """Cache connection pools per profile and selected database.
 
     A profile keeps up to max_database_pools pools, one per selected database
     (no database is its own pool, since MySQL cannot unselect one), evicting
     the least recently used. Any other config change replaces all of them.
+    Network work happens outside the manager lock, in the pools.
     """
 
-    def __init__(self, pool_factory: Callable[..., Any] = MySQLConnectionPool) -> None:
+    def __init__(
+        self, pool_factory: Callable[..., Any] = ReadOnlyConnectionPool
+    ) -> None:
         self._pool_factory = pool_factory
         self._lock = threading.RLock()
         self._pools: dict[str, Any] = {}
@@ -251,32 +362,12 @@ class ConnectionPoolManager:
         self._profile_keys: dict[str, str] = {}
         # Profile name -> its pool keys, least recently used first.
         self._profile_pools: dict[str, list[str]] = {}
-        # Pools dropped while connections may still be borrowed from them.
-        self._retired: weakref.WeakSet[Any] = weakref.WeakSet()
 
     @staticmethod
-    def _dispose_pool(pool: Any) -> None:
-        close = getattr(pool, "close", None)
-        if callable(close):
+    def _dispose(pools: list[Any]) -> None:
+        for pool in pools:
             try:
-                close()
-            except Exception:
-                pass
-            return
-
-        # Connector/Python does not expose a public pool shutdown API. Drain
-        # and close its idle raw connections so profile reloads and credential
-        # rotations do not retain server sessions indefinitely.
-        queue = getattr(pool, "_cnx_queue", None)
-        if queue is None:
-            return
-        while True:
-            try:
-                connection = queue.get_nowait()
-            except Exception:
-                break
-            try:
-                connection.close()
+                pool.close()
             except Exception:
                 pass
 
@@ -304,16 +395,15 @@ class ConnectionPoolManager:
         )
         return hashlib.sha256(repr(value).encode()).hexdigest()
 
-    def _retire(self, key: str) -> None:
+    def _retire(self, key: str, retired: list[Any]) -> None:
         pool = self._pools.pop(key, None)
         if pool is not None:
-            self._retired.add(pool)
-            self._dispose_pool(pool)
+            retired.append(pool)
 
-    def _retire_profile(self, name: str) -> None:
+    def _retire_profile(self, name: str, retired: list[Any]) -> None:
         self._profile_keys.pop(name, None)
         for key in self._profile_pools.pop(name, []):
-            self._retire(key)
+            self._retire(key, retired)
 
     def get_connection(
         self,
@@ -323,9 +413,11 @@ class ConnectionPoolManager:
         *,
         connect_factory: Callable[..., Any] = connect,
     ) -> Any:
+        retired: list[Any] = []
         if profile.pool_size == 0:
             with self._lock:
-                self._retire_profile(profile.name)
+                self._retire_profile(profile.name, retired)
+            self._dispose(retired)
             return connect_factory(**config)
 
         key = self._key(profile, endpoint, config)
@@ -336,13 +428,13 @@ class ConnectionPoolManager:
         )
         with self._lock:
             if self._profile_keys.get(profile.name) not in (None, profile_key):
-                self._retire_profile(profile.name)
+                self._retire_profile(profile.name, retired)
             self._profile_keys[profile.name] = profile_key
             keys = self._profile_pools.setdefault(profile.name, [])
             pool = self._pools.get(key)
             if pool is None:
                 while len(keys) >= profile.max_database_pools:
-                    self._retire(keys.pop(0))
+                    self._retire(keys.pop(0), retired)
                 pool = self._pool_factory(
                     pool_name=f"mcp_{key[:20]}",
                     pool_size=profile.pool_size,
@@ -353,20 +445,12 @@ class ConnectionPoolManager:
             else:
                 keys.remove(key)
             keys.append(key)
+        self._dispose(retired)
         return pool.get_connection()
 
     def release(self, connection: Any) -> None:
-        """Return a connection to its pool, closing it if the pool was retired."""
+        """Return a connection to its pool; a retired pool closes it."""
         connection.close()
-        pool = getattr(connection, "_cnx_pool", None)
-        if pool is None:
-            return
-        with self._lock:
-            retired = pool in self._retired
-        # A pool retired before or during close() got this connection back
-        # after its idle connections were closed; close them again.
-        if retired:
-            self._dispose_pool(pool)
 
     def discard(
         self,
@@ -376,6 +460,7 @@ class ConnectionPoolManager:
     ) -> None:
         """Remove a pool whose effective connection failed a safety check."""
         key = self._key(profile, endpoint, config)
+        retired: list[Any] = []
         with self._lock:
             keys = self._profile_pools.get(profile.name, [])
             if key in keys:
@@ -383,16 +468,19 @@ class ConnectionPoolManager:
                 if not keys:
                     self._profile_pools.pop(profile.name, None)
                     self._profile_keys.pop(profile.name, None)
-            self._retire(key)
+            self._retire(key, retired)
+        self._dispose(retired)
 
     def clear(self) -> None:
         """Close idle pool connections and drop cached references."""
+        retired: list[Any] = []
         with self._lock:
             for name in list(self._profile_pools):
-                self._retire_profile(name)
+                self._retire_profile(name, retired)
             for key in list(self._pools):
-                self._retire(key)
+                self._retire(key, retired)
             self._profile_keys.clear()
+        self._dispose(retired)
 
 
 class QueryControl:

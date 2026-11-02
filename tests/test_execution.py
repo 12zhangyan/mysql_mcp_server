@@ -876,6 +876,23 @@ def test_grant_assessment_warns_about_write_capable_account():
     assert "SELECT-only" in str(assessment["warning"])
 
 
+def test_grant_assessment_reads_column_level_privileges():
+    select_only = _assess_grants(
+        [
+            "GRANT USAGE ON *.* TO `app`@`%`",
+            "GRANT SELECT (`id`, `a,b) ON c`), SHOW VIEW ON `app`.`t` TO `app`@`%`",
+        ],
+        0,
+    )
+    writable = _assess_grants(
+        ["GRANT SELECT (`id`), UPDATE (`note`) ON `app`.`t` TO `app`@`%`"], 0
+    )
+
+    assert select_only["account_select_only"] is True
+    assert select_only["non_read_privileges"] == []
+    assert writable["non_read_privileges"] == ["UPDATE"]
+
+
 @pytest.mark.asyncio
 async def test_resource_uri_cannot_bypass_database_allowlist(tmp_path, monkeypatch):
     profiles_file = tmp_path / "connections.toml"
