@@ -40,7 +40,7 @@ window.BOARD_DETAILS["d-b52e16f0a71f2167"] = {
         "本地端口已被占用时不启动 ssh，直接报错"
       ],
       "openQuestions": [],
-      "next": "单元测试已通过；提交后由 CI 跑实库测试（同一连接交替访问两个库复用连接）"
+      "next": "已合并到 main，尚未发版；下次 release 时随版本发布"
     }
   }
 };

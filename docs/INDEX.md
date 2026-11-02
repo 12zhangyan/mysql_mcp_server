@@ -17,7 +17,7 @@
 
 | | 标题 | 类型 | 状态 | 日期 | 源文档 | 单页 | OpenAPI |
 |---|---|---|---|---|---|---|---|
-| 📄 | 连接池复用与 SSH 隧道隔离 | 开发文档 | 进行中 | 2026-11-01 | [md](../docs/2026-11-01/connection-pool-and-ssh-tunnel.md) | [页](../project-html/pages/mysql_mcp_server-runtime-config-连接池复用与-SSH-隧道隔离.html) | - |
+| 📄 | 连接池复用与 SSH 隧道隔离 | 开发文档 | 已完成 | 2026-11-01 | [md](../docs/2026-11-01/connection-pool-and-ssh-tunnel.md) | [页](../project-html/pages/mysql_mcp_server-runtime-config-连接池复用与-SSH-隧道隔离.html) | - |
 
 ### 📁 runtime / server
 
