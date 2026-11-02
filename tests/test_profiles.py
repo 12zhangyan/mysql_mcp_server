@@ -337,6 +337,29 @@ def test_legacy_safety_limits_are_validated(monkeypatch):
         load_connection_registry()
 
 
+def test_max_database_pools_is_configurable_and_bounded(tmp_path: Path, monkeypatch):
+    profiles_file = tmp_path / "connections.toml"
+    monkeypatch.setenv("MYSQL_PROFILES_FILE", str(profiles_file))
+    base = '[connections.main]\nuser = "reader"\npassword = "secret"\n'
+    profiles_file.write_text(base, encoding="utf-8")
+    assert load_connection_registry().get().max_database_pools == 3
+
+    profiles_file.write_text(base + "max_database_pools = 5\n", encoding="utf-8")
+    assert load_connection_registry(force_reload=True).get().max_database_pools == 5
+
+    profiles_file.write_text(base + "max_database_pools = 17\n", encoding="utf-8")
+    # An invalid profile is skipped and reported when a connection is requested.
+    with pytest.raises(ValueError, match="max_database_pools"):
+        load_connection_registry(force_reload=True).get()
+
+    monkeypatch.delenv("MYSQL_PROFILES_FILE")
+    monkeypatch.setenv("MYSQL_MAX_DATABASE_POOLS", "2")
+    assert load_connection_registry(force_reload=True).get().max_database_pools == 2
+    monkeypatch.setenv("MYSQL_MAX_DATABASE_POOLS", "0")
+    with pytest.raises(ValueError, match="MYSQL_MAX_DATABASE_POOLS"):
+        load_connection_registry(force_reload=True)
+
+
 def test_profiles_path_must_be_an_existing_file(tmp_path: Path, monkeypatch):
     for configured in (tmp_path / "missing.toml", tmp_path):
         monkeypatch.setenv("MYSQL_PROFILES_FILE", str(configured))

@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `max_database_pools` (`MYSQL_MAX_DATABASE_POOLS`, 1-16, default 3): with
+  pooling enabled, a connection keeps one pool per database it uses (no
+  database is a pool of its own) and closes the least recently used beyond
+  this limit. Each pool opens `pool_size` connections.
+
+### Fixed
+- Switching databases or passing a different `timeout_ms` no longer destroys
+  and rebuilds the connection pool. The pool key included the database and the
+  per-call socket timeout, and every new pool opened `pool_size` connections.
+  Connections borrowed from a pool that was replaced are now closed when they
+  are returned, instead of waiting for garbage collection.
+- A slow or unreachable SSH bastion no longer blocks every other connection,
+  including direct ones, for up to `startup_timeout`; tunnels start under a
+  per-connection lock.
+- An SSH tunnel whose local port is already taken now fails with a clear error
+  instead of passing the readiness check against the other listener, which
+  could connect to the wrong server. A tunnel whose ssh process exits while the
+  port answers is no longer reported as ready.
+
+### Changed
+- Connector socket timeouts always use the connection's `query_timeout_ms`. A
+  shorter per-call `timeout_ms` still returns `QUERY_TIMEOUT` on time and stops
+  SELECT through `MAX_EXECUTION_TIME`; SHOW, DESCRIBE and EXPLAIN, which
+  `MAX_EXECUTION_TIME` does not cover, may hold their worker until
+  `query_timeout_ms`.
+- Legacy SSH tunnels still default to local port 3330 (the docs said 0). Two
+  processes on one machine with that default now fail on the port check
+  instead of silently sharing the first tunnel; set distinct
+  `MYSQL_LOCAL_PORT` values or `0`.
+
 ## [0.9.17] - 2026-11-02
 
 ### Security

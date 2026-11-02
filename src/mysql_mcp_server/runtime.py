@@ -11,6 +11,7 @@ import subprocess
 import threading
 import time
 import uuid
+import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -62,12 +63,21 @@ class SshTunnelManager:
         popen_factory: Callable[..., Any] = subprocess.Popen,
         port_allocator: Callable[[], int] = _allocate_local_port,
         readiness_check: Callable[[str, int], bool] = _port_is_open,
+        port_in_use: Callable[[str, int], bool] = _port_is_open,
     ) -> None:
         self._popen_factory = popen_factory
         self._port_allocator = port_allocator
         self._readiness_check = readiness_check
-        self._lock = threading.RLock()
+        self._port_in_use = port_in_use
+        # Guards the two tables only; a tunnel start waits on its profile lock,
+        # so one slow bastion cannot block other profiles.
+        self._lock = threading.Lock()
         self._tunnels: dict[str, _ManagedTunnel] = {}
+        self._profile_locks: dict[str, threading.Lock] = {}
+
+    def _profile_lock(self, name: str) -> threading.Lock:
+        with self._lock:
+            return self._profile_locks.setdefault(name, threading.Lock())
 
     @staticmethod
     def _fingerprint(profile: ConnectionProfile) -> str:
@@ -103,16 +113,18 @@ class SshTunnelManager:
 
     def endpoint(self, profile: ConnectionProfile) -> TunnelEndpoint:
         if not profile.ssh.enabled:
-            with self._lock:
-                existing = self._tunnels.pop(profile.name, None)
+            with self._profile_lock(profile.name):
+                with self._lock:
+                    existing = self._tunnels.pop(profile.name, None)
                 if existing is not None:
                     self._stop(existing)
             return TunnelEndpoint(profile.host, profile.port, False)
 
         self._validate(profile)
         fingerprint = self._fingerprint(profile)
-        with self._lock:
-            existing = self._tunnels.get(profile.name)
+        with self._profile_lock(profile.name):
+            with self._lock:
+                existing = self._tunnels.get(profile.name)
             if (
                 existing is not None
                 and existing.fingerprint == fingerprint
@@ -123,15 +135,26 @@ class SshTunnelManager:
             ):
                 return existing.endpoint
             if existing is not None:
+                with self._lock:
+                    self._tunnels.pop(profile.name, None)
                 self._stop(existing)
 
             managed = self._start(profile, fingerprint)
-            self._tunnels[profile.name] = managed
+            with self._lock:
+                self._tunnels[profile.name] = managed
             return managed.endpoint
 
     def _start(self, profile: ConnectionProfile, fingerprint: str) -> _ManagedTunnel:
         ssh = profile.ssh
         local_port = ssh.local_port or self._port_allocator()
+        # Readiness only proves that something accepts connections on the
+        # port, so a port that is already taken would pass it.
+        if self._port_in_use("127.0.0.1", local_port):
+            raise RuntimeError(
+                f"Local port {local_port} for the SSH tunnel of '{profile.name}' "
+                "is already in use; set ssh.local_port to a free port, or 0 to "
+                "choose one automatically"
+            )
         command = [
             "ssh",
             "-i",
@@ -162,12 +185,15 @@ class SshTunnelManager:
         )
         deadline = time.monotonic() + ssh.startup_timeout
         while time.monotonic() < deadline:
+            ready = self._readiness_check("127.0.0.1", local_port)
+            # Check the process after the port: another listener that took the
+            # port answers before ssh, with ExitOnForwardFailure, exits.
             if process.poll() is not None:
                 raise RuntimeError(
                     f"SSH tunnel for '{profile.name}' exited early with status "
                     f"{process.poll()}"
                 )
-            if self._readiness_check("127.0.0.1", local_port):
+            if ready:
                 return _ManagedTunnel(
                     process=process,
                     endpoint=TunnelEndpoint(
@@ -199,19 +225,34 @@ class SshTunnelManager:
 
     def close_all(self) -> None:
         with self._lock:
-            for managed in self._tunnels.values():
-                self._stop(managed)
-            self._tunnels.clear()
+            names = list(self._profile_locks)
+        for name in names:
+            # Wait for a start in progress so its process is not left running.
+            with self._profile_lock(name):
+                with self._lock:
+                    managed = self._tunnels.pop(name, None)
+                if managed is not None:
+                    self._stop(managed)
 
 
 class ConnectionPoolManager:
-    """Cache classic Connector/Python pools by effective connection config."""
+    """Cache classic Connector/Python pools per profile and selected database.
+
+    A profile keeps up to max_database_pools pools, one per selected database
+    (no database is its own pool, since MySQL cannot unselect one), evicting
+    the least recently used. Any other config change replaces all of them.
+    """
 
     def __init__(self, pool_factory: Callable[..., Any] = MySQLConnectionPool) -> None:
         self._pool_factory = pool_factory
         self._lock = threading.RLock()
         self._pools: dict[str, Any] = {}
+        # Profile name -> key of its config without the database.
         self._profile_keys: dict[str, str] = {}
+        # Profile name -> its pool keys, least recently used first.
+        self._profile_pools: dict[str, list[str]] = {}
+        # Pools dropped while connections may still be borrowed from them.
+        self._retired: weakref.WeakSet[Any] = weakref.WeakSet()
 
     @staticmethod
     def _dispose_pool(pool: Any) -> None:
@@ -263,6 +304,17 @@ class ConnectionPoolManager:
         )
         return hashlib.sha256(repr(value).encode()).hexdigest()
 
+    def _retire(self, key: str) -> None:
+        pool = self._pools.pop(key, None)
+        if pool is not None:
+            self._retired.add(pool)
+            self._dispose_pool(pool)
+
+    def _retire_profile(self, name: str) -> None:
+        self._profile_keys.pop(name, None)
+        for key in self._profile_pools.pop(name, []):
+            self._retire(key)
+
     def get_connection(
         self,
         profile: ConnectionProfile,
@@ -273,23 +325,24 @@ class ConnectionPoolManager:
     ) -> Any:
         if profile.pool_size == 0:
             with self._lock:
-                previous_key = self._profile_keys.pop(profile.name, None)
-                previous_pool = (
-                    self._pools.pop(previous_key, None) if previous_key else None
-                )
-                if previous_pool is not None:
-                    self._dispose_pool(previous_pool)
+                self._retire_profile(profile.name)
             return connect_factory(**config)
 
         key = self._key(profile, endpoint, config)
+        profile_key = self._key(
+            profile,
+            endpoint,
+            {name: value for name, value in config.items() if name != "database"},
+        )
         with self._lock:
-            previous_key = self._profile_keys.get(profile.name)
-            if previous_key is not None and previous_key != key:
-                previous_pool = self._pools.pop(previous_key, None)
-                if previous_pool is not None:
-                    self._dispose_pool(previous_pool)
+            if self._profile_keys.get(profile.name) not in (None, profile_key):
+                self._retire_profile(profile.name)
+            self._profile_keys[profile.name] = profile_key
+            keys = self._profile_pools.setdefault(profile.name, [])
             pool = self._pools.get(key)
             if pool is None:
+                while len(keys) >= profile.max_database_pools:
+                    self._retire(keys.pop(0))
                 pool = self._pool_factory(
                     pool_name=f"mcp_{key[:20]}",
                     pool_size=profile.pool_size,
@@ -297,8 +350,23 @@ class ConnectionPoolManager:
                     **config,
                 )
                 self._pools[key] = pool
-            self._profile_keys[profile.name] = key
+            else:
+                keys.remove(key)
+            keys.append(key)
         return pool.get_connection()
+
+    def release(self, connection: Any) -> None:
+        """Return a connection to its pool, closing it if the pool was retired."""
+        connection.close()
+        pool = getattr(connection, "_cnx_pool", None)
+        if pool is None:
+            return
+        with self._lock:
+            retired = pool in self._retired
+        # A pool retired before or during close() got this connection back
+        # after its idle connections were closed; close them again.
+        if retired:
+            self._dispose_pool(pool)
 
     def discard(
         self,
@@ -309,18 +377,21 @@ class ConnectionPoolManager:
         """Remove a pool whose effective connection failed a safety check."""
         key = self._key(profile, endpoint, config)
         with self._lock:
-            pool = self._pools.pop(key, None)
-            if self._profile_keys.get(profile.name) == key:
-                self._profile_keys.pop(profile.name, None)
-            if pool is not None:
-                self._dispose_pool(pool)
+            keys = self._profile_pools.get(profile.name, [])
+            if key in keys:
+                keys.remove(key)
+                if not keys:
+                    self._profile_pools.pop(profile.name, None)
+                    self._profile_keys.pop(profile.name, None)
+            self._retire(key)
 
     def clear(self) -> None:
         """Close idle pool connections and drop cached references."""
         with self._lock:
-            for pool in self._pools.values():
-                self._dispose_pool(pool)
-            self._pools.clear()
+            for name in list(self._profile_pools):
+                self._retire_profile(name)
+            for key in list(self._pools):
+                self._retire(key)
             self._profile_keys.clear()
 
 

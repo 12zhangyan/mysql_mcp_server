@@ -393,6 +393,39 @@ def test_real_pool_resize_enforces_new_capacity(local_db, initial_size, new_size
         manager.clear()
 
 
+def test_real_pools_are_reused_per_database_and_none_stays_unselected(local_db):
+    from dataclasses import replace
+
+    from mysql_mcp_server.config import load_connection_registry, build_connector_config
+    from mysql_mcp_server.runtime import ConnectionPoolManager, TunnelEndpoint
+
+    manager = ConnectionPoolManager()
+    profile = replace(
+        load_connection_registry().get(), pool_size=1, max_database_pools=2
+    )
+    endpoint = TunnelEndpoint("127.0.0.1", 3306)
+    seen: dict[str | None, set[int]] = {}
+    try:
+        # information_schema exists on every server; pools never run user SQL.
+        for database in ["information_schema", None, "information_schema", None]:
+            config = build_connector_config(profile, database=database)
+            connection = manager.get_connection(profile, endpoint, config)
+            try:
+                with connection.cursor() as cursor:
+                    cursor.execute("SELECT CONNECTION_ID(), DATABASE()")
+                    connection_id, selected = cursor.fetchone()
+            finally:
+                manager.release(connection)
+            assert selected == database
+            seen.setdefault(database, set()).add(connection_id)
+    finally:
+        manager.clear()
+    assert {database: len(ids) for database, ids in seen.items()} == {
+        "information_schema": 1,
+        None: 1,
+    }
+
+
 @pytest.mark.parametrize(
     "projection,expected,masked_columns",
     [

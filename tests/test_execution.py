@@ -308,7 +308,7 @@ def test_open_connection_discards_pool_after_tls_verification_failure():
         patch("mysql_mcp_server.server.connection_pool_manager.discard") as discard,
     ):
         with pytest.raises(RuntimeError, match="requires TLS"):
-            _open_connection(profile, database=None, query_timeout_ms=1000)
+            _open_connection(profile, database=None)
 
     discard.assert_called_once()
     assert discard.call_args.args[0] is profile
