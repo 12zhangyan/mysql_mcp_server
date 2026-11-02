@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.18] - 2026-11-02
+
 ### Added
 - `max_database_pools` (`MYSQL_MAX_DATABASE_POOLS`, 1-16, default 3): with
   pooling enabled, a connection keeps one pool per database it uses (no
