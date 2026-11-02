@@ -89,7 +89,18 @@ test(
       assert.equal(version.stdout.trim(), manifest.version);
 
       const runtimeCache = path.join(temporary, "runtime-cache");
+      // MCP clients start the server in the user's project. Modules there that
+      // share a name with ones the bootstrap or server imports must not load.
+      const project = path.join(temporary, "project");
+      fs.mkdirSync(project);
+      for (const name of ["venv", "pip", "sqlglot", "anyio"]) {
+        fs.writeFileSync(
+          path.join(project, `${name}.py`),
+          `raise SystemExit("${name}.py from the working directory was imported")\n`,
+        );
+      }
       const firstRun = checked(process.execPath, [launcher], {
+        cwd: project,
         input: "",
         timeout: 240_000,
         env: {

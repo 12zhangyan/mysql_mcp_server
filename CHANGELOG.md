@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- The npm launcher runs Python with `-P`. `python -m` put the working
+  directory first on `sys.path`, and MCP clients usually start the server in
+  the user's project, so a `sqlglot.py`, `mcp/`, `pip.py` or `venv.py` there
+  ran inside the server process, which holds the database credentials, or
+  during the first-run install, instead of the real module.
+
 ## [0.9.19] - 2026-11-02
 
 ### Fixed

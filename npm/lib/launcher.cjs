@@ -8,6 +8,10 @@ const { spawn, spawnSync } = require("node:child_process");
 
 const manifest = require("../../package.json");
 const packageRoot = path.resolve(__dirname, "..", "..");
+// `python -m` puts the working directory first on sys.path, so an MCP client
+// started in a project with its own sqlglot.py, pip.py or mcp/ would run that
+// code instead. -P (Python 3.11+, which detectPython requires) leaves it out.
+const SAFE_PATH = "-P";
 
 function pythonCandidates(environment = process.env, platform = process.platform) {
   if (environment.MYSQL_MCP_PYTHON) {
@@ -204,13 +208,14 @@ function ensureRuntime() {
     if (!fs.existsSync(runtimePython)) {
       runChecked(
         python.command,
-        [...python.prefix, "-m", "venv", virtualenv],
+        [...python.prefix, SAFE_PATH, "-m", "venv", virtualenv],
         "Python virtual environment creation",
       );
     }
     runChecked(
       runtimePython,
       [
+        SAFE_PATH,
         "-m",
         "pip",
         "install",
@@ -227,6 +232,7 @@ function ensureRuntime() {
     runChecked(
       runtimePython,
       [
+        SAFE_PATH,
         "-m",
         "pip",
         "install",
@@ -261,7 +267,7 @@ async function main(argv = process.argv.slice(2)) {
   }
 
   const python = ensureRuntime();
-  const child = spawn(python, ["-m", "mysql_mcp_server", ...argv], {
+  const child = spawn(python, [SAFE_PATH, "-m", "mysql_mcp_server", ...argv], {
     env: process.env,
     stdio: "inherit",
     windowsHide: true,
